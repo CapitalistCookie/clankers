@@ -1,0 +1,223 @@
+"""Knowledge base — wiki structure, compile, Q&A, linting."""
+
+import json
+import os
+import glob
+from datetime import datetime
+
+DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
+WIKI_DIR = os.path.join(DATA_DIR, "wiki")
+SESSIONS_DIR = os.path.join(DATA_DIR, "raw/sessions")
+
+
+def ensure_wiki_structure():
+    """Create wiki directories and seed index if needed."""
+    for subdir in ["projects", "patterns", "decisions", "failures"]:
+        os.makedirs(os.path.join(WIKI_DIR, subdir), exist_ok=True)
+
+    index_path = os.path.join(WIKI_DIR, "index.md")
+    if not os.path.exists(index_path):
+        with open(index_path, "w") as f:
+            f.write("# Clanker Knowledge Base\n\n")
+            f.write(f"*Auto-maintained index. Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*\n\n")
+            f.write("## Projects\n\n")
+            f.write("## Patterns\n\n")
+            f.write("## Decisions\n\n")
+            f.write("## Failures\n\n")
+
+
+def get_wiki_stats():
+    """Return stats about the knowledge base."""
+    stats = {"total_articles": 0, "total_words": 0, "sections": {}}
+    for section in ["projects", "patterns", "decisions", "failures"]:
+        section_dir = os.path.join(WIKI_DIR, section)
+        if os.path.isdir(section_dir):
+            articles = [f for f in os.listdir(section_dir) if f.endswith(".md")]
+            word_count = 0
+            for a in articles:
+                with open(os.path.join(section_dir, a)) as f:
+                    word_count += len(f.read().split())
+            stats["sections"][section] = {"articles": len(articles), "words": word_count}
+            stats["total_articles"] += len(articles)
+            stats["total_words"] += word_count
+    return stats
+
+
+def compile_wiki(dry_run=False):
+    """Generate/update wiki articles from session data.
+
+    This is the LLM-powered compile step. In production, it invokes Claude
+    to read raw session data and update wiki articles. For now, it generates
+    basic project summaries from session metrics.
+    """
+    from analyze import load_sessions
+    from registry import Registry
+    from redact import redact
+    from collections import defaultdict
+
+    ensure_wiki_structure()
+    reg = Registry()
+    sessions = load_sessions(last_days=9999)  # all time
+
+    # Normalize project names to registry names
+    # Build multiple lookup keys for each registry project
+    project_map = {}
+    for p in reg.projects:
+        project_map[p] = p
+        project_map[p.lower()] = p
+        project_map[p.lower().replace("-", "").replace("_", "")] = p
+
+    # Add known aliases from bootstrap data
+    aliases = {
+        "Quanta-AI-V1": "quanta-ai", "quantaaiv1": "quanta-ai", "quanta_ai_v1": "quanta-ai",
+        "Eigenstate-V2": "eigenstate", "eigenstatev2": "eigenstate",
+        "Research": "eigenstateresearch", "research": "eigenstateresearch",
+        "FlowStudio": "flowstudio",
+        "Zergrush": "zergrush",
+        "Mac-Mini": "macmini", "macmini": "macmini",
+        "Titrin": "titrin",
+    }
+    project_map.update(aliases)
+
+    by_project = defaultdict(list)
+    for s in sessions:
+        raw_name = s.get("project", "global")
+        matched = project_map.get(raw_name, project_map.get(raw_name.lower(), raw_name))
+        by_project[matched].append(s)
+
+    articles_written = 0
+    for project, proj_sessions in by_project.items():
+        if project == "global":
+            continue
+
+        arch = reg.get_archetype(project)
+        total_sessions = len(proj_sessions)
+        total_errors = sum(s.get("errors", 0) for s in proj_sessions)
+        total_tools = sum(sum(s.get("tool_uses", {}).values()) for s in proj_sessions)
+        err_rate = total_errors / total_sessions if total_sessions > 0 else 0
+
+        # Date range
+        dates = [s.get("timestamp", "")[:10] for s in proj_sessions if s.get("timestamp")]
+        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
+
+        # Top tools
+        from collections import Counter
+        tool_counter = Counter()
+        for s in proj_sessions:
+            for tool, count in s.get("tool_uses", {}).items():
+                tool_counter[tool] += count
+        top_tools = tool_counter.most_common(5)
+
+        # Top files
+        file_counter = Counter()
+        for s in proj_sessions:
+            for f in s.get("files_touched", []):
+                file_counter[f] += 1
+        top_files = file_counter.most_common(10)
+
+        article = f"""# {project}
+
+**Archetype:** {arch}
+**Sessions:** {total_sessions} ({date_range})
+**Total errors:** {total_errors} ({err_rate:.1f}/session)
+**Total tool uses:** {total_tools}
+
+## Tool Usage
+
+| Tool | Uses |
+|------|------|
+"""
+        for tool, count in top_tools:
+            article += f"| {tool} | {count} |\n"
+
+        article += "\n## Most Touched Files\n\n"
+        for filepath, count in top_files:
+            article += f"- `{filepath}` ({count} sessions)\n"
+
+        article += f"\n\n*Auto-generated by clanker compile on {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*\n"
+
+        if not dry_run:
+            article_path = os.path.join(WIKI_DIR, "projects", f"{project}.md")
+            with open(article_path, "w") as f:
+                f.write(article)
+            articles_written += 1
+
+    # Update index
+    if not dry_run:
+        _update_index()
+
+    return articles_written
+
+
+def _update_index():
+    """Rebuild the wiki index from existing articles."""
+    index_path = os.path.join(WIKI_DIR, "index.md")
+    lines = [
+        "# Clanker Knowledge Base\n\n",
+        f"*Auto-maintained index. Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}*\n\n",
+    ]
+
+    for section in ["projects", "patterns", "decisions", "failures"]:
+        section_dir = os.path.join(WIKI_DIR, section)
+        lines.append(f"## {section.capitalize()}\n\n")
+        if os.path.isdir(section_dir):
+            articles = sorted(f for f in os.listdir(section_dir) if f.endswith(".md"))
+            if articles:
+                for a in articles:
+                    name = a.replace(".md", "")
+                    # Read first line after the title for summary
+                    with open(os.path.join(section_dir, a)) as f:
+                        f.readline()  # skip title
+                        summary = ""
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith("#"):
+                                summary = line[:100]
+                                break
+                    lines.append(f"- [{name}]({section}/{a}) — {summary}\n")
+            else:
+                lines.append("*No articles yet.*\n")
+        lines.append("\n")
+
+    with open(index_path, "w") as f:
+        f.writelines(lines)
+
+
+def lint_wiki():
+    """Check knowledge base for consistency issues."""
+    issues = []
+
+    # Check for empty articles
+    for section in ["projects", "patterns", "decisions", "failures"]:
+        section_dir = os.path.join(WIKI_DIR, section)
+        if not os.path.isdir(section_dir):
+            continue
+        for f in os.listdir(section_dir):
+            if f.endswith(".md"):
+                path = os.path.join(section_dir, f)
+                with open(path) as fh:
+                    content = fh.read()
+                if len(content.strip()) < 50:
+                    issues.append(f"Empty article: {section}/{f}")
+
+    # Check for stale project articles (project not in registry)
+    from registry import Registry
+    reg = Registry()
+    projects_dir = os.path.join(WIKI_DIR, "projects")
+    if os.path.isdir(projects_dir):
+        for f in os.listdir(projects_dir):
+            if f.endswith(".md"):
+                name = f.replace(".md", "")
+                if name not in reg.projects:
+                    issues.append(f"Stale article: projects/{f} (project not in registry)")
+
+    # Check index exists and is recent
+    index_path = os.path.join(WIKI_DIR, "index.md")
+    if not os.path.exists(index_path):
+        issues.append("Missing index.md")
+    else:
+        age_hours = (datetime.utcnow().timestamp() - os.path.getmtime(index_path)) / 3600
+        if age_hours > 24 * 7:
+            issues.append(f"Stale index.md (last updated {age_hours / 24:.0f} days ago)")
+
+    return issues

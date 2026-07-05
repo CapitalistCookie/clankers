@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# localci-install — install the generic local-CI dispatcher git hooks
+# (pre-push + post-commit) into existing repos on this box.
+#
+# Usage:
+#   localci-install <repo-path> [<repo-path> ...]
+#   localci-install --all          # yon + polymarket_research + ~/projects/*
+#
+# Source of truth for the hooks: ~/.git-templates/hooks/{pre-push,post-commit}
+# (the same files new repos receive automatically via
+#  `git config --global init.templateDir ~/.git-templates`).
+# This installer just copies them in and chains pre-existing hooks aside.
+#
+# Behavior per repo:
+#   - linked git worktree            -> SKIP (hooks are shared with the main
+#                                       checkout; install there instead)
+#   - bare repo                      -> SKIP
+#   - core.hooksPath outside         -> SKIP + manual-review (the hooks dir is
+#     $GIT_DIR/hooks                     likely tracked in the repo; installing
+#                                        would dirty the working tree)
+#   - existing pre-push containing   -> SKIP + manual-review, install NOTHING
+#     `git commit` (or denylisted)       (a pre-push that commits can corrupt
+#                                        the branch being pushed)
+#   - existing NON-dispatcher hook   -> moved to <name>.local and chained
+#                                       (the dispatcher runs it first)
+#   - hook with a superseded marker  -> replaced WITHOUT chaining (old
+#     (yon's live/ci/install_hooks.sh)   behavior is identical via .localci;
+#                                        chaining would double-run the suite)
+#   - dispatcher already installed   -> refreshed in place (idempotent)
+#
+# After install the dispatcher resolves the repo's CI config at hook time:
+#   .localci (FAST=/FULL= repo-relative)  >  ci/fast.sh + ci/full.sh  >
+#   live/ci/ci_fast.sh + live/ci/ci_full.sh  >  nothing (silent no-op).
+set -u
+
+TEMPLATES="$HOME/.git-templates/hooks"
+DISPATCH_MARKER="managed-by: localci dispatcher"
+SUPERSEDED_MARKER="managed-by: live/ci/install_hooks.sh"   # yon's old direct hooks
+HOOK_NAMES=(pre-push post-commit)
+
+# Repos that must NEVER get hooks from this tool, even if detection passes.
+# polymarkethftinfrastructure: its pre-push-time test suite commits sandbox
+# fixtures onto the live branch (memory: polymarket_repo_prepush_gotchas) —
+# any test-running pre-push there is branch-corrupting. Manual review only.
+DENYLIST=(
+    /home/user/projects/polymarkethftinfrastructure
+)
+
+if [ ! -f "$TEMPLATES/pre-push" ] || [ ! -f "$TEMPLATES/post-commit" ]; then
+    echo "localci-install: template hooks missing under $TEMPLATES" >&2
+    exit 1
+fi
+
+declare -a SUMMARY=()
+
+note() { printf '  %s\n' "$*"; }
+
+install_repo() {
+    local repo="$1"
+    repo="$(realpath -m "$repo" 2>/dev/null || echo "$repo")"
+    printf '== %s\n' "$repo"
+
+    if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+        note "SKIP: not a git repo"
+        SUMMARY+=("$repo|skip|not a git repo")
+        return 0
+    fi
+    if [ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)" = "true" ]; then
+        note "SKIP: bare repository"
+        SUMMARY+=("$repo|skip|bare repo")
+        return 0
+    fi
+
+    local gd cgd
+    gd="$(git -C "$repo" rev-parse --absolute-git-dir)"
+    cgd="$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)"
+    if [ "$gd" != "$cgd" ]; then
+        note "SKIP: linked worktree — hooks are shared with the main checkout ($cgd); install there"
+        SUMMARY+=("$repo|skip|linked worktree of $cgd")
+        return 0
+    fi
+
+    # denylist (compare realpaths)
+    local d
+    for d in "${DENYLIST[@]}"; do
+        if [ "$repo" = "$(realpath -m "$d")" ]; then
+            note "SKIP: DENYLISTED — documented branch-corrupting pre-push-time behavior; manual review only"
+            SUMMARY+=("$repo|manual-review|denylisted (pre-push-time tests commit fixtures)")
+            return 0
+        fi
+    done
+
+    # effective hooks dir must be $gd/hooks; a hooksPath elsewhere is likely
+    # tracked working-tree content — installing would dirty the repo.
+    local hp hooks_dir="$gd/hooks"
+    hp="$(git -C "$repo" config core.hooksPath || true)"
+    if [ -n "$hp" ]; then
+        local hp_abs
+        case "$hp" in /*) hp_abs="$hp" ;; *) hp_abs="$repo/$hp" ;; esac
+        hp_abs="$(realpath -m "$hp_abs")"
+        if [ "$hp_abs" != "$(realpath -m "$hooks_dir")" ]; then
+            note "SKIP: core.hooksPath=$hp (outside .git/hooks; likely tracked in the repo) — manual review"
+            SUMMARY+=("$repo|manual-review|core.hooksPath=$hp outside .git/hooks")
+            return 0
+        fi
+        hooks_dir="$hp_abs"
+    fi
+    mkdir -p "$hooks_dir"
+
+    # danger check: any existing pre-push (or already-chained .local) that
+    # performs commits — install NOTHING in that repo.
+    local f
+    for f in "$hooks_dir/pre-push" "$hooks_dir/pre-push.local"; do
+        if [ -f "$f" ] && ! grep -qF "$DISPATCH_MARKER" "$f" && grep -q "git commit" "$f"; then
+            note "SKIP: $f contains 'git commit' — a committing pre-push is branch-corrupting; manual review"
+            SUMMARY+=("$repo|manual-review|existing pre-push performs commits ($f)")
+            return 0
+        fi
+    done
+
+    local name target status_bits=()
+    for name in "${HOOK_NAMES[@]}"; do
+        target="$hooks_dir/$name"
+        local action="installed"
+        if [ -f "$target" ]; then
+            if grep -qF "$DISPATCH_MARKER" "$target"; then
+                action="refreshed"
+            elif grep -qF "$SUPERSEDED_MARKER" "$target"; then
+                action="replaced superseded managed hook (no chaining; behavior preserved via repo CI config)"
+            else
+                if [ -e "$target.local" ]; then
+                    note "SKIP $name: both $name and $name.local exist — won't clobber; manual review"
+                    status_bits+=("$name:manual-review(.local exists)")
+                    continue
+                fi
+                mv "$target" "$target.local"
+                chmod +x "$target.local"
+                action="installed; pre-existing hook chained as $name.local"
+            fi
+        fi
+        cp "$TEMPLATES/$name" "$target"
+        chmod +x "$target"
+        if ! bash -n "$target"; then
+            note "ERROR: bash -n failed on installed $target"
+            status_bits+=("$name:SYNTAX-ERROR")
+            continue
+        fi
+        if [ -f "$target.local" ]; then
+            if bash -n "$target.local" 2>/dev/null; then
+                note "$name: $action ($name.local syntax OK — verified with bash -n only, never executed)"
+            else
+                note "$name: $action (WARN: $name.local failed bash -n — review it)"
+            fi
+        else
+            note "$name: $action"
+        fi
+        status_bits+=("$name:$action")
+    done
+    SUMMARY+=("$repo|installed|$(IFS='; '; echo "${status_bits[*]}")")
+}
+
+enumerate_all() {
+    local cands=(/home/user/yon /home/user/polymarket_research)
+    local p
+    for p in /home/user/projects/*/; do
+        cands+=("${p%/}")
+    done
+    # realpath dedupe (polymarket_research is a symlink to projects/polymarket)
+    declare -A seen=()
+    local c rp
+    for c in "${cands[@]}"; do
+        [ -e "$c/.git" ] || continue
+        rp="$(realpath -m "$c")"
+        if [ -n "${seen[$rp]:-}" ]; then
+            printf '== %s\n' "$c"
+            note "SKIP: same repo as ${seen[$rp]} (symlink/dup) — already processed"
+            SUMMARY+=("$c|skip|duplicate of ${seen[$rp]}")
+            continue
+        fi
+        seen[$rp]="$c"
+        install_repo "$rp"
+    done
+}
+
+if [ $# -eq 0 ]; then
+    sed -n '2,12p' "$0"
+    exit 1
+fi
+
+if [ "${1:-}" = "--all" ]; then
+    enumerate_all
+else
+    for r in "$@"; do
+        install_repo "$r"
+    done
+fi
+
+echo
+echo "== summary =="
+printf '%s\n' "${SUMMARY[@]}" | column -t -s'|' 2>/dev/null || printf '%s\n' "${SUMMARY[@]}"

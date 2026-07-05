@@ -1,0 +1,17 @@
+# gitleaks config for clankers. Extends the default ruleset and allowlists the
+# SYNTHETIC fixtures used by the secret-detection tests (lib/ecc/guard.py's job is
+# to detect secret-shaped strings, so its tests must contain example ones). These
+# are not real credentials:
+#   - AKIAIOSFODNN7EXAMPLE  — AWS's own documented example access-key id
+#   - MIIabc                — a fake/truncated PEM body
+#   - ghp_AAAA…             — a synthetic GitHub token (literal "A" repeated)
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic secret-detection test fixtures (not real credentials)"
+regexes = [
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''-----BEGIN RSA PRIVATE KEY-----\\nMIIabc''',
+  '''ghp_A{36}''',
+]

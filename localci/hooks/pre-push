@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# managed-by: localci dispatcher v1
+# Generic local-CI pre-push gate. Source of truth: ~/.git-templates/hooks/pre-push
+# (arrives in new repos via `git config --global init.templateDir`; install into
+# existing repos with: localci-install <repo>|--all). Do not hand-edit per-repo
+# copies — edit the template and re-run localci-install.
+#
+# What it does (thin dispatcher — repo-specific logic lives in the repo):
+#   1. If pre-push.local exists next to this hook (a pre-existing gate that
+#      localci-install chained aside), run it FIRST with the real pre-push
+#      stdin (ref lines) and argv. If it fails, the push is ABORTED.
+#   2. Resolve the repo's FAST suite:
+#        .localci at repo root (line `FAST=<repo-relative-path>`; if .localci
+#        exists it is authoritative — no convention fallback)
+#        else ci/fast.sh        (generic convention)
+#        else live/ci/ci_fast.sh (yon layout)
+#      No config found -> exit 0 silently (safe to install everywhere).
+#   3. Run FAST from the repo root; non-zero exit BLOCKS the push.
+#      Bypass the FAST gate once with:  SKIP_CI=1 git push
+#      (SKIP_CI never bypasses pre-push.local — pre-existing gates keep their
+#       own bypass semantics, e.g. SKIP_PRE_PUSH_TESTS in some repos.)
+set -u
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+# ---- 1. chained pre-existing hook (gets the real stdin + argv) -------------
+if [ -x "$HOOK_DIR/pre-push.local" ]; then
+    if ! "$HOOK_DIR/pre-push.local" "$@"; then
+        echo "[localci] push blocked by pre-push.local (pre-existing repo gate)" >&2
+        exit 1
+    fi
+fi
+
+# ---- 2. resolve FAST --------------------------------------------------------
+FAST=""
+if [ -f "$ROOT/.localci" ]; then
+    FAST="$(sed -n 's/^FAST=//p' "$ROOT/.localci" | head -n1)"
+elif [ -x "$ROOT/ci/fast.sh" ]; then
+    FAST="ci/fast.sh"
+elif [ -x "$ROOT/live/ci/ci_fast.sh" ]; then
+    FAST="live/ci/ci_fast.sh"
+fi
+[ -z "$FAST" ] && exit 0
+case "$FAST" in /*) FAST_ABS="$FAST" ;; *) FAST_ABS="$ROOT/$FAST" ;; esac
+if [ ! -f "$FAST_ABS" ]; then
+    echo "[localci] WARN: FAST=$FAST configured but $FAST_ABS is missing — gate skipped" >&2
+    exit 0
+fi
+
+# ---- 3. run FAST (the gate) -------------------------------------------------
+if [ "${SKIP_CI:-0}" = "1" ]; then
+    echo "[localci] SKIP_CI=1 — bypassing pre-push FAST gate ($FAST)"
+    exit 0
+fi
+echo "[localci] pre-push gate: $FAST (bypass once with: SKIP_CI=1 git push)"
+if [ -x "$FAST_ABS" ]; then
+    ( cd "$ROOT" && "$FAST_ABS" ) < /dev/null
+else
+    ( cd "$ROOT" && bash "$FAST_ABS" ) < /dev/null
+fi
+if [ $? -ne 0 ]; then
+    echo "[localci] PUSH BLOCKED — $FAST failed (see above). Fix it, or bypass once with: SKIP_CI=1 git push" >&2
+    exit 1
+fi
+exit 0

@@ -1,0 +1,31 @@
+# Hermetic test-fixture registry (2026-07-05) — tests/test_all.py pins CLANKER_REGISTRY
+# here so the suite no longer depends on the LIVE ~/projects/.clanker.yaml contents.
+# (quanta-ai was removed from the live registry in the harness overhaul; the suite
+# used it as an implicit always-present fixture. Now it is an EXPLICIT fixture.)
+defaults:
+  index_on_session_start: true
+  retrospective_on_stop: true
+  track_errors: true
+archetypes:
+  production:
+    hooks:
+    - deploy-gate
+    - pre-commit-verification
+    - post-deploy-screenshot
+    - check-git-target
+    index_generator: python
+    deploy_target: eigenstate-vm
+  frontend:
+    hooks:
+    - pre-commit-verification
+    index_generator: typescript
+  tool:
+    hooks: []
+    index_generator: none
+projects:
+  quanta-ai:
+    archetype: production
+    remote: CapitalistCookie/quanta-ai
+  zergrush:
+    archetype: frontend
+    remote: CapitalistCookie/zergrush

@@ -1,0 +1,12 @@
+{
+  "name": "clanker",
+  "description": "Self-improving development harness — session tracking, project registry, intelligent alerting, and improvement proposals",
+  "version": "1.0.0",
+  "author": {
+    "name": "CapitalistCookie"
+  },
+  "homepage": "https://github.com/CapitalistCookie/clanker",
+  "repository": "https://github.com/CapitalistCookie/clanker",
+  "license": "MIT",
+  "keywords": ["harness", "session-tracking", "alerts", "registry", "self-improving"]
+}

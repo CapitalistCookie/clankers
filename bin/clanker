@@ -1,0 +1,910 @@
+#!/usr/bin/env python3
+"""Clanker — Self-improving development harness CLI.
+
+All phases: registry, sessions, analysis, proposals, alerts, knowledge base,
+onboarding, audit, GC, resource monitoring, temporal analysis, export/import.
+"""
+
+import argparse
+import sys
+import os
+
+# Add lib to path — resolve symlinks so this works from ~/bin/clanker
+_this = os.path.realpath(__file__)
+sys.path.insert(0, os.path.join(os.path.dirname(_this), '..', 'lib'))
+
+# ─── Tier 1 Commands ─────────────────────────────────────────────────────────
+
+def cmd_registry(args):
+    from registry import Registry
+    reg = Registry()
+    if args.action == 'list':
+        reg.list_projects()
+    elif args.action == 'archetype':
+        print(reg.get_archetype(args.name))
+    elif args.action == 'hooks':
+        for h in reg.get_hooks(args.name):
+            print(h)
+    elif args.action == 'path':
+        print(reg.get_path(args.name))
+
+def cmd_log(args):
+    print("clanker log is called by the SessionEnd hook, not directly.", file=sys.stderr)
+    print("Use 'clanker sessions' to query historical data.", file=sys.stderr)
+    sys.exit(1)
+
+def cmd_sessions(args):
+    from analyze import load_sessions
+    import json as _json
+    sessions = load_sessions(last_days=args.last)
+    if args.project:
+        sessions = [s for s in sessions if s.get('project') == args.project]
+    if not sys.stdin.isatty():
+        # Reading from pipe — pass through
+        for line in sys.stdin:
+            sessions.append(_json.loads(line.strip()))
+    if args.json:
+        for s in sessions:
+            print(_json.dumps(s))
+    else:
+        print(f"{'Date':<12} {'Project':<18} {'Duration':>8} {'Errors':>6} {'Tools':>6}")
+        print('-' * 56)
+        for s in sessions:
+            dur = f"{min(s.get('duration_s', 0), 28800) // 60}m"
+            errs = s.get('errors', 0)
+            tools = sum(s.get('tool_uses', {}).values())
+            ts = s.get('timestamp', '')[:10]
+            proj = s.get('project', '?')
+            print(f"{ts:<12} {proj:<18} {dur:>8} {errs:>6} {tools:>6}")
+
+def cmd_analyze(args):
+    from analyze import run_analysis
+    run_analysis(args.mode, by=args.by, last_days=args.last, json_output=args.json)
+
+def cmd_autonomy(args):
+    from autonomy import report
+    report(last_days=args.last, json_output=args.json)
+
+def cmd_ecc(args):
+    from ecc import cli as ecc_cli
+    sys.exit(ecc_cli.run(args))
+
+def cmd_orch(args):
+    from orch import cli as orch_cli
+    sys.exit(orch_cli.run(args))
+
+def cmd_propose(args):
+    from propose import generate_proposals, expire_stale
+    if getattr(args, 'expire_before', None):
+        expire_stale(before=args.expire_before, reason=args.reason)
+        return
+    generate_proposals(from_retro=args.from_retro)
+
+def cmd_review(args):
+    from propose import review_proposals
+    review_proposals()
+
+def cmd_alert(args):
+    from alerts import handle_alert
+    handle_alert(args.action, alert_id=args.id, message=args.message, cron=args.cron, json_output=args.json)
+
+def cmd_version(args):
+    import json as _json
+    plugin_json = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '.claude-plugin', 'plugin.json')
+    try:
+        with open(plugin_json) as f:
+            meta = _json.load(f)
+        print(f"clanker v{meta['version']}")
+    except:
+        print("clanker v0.2.0")
+
+    from analyze import load_sessions
+    from alerts import count_alerts
+    from propose import count_pending
+    from wiki import get_wiki_stats
+
+    sessions = load_sessions(last_days=7)
+    alert_count = count_alerts()
+    pending = count_pending()
+    wiki_stats = get_wiki_stats()
+
+    print(f"Sessions (7d): {len(sessions)}")
+    print(f"Active alerts: {alert_count}")
+    print(f"Pending proposals: {pending}")
+    print(f"Wiki: {wiki_stats['total_articles']} articles, {wiki_stats['total_words']} words")
+
+def cmd_adopt(args):
+    from adopt import adopt
+    sys.exit(adopt(args.target, archetype=args.archetype, new=getattr(args, 'new', False)))
+
+def cmd_create(args):
+    from adopt import adopt
+    sys.exit(adopt(args.name, archetype=args.archetype, new=True))
+
+def cmd_memory_new(args):
+    from memorycmd import new
+    return new(args.slug, args.type, args.desc, project=args.project, body=args.body or "")
+
+def cmd_memory_doctor(args):
+    from memorycmd import doctor
+    return doctor(project=args.project)
+
+def cmd_doctor(args):
+    if getattr(args, 'project', None):
+        from adopt import doctor_project
+        sys.exit(doctor_project(args.project))
+    issues = []
+    reg_path = os.environ.get('CLANKER_REGISTRY', os.path.expanduser('~/projects/.clanker.yaml'))
+    if os.path.exists(reg_path):
+        try:
+            import yaml
+            with open(reg_path) as f:
+                yaml.safe_load(f)
+            print("✓ Registry valid")
+        except Exception as e:
+            print(f"✗ Registry invalid: {e}")
+            issues.append("registry")
+    else:
+        print(f"✗ Registry missing: {reg_path}")
+        issues.append("registry")
+
+    data_dir = os.environ.get('CLANKER_DATA', '/data/clanker')
+    for subdir in ['raw/sessions', 'raw/health', 'proposals', 'alerts', 'reports', 'audit', 'wiki']:
+        path = os.path.join(data_dir, subdir)
+        if os.path.isdir(path):
+            print(f"✓ {subdir}/ exists")
+        else:
+            print(f"✗ {subdir}/ missing")
+            issues.append(subdir)
+
+    plugin_root = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')
+    hooks_json = os.path.join(plugin_root, 'hooks', 'hooks.json')
+    if os.path.exists(hooks_json):
+        print("✓ Plugin hooks.json exists")
+    else:
+        print("✗ Plugin hooks.json missing")
+        issues.append("hooks")
+
+    if os.path.exists(os.path.expanduser('~/bin/clanker')):
+        print("✓ clanker in PATH")
+    else:
+        print("✗ clanker not in PATH")
+        issues.append("path")
+
+    # Check hooks in settings.json
+    import json as _json
+    try:
+        with open(os.path.expanduser('~/.claude/settings.json')) as f:
+            settings = _json.load(f)
+        hook_events = settings.get('hooks', {})
+        has_start = any('clanker' in h.get('command', '') for m in hook_events.get('SessionStart', []) for h in m.get('hooks', []))
+        has_end = any('clanker' in h.get('command', '') for m in hook_events.get('SessionEnd', []) for h in m.get('hooks', []))
+        print(f"{'✓' if has_start else '✗'} SessionStart hook registered")
+        print(f"{'✓' if has_end else '✗'} SessionEnd hook registered")
+        if not has_start: issues.append("session-start-hook")
+        if not has_end: issues.append("session-end-hook")
+    except:
+        print("✗ Cannot read settings.json")
+        issues.append("settings")
+
+    # Check cron jobs
+    import subprocess
+    try:
+        crons = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL, text=True)
+        has_health = "clanker alert check" in crons
+        has_weekly = "clanker analyze weekly" in crons
+        print(f"{'✓' if has_health else '✗'} Health check cron installed")
+        print(f"{'✓' if has_weekly else '✗'} Weekly analysis cron installed")
+        if not has_health: issues.append("health-cron")
+        if not has_weekly: issues.append("weekly-cron")
+    except:
+        print("✗ Cannot read crontab")
+
+    if issues:
+        print(f"\n{len(issues)} issue(s) found")
+        sys.exit(1)
+    else:
+        print("\nAll checks passed")
+
+# ─── Tier 2 Commands ─────────────────────────────────────────────────────────
+
+def cmd_compile(args):
+    from wiki import compile_wiki
+    articles = compile_wiki(dry_run=args.dry_run)
+    if args.dry_run:
+        print(f"Would write {articles} project articles (dry run)")
+    else:
+        print(f"Compiled {articles} project articles")
+        from audit import log_change
+        log_change("wiki-compiled", f"{articles} articles", {"dry_run": False})
+
+def cmd_lint_wiki(args):
+    from wiki import lint_wiki
+    issues = lint_wiki()
+    if issues:
+        for i in issues:
+            print(f"  ⚠ {i}")
+        print(f"\n{len(issues)} issue(s) found")
+    else:
+        print("Wiki is clean — no issues found")
+
+def cmd_init(args):
+    from onboard import init_project, detect_archetype
+    path = os.path.expanduser(f"~/projects/{args.name}")
+    if args.detect:
+        archetype, scores = detect_archetype(path)
+        print(f"Detected: {archetype}")
+        print(f"Scores: {scores}")
+    else:
+        init_project(args.name, archetype=args.archetype)
+        from audit import log_change
+        log_change("project-init", args.name, {"archetype": args.archetype})
+        # Set up tmux session
+        if not args.no_tmux:
+            from tmux_manager import add_session
+            add_session(args.name, path)
+
+def cmd_remove(args):
+    from onboard import remove_project
+    from audit import log_change
+    remove_project(args.name)
+    log_change("project-removed", args.name)
+
+def cmd_tmux(args):
+    from tmux_manager import list_sessions, add_session, remove_session
+    if args.action == 'list':
+        print(list_sessions())
+    elif args.action == 'add':
+        add_session(args.name, args.path)
+    elif args.action == 'remove':
+        remove_session(args.name)
+
+def cmd_new(args):
+    from newsession import spawn
+    name = " ".join(args.name) if args.name else None
+    sess, msg = spawn(name=name, shell=args.shell)
+    print(msg)
+    return 0 if sess else 1
+
+def cmd_open(args):
+    from newsession import attach
+    ok, msg = attach(args.name)
+    print(msg)
+    return 0 if ok else 1
+
+def cmd_work(args):
+    """`clanker work <project>` — launch (or reattach) a Claude work session IN the
+    project's repo, so the repo's CLAUDE.md / skills / hooks / memory namespace load.
+    Harness overhaul 2026-07-05: sessions belong in repos; ~ is for meta work only."""
+    from registry import Registry
+    from newsession import spawn, attach
+    reg = Registry()
+    name = args.project
+    path = reg.get_path(name)
+    if not path or not os.path.isdir(path):
+        known = ", ".join(sorted(reg.projects.keys()))
+        print(f"work: unknown project '{name}' (path: {path or '?'})\nregistered: {known}",
+              file=sys.stderr)
+        return 1
+    if args.print_path:
+        print(path)
+        return 0
+    sess, msg = spawn(name=name, cwd=path, shell=args.shell, resume=getattr(args, 'resume', None))
+    print(msg)
+    if not sess:
+        return 1
+    if args.no_attach:
+        return 0
+    ok, amsg = attach(sess)
+    print(amsg)
+    return 0 if ok else 1
+
+def cmd_briefing(args):
+    from briefing import generate_briefing
+    briefing = generate_briefing(args.project)
+    if briefing:
+        print(briefing)
+    else:
+        print(f"No briefing data for {args.project}")
+
+# ─── Tier 3 Commands ─────────────────────────────────────────────────────────
+
+def cmd_audit_configs(args):
+    """Scan a project for external-fact configs + verify watchdog coverage.
+
+    See lib/audit_configs.py for the heuristic and rationale.
+    """
+    from audit_configs import audit_configs as _audit
+    sys.exit(_audit(args.path))
+
+def cmd_audit(args):
+    from audit import print_audit
+    print_audit(last_n=args.last)
+
+def cmd_gc(args):
+    from cleanup import run_gc
+    results = run_gc(dry_run=args.dry_run)
+    for key, val in results.items():
+        print(f"  {key}: {val}")
+    if args.dry_run:
+        print("(dry run — no changes made)")
+    else:
+        from audit import log_change
+        log_change("gc-run", "garbage-collection", results)
+
+def cmd_resources(args):
+    from advanced import resource_monitor
+    results = resource_monitor()
+    print("=== VM Resources ===")
+    print(f"  Load: {results.get('load_1m', '?')} / {results.get('load_5m', '?')} / {results.get('load_15m', '?')}")
+    print(f"  RAM: {results.get('ram_available_gb', '?')}GB free / {results.get('ram_total_gb', '?')}GB ({results.get('ram_used_pct', '?')}% used)")
+    print(f"  Swap: {results.get('swap_used_gb', '?')}GB / {results.get('swap_total_gb', '?')}GB")
+    print(f"  Disk: {results.get('disk_avail_gb', '?')}GB free ({results.get('disk_used_pct', '?')}% used)")
+
+def cmd_temporal(args):
+    from advanced import temporal_analysis
+    temporal_analysis(last_days=args.last)
+
+def cmd_model_versions(args):
+    from advanced import model_version_analysis
+    model_version_analysis(last_days=args.last)
+
+def cmd_harness_snapshot(args):
+    from advanced import harness_version_snapshot
+    import json as _json
+    snapshot = harness_version_snapshot()
+    print("=== Harness Snapshot ===")
+    for k, v in snapshot.items():
+        print(f"  {k}: {v}")
+
+def cmd_skills(args):
+    from advanced import skill_effectiveness
+    skill_effectiveness(last_days=args.last)
+
+def cmd_export(args):
+    from advanced import export_harness
+    export_harness(args.output)
+
+def cmd_import(args):
+    from advanced import import_harness
+    import_harness(args.archive)
+
+def cmd_orchestrate(args):
+    from orchestrate import orchestrate
+    orchestrate(args.plan, project_path=args.project, checkpoint_interval=args.checkpoint)
+
+def cmd_cross_project(args):
+    from crossproject import analyze_cross_project, suggest_transfers
+    if args.suggest:
+        suggest_transfers(last_days=args.last)
+    else:
+        analyze_cross_project(last_days=args.last)
+
+def cmd_contracts(args):
+    from contracts import scan_contracts, check_contract_changes
+    from registry import Registry
+    reg = Registry()
+    if args.check:
+        check_contract_changes(args.project, base_ref=args.base)
+    else:
+        path = reg.get_path(args.project)
+        contracts = scan_contracts(path)
+        total = sum(len(v) for v in contracts.values())
+        print(f"=== Contracts in {args.project} ===\n")
+        for ctype, items in contracts.items():
+            if items:
+                print(f"{ctype}: {len(items)}")
+                for item in items[:10]:
+                    if ctype == "http":
+                        print(f"  {item['method']} {item['path']} ({item['file']})")
+                    elif ctype == "websocket":
+                        print(f"  event '{item['event']}' ({item['file']})")
+                    elif ctype == "pubsub":
+                        print(f"  channel '{item['channel']}' ({item['file']})")
+                if len(items) > 10:
+                    print(f"  ...and {len(items) - 10} more")
+        print(f"\nTotal: {total} contracts")
+
+def cmd_context(args):
+    from context import analyze_file_frequency, analyze_session_patterns
+    analyze_file_frequency(project=args.project, last_days=args.last)
+    analyze_session_patterns(project=args.project, last_days=args.last)
+
+def cmd_plugins(args):
+    from plugins import list_plugins, run_all_analyzers, run_all_health_checks
+    if args.action == 'list':
+        list_plugins()
+    elif args.action == 'run-analyzers':
+        run_all_analyzers()
+    elif args.action == 'run-health':
+        results = run_all_health_checks()
+        for r in results:
+            status = "OK" if r["exit_code"] == 0 else "FAIL"
+            print(f"  [{status}] {r['name']}")
+
+def cmd_suggest_skills(args):
+    from ecosystem import suggest_skills
+    suggest_skills(project=args.project, archetype=args.archetype)
+
+def cmd_new_watchdog(args):
+    """Scaffold a new drift-watchdog plugin from the standard template.
+
+    Class-of-bug pattern from eigenstateresearch Session 7: every config
+    encoding an external fact needs a paired watchdog. This generator
+    eliminates the 200-line boilerplate.
+    """
+    from plugins import scaffold_watchdog
+    try:
+        path = scaffold_watchdog(
+            name=args.name, kind=args.kind, out_dir=args.dir,
+        )
+    except (ValueError, FileExistsError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Created watchdog scaffold at: {path}")
+    print()
+    print("Next steps:")
+    print("  1. Edit load_local()  — point at your local config/map")
+    print("  2. Edit fetch_remote() — wire up the external API call")
+    print("  3. Edit compare()     — equality logic that returns drift list")
+    print("  4. Symlink into /data/clanker/plugins/health-checks/ if needed")
+    print(f"  5. Smoke test: {path}")
+
+def cmd_dashboard(args):
+    from dashboard import generate_dashboard
+    generate_dashboard(output_path=args.output, watch=args.watch)
+
+def cmd_serve(args):
+    from serve import run_server
+    run_server(host=args.host, port=args.port, ntfy_topic=args.ntfy_topic)
+
+def cmd_serve_user(args):
+    import serve_user
+    if args.action == 'add':
+        serve_user.add(args.username, force=args.force)
+    elif args.action == 'passwd':
+        serve_user.passwd(args.username)
+    elif args.action == 'remove':
+        serve_user.remove(args.username)
+    elif args.action == 'recovery':
+        serve_user.recovery(args.username)
+    elif args.action == 'list':
+        serve_user.list_all()
+
+def cmd_decompose(args):
+    from decompose import check_prompt
+    prompt = args.prompt or " ".join(args.text) if args.text else None
+    if not prompt:
+        import sys
+        if not sys.stdin.isatty():
+            prompt = sys.stdin.read().strip()
+    if not prompt:
+        print("Usage: clanker decompose 'your task description'")
+        print("   or: echo 'task' | clanker decompose")
+        return
+    check_prompt(prompt, project=args.project)
+
+def cmd_regression(args):
+    from regression import check_regressions, detect_anomalies
+    if args.action == 'check':
+        check_regressions(days_after=args.days)
+    elif args.action == 'anomalies':
+        detect_anomalies(lookback_days=args.lookback, compare_days=args.compare)
+
+def cmd_ingest(args):
+    from ingest import ingest_from_args, ingest_from_stdin, ingest_batch
+    import sys
+
+    if args.batch:
+        data = sys.stdin.read()
+        success, errors = ingest_batch(data)
+        print(f"Ingested: {success} events, {errors} errors")
+        return
+
+    if not args.event:
+        # Read from stdin (piped JSON)
+        ok, sid, errs = ingest_from_stdin()
+        if ok:
+            print(sid)
+        else:
+            for e in errs:
+                print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    ok, sid, errs = ingest_from_args(
+        event=args.event,
+        agent=args.agent or "unknown",
+        project=args.project or os.path.basename(os.getcwd()),
+        cwd=args.cwd or os.getcwd(),
+        session_id=args.session_id,
+        duration=args.duration,
+        outcome=args.outcome,
+        summary=args.summary,
+        files_changed=args.files_changed,
+        exit_code=args.exit_code,
+        git_diff_stats=args.git_diff_stats,
+        agent_version=args.agent_version,
+    )
+    if ok:
+        print(sid)
+    else:
+        for e in errs:
+            print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+def cmd_wrap(args):
+    """Wrap any command with session tracking."""
+    import subprocess, time, json, re
+
+    project = args.project or os.path.basename(os.getcwd())
+    agent = "generic"
+
+    # Snapshot git state before
+    git_before = {}
+    try:
+        git_before["branch"] = subprocess.check_output(
+            ["git", "branch", "--show-current"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        git_before["commit"] = subprocess.check_output(
+            ["git", "log", "--oneline", "-1"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except:
+        pass
+
+    # Start session
+    from ingest import ingest_from_args
+    ok, sid, _ = ingest_from_args("session_start", agent, project, cwd=os.getcwd())
+    if ok:
+        print(f"[clanker] Session {sid[:8]} started", file=__import__('sys').stderr)
+
+    # Run the command
+    start = time.time()
+    try:
+        result = subprocess.run(args.command, shell=False)
+        exit_code = result.returncode
+    except KeyboardInterrupt:
+        exit_code = 130
+    except Exception as e:
+        print(f"[clanker] Command failed: {e}", file=__import__('sys').stderr)
+        exit_code = 1
+
+    duration = int(time.time() - start)
+
+    # Snapshot git state after
+    git_diff = {}
+    try:
+        diff_stat = subprocess.check_output(
+            ["git", "diff", "--shortstat", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if diff_stat:
+            ins = re.search(r'(\d+) insertion', diff_stat)
+            dels = re.search(r'(\d+) deletion', diff_stat)
+            files = re.search(r'(\d+) file', diff_stat)
+            git_diff = {
+                "insertions": int(ins.group(1)) if ins else 0,
+                "deletions": int(dels.group(1)) if dels else 0,
+                "files": int(files.group(1)) if files else 0,
+            }
+    except:
+        pass
+
+    # Determine outcome
+    outcome = "unknown"
+    try:
+        new_commit = subprocess.check_output(
+            ["git", "log", "--oneline", "-1"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if git_before.get("commit") and new_commit != git_before["commit"]:
+            outcome = "commit"
+    except:
+        pass
+    if exit_code != 0:
+        outcome = "abandoned"
+
+    # End session
+    ok, _, _ = ingest_from_args(
+        "session_end", agent, project,
+        cwd=os.getcwd(), session_id=sid,
+        duration=duration, outcome=outcome,
+        exit_code=exit_code, git_diff_stats=json.dumps(git_diff) if git_diff else None,
+    )
+    if ok:
+        print(f"[clanker] Session {sid[:8]} ended ({duration}s, exit={exit_code})", file=__import__('sys').stderr)
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(prog='clanker', description='Self-improving development harness')
+    sub = parser.add_subparsers(dest='command')
+
+    # === Tier 1 ===
+    p = sub.add_parser('registry', help='Project registry')
+    p.add_argument('action', choices=['list', 'archetype', 'hooks', 'path'])
+    p.add_argument('name', nargs='?', default='')
+    p.set_defaults(func=cmd_registry)
+
+    p = sub.add_parser('log', help='Extract session metrics (hook only)')
+    p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser('sessions', help='Query session data')
+    p.add_argument('--last', type=int, default=7, help='Days to look back')
+    p.add_argument('--project', help='Filter by project')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser('analyze', help='Run analysis')
+    p.add_argument('mode', choices=['daily', 'weekly', 'errors', 'slow'], default='daily', nargs='?')
+    p.add_argument('--by', choices=['project', 'tool', 'archetype'], default='project')
+    p.add_argument('--last', type=int, default=7)
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser('propose', help='Generate proposals (auto-expires pending >30d first)')
+    p.add_argument('--from-retro', action='store_true')
+    p.add_argument('--expire-before', default=None, metavar='YYYY-MM-DD',
+                   help='ONLY expire pending proposals older than this date (no generation)')
+    p.add_argument('--reason', default=None, help='reason recorded on expired proposals')
+    p.set_defaults(func=cmd_propose)
+
+    p = sub.add_parser('autonomy', help='Autonomy scoreboard — hands-off %% of sessions, intervention rate, where Claude needs you')
+    p.add_argument('--last', type=int, default=30)
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=cmd_autonomy)
+
+    p = sub.add_parser('ecc', help='Optional ECC-derived analyses (off by default; running one opts in)')
+    p.add_argument('action', choices=['scan', 'parked', 'overlap', 'trend', 'risk', 'budget', 'guard'])
+    p.add_argument('cmdline', nargs='*', help="Command to classify (guard); quote it, e.g. ecc guard 'git push --force'")
+    p.add_argument('--last', type=int, default=30, help='Days of sessions to consider')
+    p.add_argument('--pending', type=int, default=1800, help='Parked threshold (seconds with no tool result)')
+    p.add_argument('--scan', dest='scan', type=int, default=20, help='Recent transcripts to risk-scan')
+    p.add_argument('--limit', type=float, help='Budget limit in USD (for the budget action)')
+    p.set_defaults(func=cmd_ecc)
+
+    p = sub.add_parser('orch', help='Orchestration — spawn & steer agent sessions (OFF by default; WebUI-controllable)')
+    p.add_argument('action', nargs='?', default='status',
+                   choices=['status', 'on', 'off', 'set', 'spawn', 'list', 'stop', 'supervise', 'enqueue', 'dispatch'])
+    p.add_argument('cmdline', nargs='*', help='action args: task / "key value" / session id')
+    p.add_argument('--project', help='Project for spawn/enqueue')
+    p.add_argument('--headless', action='store_true', help='Spawn a headless (claude --print) session')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=cmd_orch)
+
+    p = sub.add_parser('review', help='Review pending proposals')
+    p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser('alert', help='Alert management')
+    p.add_argument('action', choices=['list', 'check', 'dismiss', 'create'])
+    p.add_argument('--id', help='Alert ID')
+    p.add_argument('--message', help='Alert message')
+    p.add_argument('--cron', action='store_true')
+    p.add_argument('--json', action='store_true')
+    p.set_defaults(func=cmd_alert)
+
+    p = sub.add_parser('version', help='Version and status')
+    p.set_defaults(func=cmd_version)
+
+    p = sub.add_parser('doctor', help='Self-diagnostics; with a project name, run the project CONTRACT check')
+    p.add_argument('project', nargs='?', default=None,
+                   help='project name: check registered/CLAUDE.md/state-file/ci/remote/no-plaintext-secrets')
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser('memory', help='Memory-file ops (lint-clean by construction): new / doctor')
+    msub = p.add_subparsers(dest='memaction', required=True)
+    mp = msub.add_parser('new', help='Scaffold a memory file + index pointer (frontmatter law enforced)')
+    mp.add_argument('slug', help='kebab-case filename (no .md)')
+    mp.add_argument('--type', required=True, choices=['user', 'feedback', 'project', 'reference'])
+    mp.add_argument('--desc', required=True, help='one-line description (recall routes on this)')
+    mp.add_argument('--project', default=None, help='target a project namespace instead of the global router')
+    mp.add_argument('--body', default='', help='memory body text')
+    mp.set_defaults(func=cmd_memory_new)
+    mp = msub.add_parser('doctor', help='Lint-sweep a memory dir + regen INDEX_ALL.md')
+    mp.add_argument('--project', default=None)
+    mp.set_defaults(func=cmd_memory_doctor)
+
+    p = sub.add_parser('create', help='Start a project from NOTHING: mkdir ~/projects/<name> + git init + scaffold contract + register + doctor. Then: clanker work <name>')
+    p.add_argument('name', help='project name (becomes ~/projects/<name>) or explicit path')
+    p.add_argument('--archetype', default=None, help='research | production | frontend | infra | tool (default: auto-detect)')
+    p.set_defaults(func=cmd_create)
+
+    p = sub.add_parser('adopt', help='Ingest an EXISTING repo: clone (URL) or use in place, register, scaffold missing contract pieces (CLAUDE.md/STATUS.md/ci), then doctor')
+    p.add_argument('target', help='git URL, local path, or bare name (= ~/projects/<name>)')
+    p.add_argument('--archetype', default=None, help='override archetype detection')
+    p.add_argument('--new', action='store_true', help='(= clanker create) create the directory + git init before scaffolding')
+    p.set_defaults(func=cmd_adopt)
+
+    # === Tier 2 ===
+    p = sub.add_parser('compile', help='Compile knowledge base from session data')
+    p.add_argument('--dry-run', action='store_true')
+    p.set_defaults(func=cmd_compile)
+
+    p = sub.add_parser('lint-wiki', help='Check knowledge base consistency')
+    p.set_defaults(func=cmd_lint_wiki)
+
+    p = sub.add_parser('init', help='Onboard a new project')
+    p.add_argument('name', help='Project name')
+    p.add_argument('--archetype', help='Override archetype')
+    p.add_argument('--detect', action='store_true', help='Only detect archetype, don\'t scaffold')
+    p.add_argument('--no-tmux', action='store_true', help='Skip tmux session creation')
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser('remove', help='Remove project from clanker (keeps repo)')
+    p.add_argument('name', help='Project name')
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser('tmux', help='Tmux session management')
+    p.add_argument('action', choices=['list', 'add', 'remove'])
+    p.add_argument('name', nargs='?', help='Session/project name')
+    p.add_argument('--path', help='Project path (for add)')
+    p.set_defaults(func=cmd_tmux)
+
+    p = sub.add_parser('scratch', aliases=['new'],
+                       help='Throwaway Claude session at the CURRENT dir — no project machinery. (Projects: `create`/`adopt`; project sessions: `work`.)')
+    p.add_argument('name', nargs='*', help='Session name (default: auto-generated)')
+    p.add_argument('--shell', action='store_true', help='Launch a bare shell instead of Claude')
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser('open', aliases=['attach', 'test'],
+                       help='Attach to a session from `clanker new` (default: most recent)')
+    p.add_argument('name', nargs='?', help='Session name (default: most recent)')
+    p.set_defaults(func=cmd_open)
+
+    p = sub.add_parser('work', help='Launch/attach a Claude work session IN a registered project repo (tmux + cd + claude)')
+    p.add_argument('project', help='registry project name (clanker registry list)')
+    p.add_argument('--shell', action='store_true', help='bare shell instead of claude')
+    p.add_argument('--no-attach', action='store_true', help='start detached; do not attach')
+    p.add_argument('--print-path', action='store_true', help='print resolved repo path and exit')
+    p.add_argument('--resume', nargs='?', const=True, default=None, metavar='SESSION_ID',
+                   help="resume a past conversation in this repo: bare --resume opens the picker (this repo's sessions only); with an id, resumes it directly")
+    p.set_defaults(func=cmd_work)
+
+    p = sub.add_parser('briefing', help='Generate project briefing')
+    p.add_argument('project', help='Project name')
+    p.set_defaults(func=cmd_briefing)
+
+    # === Tier 3 ===
+    p = sub.add_parser('audit', help='View audit trail')
+    p.add_argument('--last', type=int, default=20)
+    p.set_defaults(func=cmd_audit)
+
+    # Scan a project for external-fact configs + verify drift-watchdog
+    # coverage. Class-of-bug preventer from eigenstateresearch Session 7.
+    p = sub.add_parser('audit-configs', help='Scan project for unchecked external-fact configs')
+    p.add_argument('path', help='Project root path')
+    p.set_defaults(func=cmd_audit_configs)
+
+    p = sub.add_parser('gc', help='Garbage collection')
+    p.add_argument('--dry-run', action='store_true')
+    p.set_defaults(func=cmd_gc)
+
+    p = sub.add_parser('resources', help='VM resource monitor')
+    p.set_defaults(func=cmd_resources)
+
+    p = sub.add_parser('temporal', help='Temporal analysis (time-of-day, day-of-week)')
+    p.add_argument('--last', type=int, default=30)
+    p.set_defaults(func=cmd_temporal)
+
+    p = sub.add_parser('model-versions', help='Analyze by Claude Code version')
+    p.add_argument('--last', type=int, default=30)
+    p.set_defaults(func=cmd_model_versions)
+
+    p = sub.add_parser('snapshot', help='Harness version snapshot')
+    p.set_defaults(func=cmd_harness_snapshot)
+
+    p = sub.add_parser('skills', help='Skill effectiveness analysis')
+    p.add_argument('--last', type=int, default=30)
+    p.set_defaults(func=cmd_skills)
+
+    p = sub.add_parser('export', help='Export harness state')
+    p.add_argument('--output', help='Output tarball path')
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser('import', help='Import harness state')
+    p.add_argument('archive', help='Archive path')
+    p.set_defaults(func=cmd_import)
+
+    # === New Tier 3 ===
+    p = sub.add_parser('orchestrate', help='Orchestrate a plan with task dispatch')
+    p.add_argument('plan', help='Path to plan markdown file')
+    p.add_argument('--project', help='Project path')
+    p.add_argument('--checkpoint', type=int, default=3, help='Checkpoint every N tasks')
+    p.set_defaults(func=cmd_orchestrate)
+
+    p = sub.add_parser('cross-project', help='Cross-project pattern analysis')
+    p.add_argument('--last', type=int, default=30)
+    p.add_argument('--suggest', action='store_true', help='Suggest transfers')
+    p.set_defaults(func=cmd_cross_project)
+
+    p = sub.add_parser('contracts', help='Scan/check API contracts')
+    p.add_argument('project', help='Project name')
+    p.add_argument('--check', action='store_true', help='Check recent changes for contract violations')
+    p.add_argument('--base', default='HEAD~1', help='Base ref for checking changes')
+    p.set_defaults(func=cmd_contracts)
+
+    p = sub.add_parser('context', help='Context window intelligence')
+    p.add_argument('--project', help='Filter by project')
+    p.add_argument('--last', type=int, default=30)
+    p.set_defaults(func=cmd_context)
+
+    p = sub.add_parser('plugins', help='List/run plugins')
+    p.add_argument('action', choices=['list', 'run-analyzers', 'run-health'], nargs='?', default='list')
+    p.set_defaults(func=cmd_plugins)
+
+    p = sub.add_parser('dashboard', help='Generate HTML dashboard')
+    p.add_argument('--output', help='Output file path')
+    p.add_argument('--watch', action='store_true', help='Watch for data changes and auto-regenerate')
+    p.set_defaults(func=cmd_dashboard)
+
+    p = sub.add_parser('serve', help='Live dashboard server with terminal bridge')
+    p.add_argument('--host', default='127.0.0.1', help='Bind address (default: 127.0.0.1 — loopback; the tunnel reaches it locally)')
+    p.add_argument('--port', type=int, default=8899, help='Port (default: 8899)')
+    p.add_argument('--ntfy-topic', help='ntfy.sh topic for input-needed notifications')
+    p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser('serve-user', help='Manage dashboard logins (username + password + TOTP)')
+    p.add_argument('action', choices=['add', 'list', 'remove', 'passwd', 'recovery'])
+    p.add_argument('username', nargs='?', default='', help='Username (for add/remove/passwd/recovery)')
+    p.add_argument('--force', action='store_true', help='Reset an existing user (add)')
+    p.set_defaults(func=cmd_serve_user)
+
+    p = sub.add_parser('suggest-skills', help='Search skills.sh for relevant skills')
+    p.add_argument('--project', help='Project name')
+    p.add_argument('--archetype', help='Override archetype')
+    p.set_defaults(func=cmd_suggest_skills)
+
+    # Drift watchdog scaffolder — addresses the eigenstateresearch
+    # Session 7 class-of-bug where data-config silently drifted from
+    # external truth without any plugin watching for it.
+    p = sub.add_parser('new-watchdog', help='Scaffold a new drift-watchdog plugin')
+    p.add_argument('name', help='Plugin slug, e.g. "station-drift"')
+    p.add_argument('--kind', default='config-drift',
+                   choices=['config-drift', 'api-contract', 'param-bounds'],
+                   help='Watchdog flavor (default config-drift)')
+    p.add_argument('--dir', default=None,
+                   help='Output directory (defaults to plugin install dir)')
+    p.set_defaults(func=cmd_new_watchdog)
+
+    p = sub.add_parser('decompose', help='Analyze prompt complexity')
+    p.add_argument('text', nargs='*', help='Task description')
+    p.add_argument('--prompt', help='Task description (alternative)')
+    p.add_argument('--project', help='Project context')
+    p.set_defaults(func=cmd_decompose)
+
+    p = sub.add_parser('regression', help='Regression detection')
+    p.add_argument('action', choices=['check', 'anomalies'], default='check', nargs='?')
+    p.add_argument('--days', type=int, default=14, help='Days after implementation to check')
+    p.add_argument('--lookback', type=int, default=7, help='Recent window for anomaly detection')
+    p.add_argument('--compare', type=int, default=30, help='Historical window for comparison')
+    p.set_defaults(func=cmd_regression)
+
+    # === Universal ===
+    p = sub.add_parser('ingest', help='Ingest events from any source')
+    p.add_argument('--event', choices=['session_start', 'session_end', 'heartbeat'])
+    p.add_argument('--agent', help='Agent name (claude-code, cursor, generic, ci)')
+    p.add_argument('--project', help='Project name')
+    p.add_argument('--cwd', help='Working directory')
+    p.add_argument('--session-id', help='Session ID (auto-generated if omitted)')
+    p.add_argument('--duration', type=int, help='Duration in seconds')
+    p.add_argument('--outcome', choices=['commit', 'push', 'deploy', 'abandoned', 'unknown'])
+    p.add_argument('--summary', help='Session summary')
+    p.add_argument('--files-changed', help='Comma-separated file list')
+    p.add_argument('--exit-code', type=int, help='Exit code')
+    p.add_argument('--git-diff-stats', help='JSON: {"insertions":N,"deletions":N,"files":N}')
+    p.add_argument('--agent-version', help='Agent version string')
+    p.add_argument('--batch', action='store_true', help='Read JSONL from stdin')
+    p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser('wrap', help='Wrap any command with session tracking')
+    p.add_argument('command', nargs='+', help='Command to wrap')
+    p.add_argument('--project', help='Project name (default: current dir name)')
+    p.set_defaults(func=cmd_wrap)
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    sys.exit(args.func(args) or 0)
+
+if __name__ == '__main__':
+    main()

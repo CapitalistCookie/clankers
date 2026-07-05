@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# managed-by: localci dispatcher v1
+# Generic local-CI post-commit spawner. Source of truth:
+# ~/.git-templates/hooks/post-commit (arrives in new repos via
+# `git config --global init.templateDir`; install into existing repos with:
+# localci-install <repo>|--all). Do not hand-edit per-repo copies.
+#
+# What it does (thin dispatcher — telegram/state/reporting belong to the
+# repo's own FULL script, never to this dispatcher):
+#   1. If post-commit.local exists next to this hook (a pre-existing hook that
+#      localci-install chained aside), run it first (its failure is reported
+#      but cannot abort — the commit already exists).
+#   2. Resolve the repo's FULL suite:
+#        .localci at repo root (line `FULL=<repo-relative-path>`; if .localci
+#        exists it is authoritative — no convention fallback)
+#        else ci/full.sh         (generic convention)
+#        else live/ci/ci_full.sh (yon layout)
+#      No config found -> exit 0 silently (safe to install everywhere).
+#   3. Spawn FULL DETACHED (setsid + nohup) so the commit returns instantly.
+#      Single-flight + collapse-to-latest via flock on .git/ci/dispatch.lock:
+#      commits made while a run is active queue their sha in
+#      .git/ci/dispatch.pending (last writer wins); when the lock frees, only
+#      the NEWEST queued sha actually runs. The lock is dispatch.lock — NOT
+#      .git/ci/lock — so a FULL script with its own internal flock single-
+#      flight (e.g. yon's ci_full.sh) keeps working unchanged.
+#      Log: .git/ci/run-<sha>.log     Skip once with: SKIP_CI=1 git commit ...
+set -u
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+# ---- 1. chained pre-existing hook -------------------------------------------
+if [ -x "$HOOK_DIR/post-commit.local" ]; then
+    "$HOOK_DIR/post-commit.local" "$@" || \
+        echo "[localci] note: post-commit.local exited non-zero" >&2
+fi
+
+# ---- 2. resolve FULL ---------------------------------------------------------
+FULL=""
+if [ -f "$ROOT/.localci" ]; then
+    FULL="$(sed -n 's/^FULL=//p' "$ROOT/.localci" | head -n1)"
+elif [ -x "$ROOT/ci/full.sh" ]; then
+    FULL="ci/full.sh"
+elif [ -x "$ROOT/live/ci/ci_full.sh" ]; then
+    FULL="live/ci/ci_full.sh"
+fi
+[ -z "$FULL" ] && exit 0
+case "$FULL" in /*) FULL_ABS="$FULL" ;; *) FULL_ABS="$ROOT/$FULL" ;; esac
+if [ ! -f "$FULL_ABS" ]; then
+    echo "[localci] WARN: FULL=$FULL configured but $FULL_ABS is missing — not spawning" >&2
+    exit 0
+fi
+
+if [ "${SKIP_CI:-0}" = "1" ]; then
+    exit 0
+fi
+
+# ---- 3. spawn FULL detached (single-flight, collapse-to-latest) --------------
+GD="$(git rev-parse --absolute-git-dir)"
+CI="$GD/ci"
+mkdir -p "$CI"
+SHA="$(git rev-parse HEAD)"
+
+setsid nohup bash -c '
+    ci="$1"; root="$2"; full="$3"; sha="$4"
+    echo "$sha" > "$ci/dispatch.pending"        # last writer wins
+    exec 9>"$ci/dispatch.lock"
+    flock 9                                     # blocks while another run holds it
+    latest="$(cat "$ci/dispatch.pending" 2>/dev/null || true)"
+    if [ "$latest" != "$sha" ]; then
+        exit 0                                  # superseded by a newer commit
+    fi
+    rm -f "$ci/dispatch.pending"
+    cd "$root" || exit 1
+    if [ -x "$full" ]; then
+        exec "$full" "$sha"                     # fd 9 (lock) held for the whole run
+    else
+        exec bash "$full" "$sha"
+    fi
+' localci-full "$CI" "$ROOT" "$FULL_ABS" "$SHA" >> "$CI/run-$SHA.log" 2>&1 < /dev/null &
+
+echo "[localci] FULL suite ($FULL) spawned detached for ${SHA:0:7} — log: $CI/run-$SHA.log (skip once: SKIP_CI=1 git commit)"
+exit 0
