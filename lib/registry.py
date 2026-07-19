@@ -7,10 +7,14 @@ through one atomic, one-schema path.
 """
 
 import os
+import shutil
 import subprocess
 import yaml
 
 DEFAULT_REGISTRY = os.path.expanduser("~/projects/.clanker.yaml")
+
+# Resolve git once at import so each subprocess call skips a PATH lookup (S8).
+GIT = shutil.which("git") or "/usr/bin/git"
 
 
 def _registry_path():
@@ -135,11 +139,11 @@ class Registry:
             if os.path.isdir(os.path.join(path, ".git")):
                 try:
                     branch = subprocess.check_output(
-                        ["git", "-C", path, "branch", "--show-current"],
+                        [GIT, "-C", path, "branch", "--show-current"],
                         stderr=subprocess.DEVNULL, text=True
                     ).strip()
                     commit = subprocess.check_output(
-                        ["git", "-C", path, "log", "--oneline", "-1"],
+                        [GIT, "-C", path, "log", "--oneline", "-1"],
                         stderr=subprocess.DEVNULL, text=True
                     ).strip()[:50]
                 except:

@@ -1,0 +1,16 @@
+{
+  "_note": "Replacement for hooks.Stop in ~/.claude/settings.json. The 4 prior Stop entries (iron-law-check timeout 8 + asyncRewake, retro-prompt 5, scope-calibration 5, clanker-dist/status-stale-nudge 8) are consolidated into ONE dispatcher, stop-dispatch.sh, which runs them in that order on a single stdin read. asyncRewake:true is preserved (it is what carries iron-law's exit-2 re-wake through the dispatcher). timeout 30 = the sum of the four inner per-gate budgets (8+5+5+8=26 — still enforced PER GATE inside the dispatcher via `timeout`) plus headroom, because the dispatcher runs them sequentially. To apply: replace the value of hooks.Stop with the array under \"Stop\" below.",
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash /home/user/.claude/hooks/stop-dispatch.sh",
+          "timeout": 30,
+          "statusMessage": "Stop-chain checks (iron-law / retro / scope / STATUS)...",
+          "asyncRewake": true
+        }
+      ]
+    }
+  ]
+}

@@ -9,6 +9,32 @@ from datetime import datetime, timedelta
 DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
 SESSIONS_DIR = os.path.join(DATA_DIR, "raw/sessions")
 
+# S1: memoize parsed session records. Keyed on (newest sessions-dir mtime, file
+# count, last_days, dedup, cutoff-date) and invalidated automatically when a
+# session file is appended-to or added (the mtime/count fingerprint changes) or
+# the day rolls over — so the dashboard refresher stops re-reading + re-parsing
+# 90 days of JSONL on every warm cycle.
+_sessions_memo = {}
+
+
+def _sessions_signature():
+    """Cheap stat-only fingerprint of SESSIONS_DIR: (newest mtime, file count).
+    Changes whenever a session file is appended-to or a new one appears."""
+    try:
+        files = glob.glob(os.path.join(SESSIONS_DIR, "*.jsonl"))
+        newest = max((os.path.getmtime(f) for f in files), default=0.0)
+        return (newest, len(files))
+    except OSError:
+        return (0.0, 0)
+
+
+def _prune_sessions_memo():
+    """Keep the memo tiny — only a couple of (last_days, dedup) combos are ever
+    used, but each new fingerprint adds a key; drop all but the newest few."""
+    if len(_sessions_memo) > 8:
+        for k in list(_sessions_memo)[:-4]:
+            del _sessions_memo[k]
+
 # Cap session duration at 8 hours — longer durations are idle tmux sessions,
 # not continuous work. This prevents inflated cost metrics.
 MAX_DURATION_S = 28800  # 8 hours
@@ -68,10 +94,15 @@ def load_sessions(last_days=7, dedup=True):
 
     Set dedup=False only to inspect the raw event stream.
     """
-    records = []
     cutoff = datetime.utcnow() - timedelta(days=last_days)
     cutoff_str = cutoff.strftime("%Y-%m-%d")
+    sig = _sessions_signature()
+    key = (sig[0], sig[1], last_days, dedup, cutoff_str)
+    cached = _sessions_memo.get(key)
+    if cached is not None:
+        return list(cached)   # shallow copy so a caller's in-place sort can't corrupt the memo
 
+    records = []
     for f in sorted(glob.glob(os.path.join(SESSIONS_DIR, "*.jsonl"))):
         basename = os.path.basename(f).replace(".jsonl", "")
         if basename < cutoff_str:
@@ -94,7 +125,9 @@ def load_sessions(last_days=7, dedup=True):
             pass
 
     if not dedup:
-        return records
+        _sessions_memo[key] = records
+        _prune_sessions_memo()
+        return list(records)
 
     # Dedup by session_id, last-write-wins. Files are date-sorted and lines are
     # appended chronologically, so the final occurrence of an id is its latest
@@ -108,7 +141,10 @@ def load_sessions(last_days=7, dedup=True):
             by_id[sid] = s
         else:
             anon.append(s)
-    return list(by_id.values()) + anon
+    result = list(by_id.values()) + anon
+    _sessions_memo[key] = result
+    _prune_sessions_memo()
+    return list(result)
 
 
 def run_analysis(mode, by="project", last_days=7, json_output=False):

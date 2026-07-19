@@ -320,6 +320,14 @@ fi
 
 # ── hook entry ────────────────────────────────────────────────────────────────
 INPUT=$(cat)
+# Pure-bash prefilter (S6): PostToolUse(Edit|Write) fires on EVERY file write, but a
+# memory write's payload must contain the substring "/memory/" (the precise namespace
+# case below is a subset of this). If it can't, skip the python3 file_path parse
+# entirely — the common non-memory write then pays zero extra process spawns.
+case "$INPUT" in
+  *"/memory/"*) ;;
+  *) exit 0 ;;
+esac
 FILE=$(printf '%s' "$INPUT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('file_path',''))" 2>/dev/null || echo "")
 # Scope: CLAUDE memory namespaces ONLY (~/.claude/projects/<ns>/memory/). A bare */memory/* match
 # false-positived on repo files that happen to live under a memory/ dir — e.g. spec-kit's

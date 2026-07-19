@@ -21,6 +21,7 @@
   "hooks/context-gauge.py",
   "hooks/harness/MANIFEST.md",
   "hooks/harness/README.md",
+  "hooks/harness/STOP-DISPATCH-WIRING.json",
   "hooks/harness/backfill-safety.sh",
   "hooks/harness/check-git-target.sh",
   "hooks/harness/closure-claim-verifier.sh",
@@ -38,6 +39,7 @@
   "hooks/harness/retro-prompt.sh",
   "hooks/harness/scope-calibration.sh",
   "hooks/harness/ssh-tunnel-port-guard.py",
+  "hooks/harness/stop-dispatch.sh",
   "hooks/harness/tests/test_context_gauge.sh",
   "hooks/hooks.json",
   "hooks/prompt-check.sh",
@@ -151,5 +153,5 @@
   "tests/test_webauth.py",
   "tools/archive-transcripts.sh"
  ],
- "source_commit": "d0c08fe"
+ "source_commit": "186375d"
 }

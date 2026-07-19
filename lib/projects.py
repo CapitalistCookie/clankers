@@ -25,7 +25,18 @@ to the live project — purely at the resolution layer, never mutating stored da
 """
 import functools
 import os
+import shutil
 import subprocess
+import time
+
+# Resolve git once at import so each subprocess call skips a PATH lookup (S8).
+GIT = shutil.which("git") or "/usr/bin/git"
+
+_SCAN_TTL = 300
+_scan_cache = {}   # S1: {roots-tuple: (data, ts)} — 300s TTL memo for scan_projects().
+#                    Keyed on the resolved roots (CLANKER_PROJECT_ROOTS) so a roots
+#                    change (per-test isolation, or a live env change) never returns
+#                    another root-set's scan; in prod the roots are stable → one key.
 
 
 def project_roots():
@@ -43,7 +54,7 @@ def _main_repo_path(cwd):
     collapsing linked worktrees and following symlinks — or None if not in a repo.
     `--git-common-dir` points at the main repo's `.git` for any worktree."""
     try:
-        p = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+        p = subprocess.run([GIT, "-C", cwd, "rev-parse", "--git-common-dir"],
                            capture_output=True, text=True, timeout=3)
     except Exception:
         return None
@@ -143,6 +154,7 @@ def reset_caches():
     _live_repos.cache_clear()
     _aliases.cache_clear()
     resolve_project.cache_clear()
+    _scan_cache.clear()
 
 
 def scan_projects():
@@ -150,7 +162,17 @@ def scan_projects():
     root that is itself a repo is added directly; otherwise its immediate repo
     children are. Deduped by the MAIN repo's real path, and named after it, so a
     convenience symlink (~/polymarket_research -> ~/projects/polymarket) collapses
-    into the canonical project rather than appearing as a phantom second one."""
+    into the canonical project rather than appearing as a phantom second one.
+
+    Memoized for 300s (S1): the scan stats every root's children and runs a git
+    subprocess per repo, and the dashboard rebuilds this often; repos appear/leave
+    on human timescales. reset_caches() drops it (tests + after registry edits)."""
+    roots = project_roots()
+    key = tuple(roots)
+    now = time.time()
+    hit = _scan_cache.get(key)
+    if hit is not None and now - hit[1] < _SCAN_TTL:
+        return hit[0]
     found = {}
     seen = set()
 
@@ -161,7 +183,7 @@ def scan_projects():
         seen.add(main)
         found.setdefault(os.path.basename(main), main)
 
-    for root in project_roots():
+    for root in roots:
         if not os.path.isdir(root):
             continue
         if os.path.isdir(os.path.join(root, ".git")):
@@ -175,4 +197,8 @@ def scan_projects():
             p = os.path.join(root, child)
             if os.path.isdir(os.path.join(p, ".git")):
                 add(p)
+    _scan_cache[key] = (found, now)
+    if len(_scan_cache) > 8:   # bound it — distinct root-sets are few (prod: one)
+        for k in [k for k, v in _scan_cache.items() if now - v[1] >= _SCAN_TTL]:
+            del _scan_cache[k]
     return found

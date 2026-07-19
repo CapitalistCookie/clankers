@@ -565,26 +565,44 @@ async def security_middleware(request, handler):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Cache:
-    """Simple TTL cache."""
+    """Simple TTL cache. Unkeyed by default (one slot); pass a key to get()/set()
+    for an endpoint whose payload varies by a request param (e.g. /api/panes?sessions=)
+    — each key gets its own TTL slot so distinct selections never clobber each other."""
     def __init__(self, ttl):
         self.ttl = ttl
         self._data = None
         self._time = 0
+        self._keyed = {}
 
-    def get(self):
-        if time.time() - self._time < self.ttl:
+    def get(self, key=None):
+        now = time.time()
+        if key is not None:
+            hit = self._keyed.get(key)
+            if hit is not None and now - hit[1] < self.ttl:
+                return hit[0]
+            return None
+        if now - self._time < self.ttl:
             return self._data
         return None
 
-    def set(self, data):
+    def set(self, data, key=None):
+        now = time.time()
+        if key is not None:
+            self._keyed[key] = (data, now)
+            # Bound the keyed map — selections churn as the operator changes tiles;
+            # drop entries past their TTL so it can't grow without limit.
+            if len(self._keyed) > 16:
+                self._keyed = {k: v for k, v in self._keyed.items()
+                               if now - v[1] < self.ttl}
+            return
         self._data = data
-        self._time = time.time()
+        self._time = now
 
 
-# TTL 150 > the refresher's 55s period: '/' serves warm cache always; the TTL
+# TTL 300 > the refresher's 120s period: '/' serves warm cache always; the TTL
 # only matters as a staleness ceiling if the refresher task dies.
-_dashboard_cache = Cache(ttl=150)
-_status_cache = Cache(ttl=2)
+_dashboard_cache = Cache(ttl=300)
+_status_cache = Cache(ttl=4)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1040,11 +1058,20 @@ async def handle_reader(request):
     return resp
 
 
-_panes_cache = Cache(ttl=2)
+_panes_cache = Cache(ttl=4)
 
 async def handle_panes(request):
-    """Return captured content for all Claude panes (for tiled monitor view)."""
-    cached = _panes_cache.get()
+    """Return per-Claude-pane state + captured content for the tiled monitor view.
+
+    ?sessions=a,b,c (the tiles the client is actually showing) restricts the
+    EXPENSIVE capture_pane_tail(40 lines) to those sessions — every claude pane is
+    still returned with its cheap state, so the tile switcher's session list stays
+    complete, but off-screen panes carry empty content instead of a 40-line grab.
+    The cache is keyed by the (normalized) selection so distinct views don't clobber."""
+    sel_raw = request.query.get("sessions", "")
+    sel = {s for s in sel_raw.split(",") if s} if sel_raw else None
+    cache_key = ",".join(sorted(sel)) if sel else ""
+    cached = _panes_cache.get(cache_key)
     if cached:
         resp = web.json_response(cached)
         resp.enable_compression()
@@ -1056,7 +1083,9 @@ async def handle_panes(request):
         if p["session"].startswith("web-") or p["command"] != "claude":
             continue
         state = detect_session_state(p)
-        content = capture_pane_tail(p["target"], lines=40)
+        # Only pay the 40-line capture for panes the client is actually showing.
+        content = (capture_pane_tail(p["target"], lines=40)
+                   if sel is None or p["session"] in sel else "")
         result.append({
             "session": p["session"],
             "target": p["target"],
@@ -1066,7 +1095,7 @@ async def handle_panes(request):
             "height": p["height"],
         })
 
-    _panes_cache.set(result)
+    _panes_cache.set(result, cache_key)
     resp = web.json_response(result)
     resp.enable_compression()
     return resp
@@ -1200,8 +1229,9 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sysmon_sampl
 # paints INSTANTLY from cache instead of paying SSH handshake + the sampler's
 # 1s rate-delta sleep on-request (~2-3s of 'sluggish', operator 2026-07-19).
 # ControlMaster reuses one SSH connection across all samples.
-_sysmon_cache = Cache(ttl=30)
-_gpu_cache = Cache(ttl=45)
+_sysmon_cache = Cache(ttl=300)   # S7: lazy-warm — the warmer keeps this fresh; a
+_gpu_cache = Cache(ttl=45)       # cold open is served from here (no on-request SSH).
+_sysmon_last_touch = 0.0         # time.time() of the last monitor open (handle_sysmon / ws accept)
 SYSMON_GPU_SSH = os.environ.get("CLANKER_SYSMON_GPU_SSH", "")  # e.g. root@<gpu-ct>
 
 _SSH_MUX = ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/clanker-ssh-%r@%h",
@@ -1262,7 +1292,9 @@ def _sysmon_sample_gpus():
 
 
 async def sysmon_warmer(app):
-    """Keep host+GPU snapshots warm off-request (20s cadence)."""
+    """Keep host+GPU snapshots warm off-request. Lazy cadence (S7): 20s while the
+    monitor was opened in the last 10min, 120s when nobody's looking — the 300s
+    cache TTL still covers the slow cadence so a cold open is never stale."""
     if not SYSMON_SSH_HOST:
         return
     while True:
@@ -1276,12 +1308,14 @@ async def sysmon_warmer(app):
                 _sysmon_cache.set(data)
         except Exception as e:
             log.debug("sysmon warmer error: %s", e)
-        await asyncio.sleep(20)
+        await asyncio.sleep(20 if time.time() - _sysmon_last_touch < 600 else 120)
 
 
 async def handle_sysmon(request):
     """One-shot system snapshot (host + gpus) as JSON — served from the warm
     cache; a cold miss (just after boot) samples inline."""
+    global _sysmon_last_touch
+    _sysmon_last_touch = time.time()   # S7: a look re-arms the fast warm cadence
     cached = _sysmon_cache.get()
     if cached is not None:
         return web.json_response(cached)
@@ -1303,11 +1337,12 @@ async def handle_ws_sysmon(request):
     `ssh … python3 - loop` running the sampler in a loop on the host and forwards
     each JSON line. Still strictly read-only. The remote sampler self-exits the
     moment this socket closes (its next stdout write breaks) — verified no orphan."""
-    global _sysmon_streams
+    global _sysmon_streams, _sysmon_last_touch
     if not _ws_origin_ok(request):
         return web.Response(status=403, text="Origin not allowed")
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
+    _sysmon_last_touch = time.time()   # S7: an open stream re-arms the fast warm cadence
     if _sysmon_streams >= MAX_SYSMON_STREAMS:
         await ws.send_str(json.dumps({"error": "too many monitor streams"}))
         await ws.close()
@@ -1601,6 +1636,7 @@ async def monitor_sessions(app):
     last_ping = {}         # session -> ts of last DELIVERED ping (cooldown)
     muted_until = 0.0      # quota backoff: no publish attempts before this ts
     agents_pinged = set()  # sessions already pinged for their current fan-out
+    fanout_check = {}      # sid -> ts of last fan-out capture_pane_tail (S2: throttle to 1/30s)
     # Subagent limit-kill watcher: the SubagentStop hook appends to this queue;
     # start at the current size so historical entries never burst on restart.
     queue_path = os.path.expanduser("~/.claude/agent_resume_queue.jsonl")
@@ -1626,6 +1662,7 @@ async def monitor_sessions(app):
                     waiting_since.pop(sid, None)
                     last_ping.pop(sid, None)
                     notified.discard(sid)
+                    fanout_check.pop(sid, None)
                 if crashed and NTFY_TOPIC and now >= muted_until:
                     names = ", ".join(sorted(crashed)[:6])
                     title = (f"{crashed[0]} vanished mid-work" if len(crashed) == 1
@@ -1690,8 +1727,14 @@ async def monitor_sessions(app):
                         # Fan-out visibility: first sight of subagent activity in
                         # this working episode -> one informational ping saying
                         # what fanned out (exhaustive-states request, 2026-07-19).
+                        # Throttle the fan-out capture to at most once per 30s per
+                        # session (S2): a pane with no subagents never sets
+                        # agents_pinged, so without this the capture would run every
+                        # 5s loop for the whole working episode.
                         if (state == "working" and sid not in agents_pinged
-                                and NTFY_TOPIC and now >= muted_until):
+                                and NTFY_TOPIC and now >= muted_until
+                                and now - fanout_check.get(sid, 0.0) >= 30):
+                            fanout_check[sid] = now
                             wtail = capture_pane_tail(p["target"], lines=12)
                             wsub, agents, detail = classify_working_state(wtail)
                             if wsub == "subagents":
@@ -1842,7 +1885,7 @@ async def dashboard_refresher(app):
     generate_dashboard_data costs ~0.9s (registry git subprocesses + session
     store scans). Built inline, the first request after any idle > cache TTL
     stacked that on top of tunnel RTT — the recurring 'dashboard takes forever'
-    (2026-07-19). Refresh every 55s < the 150s TTL, so '/' always serves warm."""
+    (2026-07-19). Refresh every 120s < the 300s TTL, so '/' always serves warm."""
     from dashboard import _build_html
     from dashboard_data import generate_dashboard_data
     first = True
@@ -1859,7 +1902,7 @@ async def dashboard_refresher(app):
             first = False
         except Exception as e:
             log.warning("dashboard refresh failed: %s", e)
-        await asyncio.sleep(55)
+        await asyncio.sleep(120)
 
 
 async def start_background(app):
@@ -1897,10 +1940,9 @@ def _live_features_html():
     return '''
 <!-- ─── Live Features: xterm.js + terminal + notifications ─── -->
 <link rel="stylesheet" href="/vendor/xterm.min.css">
-<script defer src="/vendor/xterm.min.js"></script>
-<script defer src="/vendor/addon-webgl.min.js"></script>
-<script defer src="/vendor/addon-fit.min.js"></script>
-<script defer src="/vendor/addon-web-links.min.js"></script>
+<!-- A8: xterm.min.js + addon-webgl/fit/web-links are loaded lazily by live.js's
+     ensureXterm() on the first terminal open (desktop terminal / tiled connect);
+     the mobile reader/view paths never pull them. -->
 <script defer src="/vendor/marked.min.js"></script>
 <script defer src="/vendor/purify.min.js"></script>
 <script defer src="/app/reader.js"></script>

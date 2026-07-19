@@ -98,24 +98,32 @@ session_guard=${session_guard//[^a-zA-Z0-9_-]/}
 fired_marker() { [ -f "/tmp/.ironlaw-${session_guard}-$1" ]; }
 mark_fired() { touch "/tmp/.ironlaw-${session_guard}-$1" 2>/dev/null || true; }
 
-# Pull the last ~60 lines of tool output from the JSONL transcript so we
-# can grep for evidence tokens. Best-effort — if jq fails, recent_output
-# is empty and every claim is treated as unverified (false positives are
-# the safer failure mode for an iron-law check).
+# Evidence blob = tool output from the JSONL transcript, grepped for evidence
+# tokens. Built LAZILY — only the first time a claim pattern actually matches
+# (S4). A claim-free Stop does NO tail|jq slurp at all (the common case;
+# asyncRewake re-fires this hook on every Stop). Best-effort — if jq fails,
+# recent_output stays empty and every claim is treated as unverified (false
+# positives are the safer failure mode for an iron-law check).
 recent_output=""
-if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-  # 400-line window (was 80): first live fire 2026-07-05 was a long final
-  # summary whose evidence tokens sat a few messages back — real evidence,
-  # too-small window. Long-turn sessions need the deeper look-back.
-  recent_output=$(tail -n 400 "$transcript" 2>/dev/null \
-    | jq -rs '.[] | (.tool_result? // .message?.content? // "") | tostring' 2>/dev/null \
-    || true)
-fi
+_evidence_built=0
+ensure_evidence() {
+  [ "$_evidence_built" -eq 1 ] && return
+  _evidence_built=1
+  if [ -n "$transcript" ] && [ -f "$transcript" ]; then
+    # 400-line window (was 80): first live fire 2026-07-05 was a long final
+    # summary whose evidence tokens sat a few messages back — real evidence,
+    # too-small window. Long-turn sessions need the deeper look-back.
+    recent_output=$(tail -n 400 "$transcript" 2>/dev/null \
+      | jq -rs '.[] | (.tool_result? // .message?.content? // "") | tostring' 2>/dev/null \
+      || true)
+  fi
+}
 
 violations=()
 
 # --- Pattern 1: deploy success claim ---
 if ! fired_marker deploy && printf '%s' "$msg" | grep -iqE '(deploy(ed|ment)? success(ful)?|successfully deployed|deploy.*green|live on (CT|prod)|deploy SUCCESS)'; then
+  ensure_evidence
   if ! printf '%s' "$recent_output" | grep -qE '(healthz: 200|healthz.*200|Active: active|active \(running\)|\[deploy\] SUCCESS)'; then
     violations+=("DEPLOY-CLAIM: said success without recent 'healthz: 200' / 'Active: active' / '[deploy] SUCCESS' token in tool output")
     mark_fired deploy
@@ -124,6 +132,7 @@ fi
 
 # --- Pattern 2: prepush green / all green ---
 if ! fired_marker prepush && printf '%s' "$msg" | grep -iqE '(prepush.*green|all (tests )?green|tests.*all pass(ing|ed)?|all tests pass)'; then
+  ensure_evidence
   # Evidence dialect extended 2026-07-05 (2nd live fire): local CI prints
   # "[ci/fast] all green" and pytest prints "N passed in Ns" — both are real
   # success tokens this box emits.
@@ -135,6 +144,7 @@ fi
 
 # --- Pattern 3: pushed claim ---
 if ! fired_marker push && printf '%s' "$msg" | grep -iqE '(pushed (to )?(origin|main|remote)|push (succeeded|successful)|push success)'; then
+  ensure_evidence
   # "Everything up-to-date" = remote already has HEAD (valid push evidence);
   # quiet pushes print nothing — the convention is now push NON-quiet.
   if ! printf '%s' "$recent_output" | grep -qE '(\* \[new branch\]|main -> main|master -> master|HEAD -> |To https?://|To git@|Everything up-to-date)'; then
@@ -145,6 +155,7 @@ fi
 
 # --- Pattern 4: deployed/shipped to specific host ---
 if ! fired_marker host && printf '%s' "$msg" | grep -iqE '(deployed to (CT [0-9]+|192\.168|prod)|shipped to (CT [0-9]+|prod))'; then
+  ensure_evidence
   if ! printf '%s' "$recent_output" | grep -qE '(healthz: 200|Active: active|systemctl.*active|deploy.*SUCCESS)'; then
     violations+=("HOST-DEPLOY-CLAIM: said deployed to specific host without healthz/active/SUCCESS evidence")
     mark_fired host

@@ -19,10 +19,14 @@ Design constraints (bulletproof/future-proof):
 import json
 import os
 import re
+import shutil
 import subprocess
 
 TAIL_BYTES = 512 * 1024
 MAX_UNITS = 60
+
+# Resolve git once at import so each subprocess call skips a PATH lookup (S8).
+GIT = shutil.which("git") or "/usr/bin/git"
 
 
 def _slug(path):
@@ -85,7 +89,7 @@ def resolve_transcript(tmux_session):
     # moves pane_current_path — prefer the git root's namespace when inside a repo.
     try:
         root = subprocess.check_output(
-            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            [GIT, "-C", cwd, "rev-parse", "--show-toplevel"],
             stderr=subprocess.DEVNULL, text=True, timeout=3).strip() or cwd
     except Exception:
         root = cwd
