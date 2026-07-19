@@ -26,7 +26,16 @@
 # Selftest: bash memory-lint.sh --selftest  (run after ANY edit here).
 set -uo pipefail
 
-SECRET_RE='glpat-[A-Za-z0-9._-]{15,}|cfut_[A-Za-z0-9]{30,}|db-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|PGPASSWORD=[^$][^)]|-----BEGIN [A-Z ]*PRIVATE KEY'
+# SECRET_RE is fragment-assembled so this file never matches its own patterns
+# (adopt's contract secret-scan and gitleaks both walk repo .sh files — the
+# same self-match rule publint uses).
+SECRET_RE='glpat'
+SECRET_RE+='-[A-Za-z0-9._-]{15,}|cfut'
+SECRET_RE+='_[A-Za-z0-9]{30,}|db'
+SECRET_RE+='-[A-Za-z0-9]{20,}|AK'
+SECRET_RE+='IA[0-9A-Z]{16}|PGPASS'
+SECRET_RE+='WORD=[^$][^)]|-----BEGIN [A-Z ]*PRIVAT'
+SECRET_RE+='E KEY'
 
 lint_file() {  # $1 = file path; prints violations to stderr, returns 2 on block
   local FILE="$1" DIR BASE
@@ -244,8 +253,10 @@ if [ "${1:-}" = "--selftest" ]; then
   # 4 topic missing frontmatter -> 2
   printf 'just text\n' > "$T/memory/bare.md"
   lint_file "$T/memory/bare.md" >/dev/null 2>&1; [ $? -eq 2 ] || { echo "FAIL no-frontmatter"; fails=1; }
-  # 5 topic with secret -> 2
-  printf -- '---\nname: s\ndescription: d\nmetadata:\n  type: reference\n---\nkey glpat-AAAAAAAAAAAAAAAAAAAA\n' > "$T/memory/s.md"
+  # 5 topic with secret -> 2 (fixture token assembled so this file never
+  # contains a secret-shaped literal itself)
+  FAKE_TOKEN="glpat"$(printf -- '-%.0s' 1)$(printf 'A%.0s' {1..20})
+  printf -- '---\nname: s\ndescription: d\nmetadata:\n  type: reference\n---\nkey %s\n' "$FAKE_TOKEN" > "$T/memory/s.md"
   lint_file "$T/memory/s.md" >/dev/null 2>&1; [ $? -eq 2 ] || { echo "FAIL secret"; fails=1; }
   # 6 good topic -> 0 + regen produces INDEX_ALL with ORPHANS section + count
   printf -- "$FM" orphan > "$T/memory/orphan.md"
