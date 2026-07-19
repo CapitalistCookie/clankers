@@ -926,6 +926,19 @@ class PtyBridge:
 # Routes
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _stamp_assets(html):
+    """Version-stamp the /app/ asset URLs with the process BUILD_ID.
+
+    The page itself is no-store, so every load carries current URLs; a build
+    change forces every intermediary (browser heuristics, Cloudflare edge,
+    bfcache-restored documents doing a late fetch) to refetch the assets.
+    Without this, 'did the deploy land on the phone' was unanswerable
+    (operator hit exactly that, 2026-07-19)."""
+    for asset in ("app/app.css", "app/app.js", "app/live.js", "app/reader.js"):
+        html = html.replace(f"/{asset}", f"/{asset}?v={BUILD_ID}")
+    return html
+
+
 async def handle_index(request):
     """Serve the live dashboard from the warm cache (see dashboard_refresher).
 
@@ -944,7 +957,8 @@ async def handle_index(request):
     data = await asyncio.to_thread(generate_dashboard_data)
     data_json = json.dumps(data, indent=None)
     base_html = _build_html(data_json)
-    html = base_html.replace("</body>", _live_features_html() + "\n</body>")
+    html = _stamp_assets(
+        base_html.replace("</body>", _live_features_html() + "\n</body>"))
     _dashboard_cache.set(html)
     resp = web.Response(text=html, content_type="text/html")
     resp.enable_compression()
@@ -1762,8 +1776,9 @@ async def dashboard_refresher(app):
         try:
             t0 = time.time()
             data = await asyncio.to_thread(generate_dashboard_data)
-            html = _build_html(json.dumps(data, indent=None)).replace(
-                "</body>", _live_features_html() + "\n</body>")
+            html = _stamp_assets(
+                _build_html(json.dumps(data, indent=None)).replace(
+                    "</body>", _live_features_html() + "\n</body>"))
             _dashboard_cache.set(html)
             (log.info if first else log.debug)(
                 "dashboard cache warmed in %.2fs", time.time() - t0)
