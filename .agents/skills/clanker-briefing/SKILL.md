@@ -17,7 +17,7 @@ Shows:
 ## Usage
 
 ```bash
+clanker briefing eigenstate   # Briefing for a registered project
 clanker briefing zergrush     # Briefing for zergrush
-clanker briefing quanta-ai    # Briefing for quanta-ai
 clanker registry list         # See all available projects
 ```

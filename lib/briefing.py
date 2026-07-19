@@ -60,21 +60,26 @@ def generate_briefing(project, project_path=None):
             session_lines.append(f"  {ts} | {dur} | {errs} errors")
         sections.append(("Recent Sessions", "\n".join(session_lines)))
 
-    # 3. Open alerts for this project
-    from alerts import count_alerts
+    # 3. Open alerts. These are GLOBAL (disk, tunnels, unpushed repos) — alerts
+    # carry no project field yet, so label them honestly instead of implying
+    # they belong to this project. If the alert names a project, scope it.
     alerts_dir = os.path.join(DATA_DIR, "alerts")
     if os.path.isdir(alerts_dir):
-        project_alerts = []
+        alert_msgs = []
         for f in os.listdir(alerts_dir):
             if f.endswith(".json"):
                 try:
                     with open(os.path.join(alerts_dir, f)) as fh:
                         alert = json.load(fh)
-                    project_alerts.append(alert.get("message", ""))
-                except:
+                    aproj = alert.get("project")
+                    if aproj and aproj != project:
+                        continue
+                    alert_msgs.append(alert.get("message", ""))
+                except Exception:
                     pass
-        if project_alerts:
-            sections.append(("Alerts", "\n".join(f"  - {a}" for a in project_alerts)))
+        if alert_msgs:
+            sections.append(("System Alerts (global)",
+                             "\n".join(f"  - {a}" for a in alert_msgs)))
 
     # 4. Pending proposals for this project
     from propose import _read_ledger

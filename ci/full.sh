@@ -18,5 +18,14 @@ if command -v gitleaks >/dev/null 2>&1; then
 else
   echo "[ci/full] gitleaks not installed — skipping secret scan"
 fi
+echo "[ci/full] publint…";  bash ci/publint.sh || rc=1
+# Live-harness hook selftests: these scripts gate every session on this box —
+# a broken edit must fail CI loudly, not wait to be noticed at 2am.
+for st in "$HOME/.claude/hooks/memory-lint.sh" "$HOME/.claude/hooks/context-gauge.sh"; do
+  if [ -f "$st" ]; then
+    echo "[ci/full] selftest $(basename "$st")…"
+    bash "$st" --selftest || rc=1
+  fi
+done
 [ "$rc" -eq 0 ] && echo "[ci/full] all green" || echo "[ci/full] FAILURES (rc=$rc)"
 exit "$rc"

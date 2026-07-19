@@ -1,10 +1,65 @@
-"""Project registry — reads ~/projects/.clanker.yaml."""
+"""Project registry — reads ~/projects/.clanker.yaml.
+
+write_entry/remove_entry below are THE single registry mutators (2026-07-19):
+the codebase previously had three writers with two serializers and divergent
+schemas (adopt vs onboard init vs onboard remove) — every mutation now goes
+through one atomic, one-schema path.
+"""
 
 import os
 import subprocess
 import yaml
 
 DEFAULT_REGISTRY = os.path.expanduser("~/projects/.clanker.yaml")
+
+
+def _registry_path():
+    return os.environ.get("CLANKER_REGISTRY", DEFAULT_REGISTRY)
+
+
+def _load_raw(path):
+    if os.path.exists(path):
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _atomic_write(path, data):
+    # tmp + os.replace: a crash mid-write can never truncate the registry.
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True,
+                       default_flow_style=False)
+    os.replace(tmp, path)
+
+
+def write_entry(name, entry, create_only=False):
+    """Merge `entry` (dict) into projects[name]. create_only=True refuses to
+    touch an existing entry (returns False — adopt's idempotence contract).
+    Returns True when the file was written. Only non-None values are stored
+    (no more `remote: None` rows)."""
+    path = _registry_path()
+    data = _load_raw(path)
+    projects = data.setdefault("projects", {})
+    if create_only and name in projects:
+        return False
+    clean = {k: v for k, v in (entry or {}).items() if v is not None}
+    projects[name] = {**(projects.get(name) or {}), **clean}
+    _atomic_write(path, data)
+    return True
+
+
+def remove_entry(name):
+    """Delete projects[name]. Returns True if it existed."""
+    path = _registry_path()
+    data = _load_raw(path)
+    projects = data.get("projects", {}) or {}
+    if name not in projects:
+        return False
+    del projects[name]
+    data["projects"] = projects
+    _atomic_write(path, data)
+    return True
 
 
 class Registry:

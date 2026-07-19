@@ -62,8 +62,9 @@ try:
     from projects import resolve_project
     project = resolve_project(cwd)
 except Exception:
-    if "/home/user/projects/" in cwd:
-        project = cwd.split("/home/user/projects/")[-1].split("/")[0]
+    _projects_root = os.path.expanduser("~/projects/")
+    if _projects_root in cwd:
+        project = cwd.split(_projects_root)[-1].split("/")[0]
 
 tool_uses = Counter()
 error_tools = Counter()
@@ -292,7 +293,7 @@ fi
 # hard timeout so SessionEnd never hangs; everything || true — fail-open.
 (
   flock -n 9 || exit 0
-  cd /home/user/.claude 2>/dev/null || exit 0
+  cd "$HOME/.claude" 2>/dev/null || exit 0
   # shell-expanded literal dirs (git wildcard pathspecs don't recurse here);
   # each add separate — one missing path must not abort the rest
   for d in projects/*/memory memory; do

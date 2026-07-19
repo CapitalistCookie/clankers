@@ -5,6 +5,7 @@
 #   - AKIAIOSFODNN7EXAMPLE  — AWS's own documented example access-key id
 #   - MIIabc                — a fake/truncated PEM body
 #   - ghp_AAAA…             — a synthetic GitHub token (literal "A" repeated)
+#   - glpat-AAAA…           — a synthetic GitLab token in memory-lint.sh's selftest
 [extend]
 useDefault = true
 
@@ -14,4 +15,12 @@ regexes = [
   '''AKIAIOSFODNN7EXAMPLE''',
   '''-----BEGIN RSA PRIVATE KEY-----\\nMIIabc''',
   '''ghp_A{36}''',
+  '''glpat-A{20}''',
+]
+# Compiled bytecode renders the synthetic fixtures with REAL newlines, which
+# the source-shaped regexes above can't match (see ci/full.sh's git-mode note).
+# Never-shipped cache artifacts are excluded from filesystem scans entirely.
+paths = [
+  '''.*__pycache__.*''',
+  '''.*\.pyc$''',
 ]

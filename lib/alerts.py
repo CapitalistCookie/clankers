@@ -18,11 +18,25 @@ def count_alerts():
 
 
 def _create_alert(alert_id, severity, source, message, details=None):
-    """Create an alert file."""
+    """Create an alert file.
+
+    Re-raised alerts keep their original first_seen: the 15-min cron rewrites
+    the file on every pass, so without this a chronically-ignored alert is
+    indistinguishable from a fresh one (mtime and timestamp always look new).
+    """
     os.makedirs(ALERTS_DIR, exist_ok=True)
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = os.path.join(ALERTS_DIR, f"{alert_id}.json")
+    first_seen = now
+    try:
+        with open(path) as f:
+            first_seen = json.load(f).get("first_seen", first_seen)
+    except (OSError, json.JSONDecodeError):
+        pass
     alert = {
         "id": alert_id,
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "timestamp": now,
+        "first_seen": first_seen,
         "type": "health-check",
         "severity": severity,
         "source": source,
@@ -30,7 +44,6 @@ def _create_alert(alert_id, severity, source, message, details=None):
         "details": details or {},
         "status": "active",
     }
-    path = os.path.join(ALERTS_DIR, f"{alert_id}.json")
     with open(path, "w") as f:
         json.dump(alert, f, indent=2)
     return alert
@@ -100,21 +113,27 @@ def _run_health_checks():
         _create_alert("tmux-down", "critical", "tmux-check", "tmux server is not running")
         results["tmux"] = {"status": "critical"}
 
-    # 4. Cloudflared tunnel
-    try:
-        out = subprocess.check_output(
-            ["systemctl", "is-active", "cloudflared"],
-            stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        if out == "active":
-            _dismiss_alert("cloudflared-down")
-            results["cloudflared"] = {"status": "ok"}
-        else:
-            _create_alert("cloudflared-down", "critical", "tunnel-check",
-                         "cloudflared tunnel is not running")
-            results["cloudflared"] = {"status": "critical"}
-    except:
-        results["cloudflared"] = {"status": "unknown"}
+    # 4. Tunnels — check each unit that exists on this host, by name. The old
+    # check watched only 'cloudflared' while the dashboard rides
+    # 'clanker-tunnel'; both being up let it pass for the wrong reason.
+    for unit in ("clanker-tunnel", "cloudflared"):
+        try:
+            out = subprocess.run(
+                ["systemctl", "is-active", unit],
+                capture_output=True, text=True
+            ).stdout.strip()
+            if out == "active":
+                _dismiss_alert(f"{unit}-down")
+                results[unit] = {"status": "ok"}
+            elif out in ("inactive", "failed", "activating", "deactivating"):
+                _create_alert(f"{unit}-down", "critical", "tunnel-check",
+                              f"{unit} tunnel is not running (systemctl: {out})")
+                results[unit] = {"status": "critical"}
+            else:
+                # unit not installed on this host — absence is not an outage
+                results[unit] = {"status": "absent"}
+        except Exception:
+            results[unit] = {"status": "unknown"}
 
     # 5. Stale lock files
     lock_file = os.path.expanduser("~/.claude/scheduled_tasks.lock")

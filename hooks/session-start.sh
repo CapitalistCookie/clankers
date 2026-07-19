@@ -4,7 +4,9 @@
 set -uo pipefail
 
 CLANKER_DATA="${CLANKER_DATA:-/data/clanker}"
-CLANKER_REGISTRY="${CLANKER_REGISTRY:-/home/user/projects/.clanker.yaml}"
+CLANKER_REGISTRY="${CLANKER_REGISTRY:-$HOME/projects/.clanker.yaml}"
+# Claude Code's namespace slug for $HOME (slashes/dots become dashes)
+HOME_SLUG="${HOME//[\/.]/-}"
 
 ALERTS_DIR="$CLANKER_DATA/alerts"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,7 +90,7 @@ fi
 if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
     if [ -f "$PROJECT_DIR/docs/codebase-index/generate.py" ]; then
         python3 "$PROJECT_DIR/docs/codebase-index/generate.py" \
-            --routing-table "/home/user/.claude/projects/-home-user/memory/CODEBASE_INDEX.md" \
+            --routing-table "$HOME/.claude/projects/$HOME_SLUG/memory/CODEBASE_INDEX.md" \
             2>/dev/null &
     fi
     if [ -f "$PROJECT_DIR/docs/codebase-index/generate-sdk-reference.sh" ]; then
@@ -101,17 +103,26 @@ fi
 # the lint hook, or a file was rm'd), regenerate the inventory and surface the
 # orphan count. Covers BOTH the global router dir and this session's namespace.
 MEM_NOTE=""
-LINT="/home/user/.claude/hooks/memory-lint.sh"
+LINT="$HOME/.claude/hooks/memory-lint.sh"
 if [ -x "$LINT" ] || [ -f "$LINT" ]; then
     NS_SLUG=$(printf '%s' "${CWD:-}" | sed 's|[/.]|-|g')
-    for MDIR in "$HOME/.claude/projects/-home-user/memory" "$HOME/.claude/projects/$NS_SLUG/memory"; do
+    for MDIR in "$HOME/.claude/projects/$HOME_SLUG/memory" "$HOME/.claude/projects/$NS_SLUG/memory"; do
         [ -f "$MDIR/MEMORY.md" ] || continue
         if [ ! -f "$MDIR/INDEX_ALL.md" ] || [ "$MDIR/MEMORY.md" -nt "$MDIR/INDEX_ALL.md" ]; then
             ORPH=$(bash "$LINT" --regen "$MDIR" 2>/dev/null | sed -n 's/^orphans=//p' || true)
             if [ -n "$ORPH" ] && [ "$ORPH" -gt 0 ] 2>/dev/null; then
-                MEM_NOTE="memory: $ORPH orphaned file(s) unreachable from MEMORY.md — see $MDIR/INDEX_ALL.md §ORPHANS"
+                MEM_NOTE="memory: $ORPH orphaned file(s) unreachable from the router indexes — see $MDIR/INDEX_ALL.md §ORPHANS"
             fi
         fi
+        # Index-budget warn band (sharded-router 2026-07-19): surface ≥80% at
+        # session start so a filling index is heard about BEFORE the 16KB wall.
+        for IDX in "$MDIR/MEMORY.md" "$MDIR"/*-POINTERS.md; do
+            [ -f "$IDX" ] || continue
+            SZ=$(wc -c < "$IDX" 2>/dev/null || echo 0)
+            if [ "$SZ" -gt 13107 ] 2>/dev/null; then
+                MEM_NOTE="${MEM_NOTE:+$MEM_NOTE · }memory: $(basename "$IDX") at $((SZ * 100 / 16384))% of its 16KB index budget — split the shard (law: MEMORY.md header)"
+            fi
+        done
     done
 fi
 

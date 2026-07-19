@@ -28,11 +28,6 @@ def cmd_registry(args):
     elif args.action == 'path':
         print(reg.get_path(args.name))
 
-def cmd_log(args):
-    print("clanker log is called by the SessionEnd hook, not directly.", file=sys.stderr)
-    print("Use 'clanker sessions' to query historical data.", file=sys.stderr)
-    sys.exit(1)
-
 def cmd_sessions(args):
     from analyze import load_sessions
     import json as _json
@@ -125,11 +120,27 @@ def cmd_memory_new(args):
     from memorycmd import new
     return new(args.slug, args.type, args.desc, project=args.project, body=args.body or "")
 
+def cmd_sync(args):
+    from synccmd import run as sync_run
+    mode = "apply" if args.apply else ("pin" if args.pin else "check")
+    sys.exit(sync_run(mode))
+
+def cmd_publish(args):
+    from publishcmd import publish
+    sys.exit(publish(check_only=args.check, push=args.push))
+
+def cmd_memory_router_gen(args):
+    from memorycmd import router_gen
+    sys.exit(router_gen())
+
 def cmd_memory_doctor(args):
     from memorycmd import doctor
     return doctor(project=args.project)
 
 def cmd_doctor(args):
+    if getattr(args, 'fleet', False):
+        from adopt import doctor_fleet
+        sys.exit(doctor_fleet(include_secrets=getattr(args, 'secrets', False)))
     if getattr(args, 'project', None):
         from adopt import doctor_project
         sys.exit(doctor_project(args.project))
@@ -186,6 +197,18 @@ def cmd_doctor(args):
     except:
         print("✗ Cannot read settings.json")
         issues.append("settings")
+
+    # Repo ↔ installed hook parity (clanker sync --check, quiet)
+    try:
+        from synccmd import check as _sync_check
+        drifted, missing, total = _sync_check(quiet=True)
+        bad = len(drifted) + len(missing)
+        print(f"{'✓' if bad == 0 else '✗'} Hook sync parity ({total - bad}/{total})"
+              + ("" if bad == 0 else " — run: clanker sync"))
+        if bad:
+            issues.append("hook-sync")
+    except Exception:
+        print("✗ Hook sync check errored")
 
     # Check cron jobs
     import subprocess
@@ -301,11 +324,19 @@ def cmd_work(args):
 
 def cmd_briefing(args):
     from briefing import generate_briefing
-    briefing = generate_briefing(args.project)
+    from registry import Registry
+    reg = Registry()
+    if args.project not in reg.projects:
+        # Global alerts used to make ANY name produce a truthy "briefing";
+        # an unknown project is an error, not a briefing with no git section.
+        print(f"No briefing data for {args.project} (not in registry)", file=sys.stderr)
+        return 1
+    briefing = generate_briefing(args.project, reg.get_path(args.project))
     if briefing:
         print(briefing)
     else:
-        print(f"No briefing data for {args.project}")
+        print(f"No briefing data for {args.project}", file=sys.stderr)
+        return 1
 
 # ─── Tier 3 Commands ─────────────────────────────────────────────────────────
 
@@ -369,10 +400,6 @@ def cmd_import(args):
     from advanced import import_harness
     import_harness(args.archive)
 
-def cmd_orchestrate(args):
-    from orchestrate import orchestrate
-    orchestrate(args.plan, project_path=args.project, checkpoint_interval=args.checkpoint)
-
 def cmd_cross_project(args):
     from crossproject import analyze_cross_project, suggest_transfers
     if args.suggest:
@@ -384,10 +411,13 @@ def cmd_contracts(args):
     from contracts import scan_contracts, check_contract_changes
     from registry import Registry
     reg = Registry()
+    path = reg.get_path(args.project)
+    if not path or not os.path.isdir(path):
+        print(f"contracts: unknown project or missing path: {args.project}", file=sys.stderr)
+        return 1
     if args.check:
         check_contract_changes(args.project, base_ref=args.base)
     else:
-        path = reg.get_path(args.project)
         contracts = scan_contracts(path)
         total = sum(len(v) for v in contracts.values())
         print(f"=== Contracts in {args.project} ===\n")
@@ -624,9 +654,6 @@ def main():
     p.add_argument('name', nargs='?', default='')
     p.set_defaults(func=cmd_registry)
 
-    p = sub.add_parser('log', help='Extract session metrics (hook only)')
-    p.set_defaults(func=cmd_log)
-
     p = sub.add_parser('sessions', help='Query session data')
     p.add_argument('--last', type=int, default=7, help='Days to look back')
     p.add_argument('--project', help='Filter by project')
@@ -684,10 +711,25 @@ def main():
     p = sub.add_parser('version', help='Version and status')
     p.set_defaults(func=cmd_version)
 
-    p = sub.add_parser('doctor', help='Self-diagnostics; with a project name, run the project CONTRACT check')
+    p = sub.add_parser('doctor', help='Self-diagnostics; with a project name, run the project CONTRACT check; --fleet = every registered project, one row each')
     p.add_argument('project', nargs='?', default=None,
                    help='project name: check registered/CLAUDE.md/state-file/ci/remote/no-plaintext-secrets')
+    p.add_argument('--fleet', action='store_true',
+                   help='contract check across the WHOLE registry (secret grep off; add --secrets)')
+    p.add_argument('--secrets', action='store_true',
+                   help='with --fleet: include the per-repo secret grep (slow on big repos)')
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser('sync', help='Repo ↔ installed-hook parity: --check (default) / --apply (install) / --pin (wire settings.json to dist copies)')
+    p.add_argument('--check', action='store_true', help='parity table (default)')
+    p.add_argument('--apply', action='store_true', help='install repo hooks into ~/.claude (git-snapshotted, selftested)')
+    p.add_argument('--pin', action='store_true', help='rewrite settings.json repo paths -> clanker-dist (implies --apply)')
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser('publish', help='Sanitized sync to the public sister repo (strip + publint/gitleaks gates + commit)')
+    p.add_argument('--check', action='store_true', help='dry-run: what would copy/delete')
+    p.add_argument('--push', action='store_true', help='push the public repo after committing')
+    p.set_defaults(func=cmd_publish)
 
     p = sub.add_parser('memory', help='Memory-file ops (lint-clean by construction): new / doctor')
     msub = p.add_subparsers(dest='memaction', required=True)
@@ -698,6 +740,8 @@ def main():
     mp.add_argument('--project', default=None, help='target a project namespace instead of the global router')
     mp.add_argument('--body', default='', help='memory body text')
     mp.set_defaults(func=cmd_memory_new)
+    mp = msub.add_parser('router-gen', help='Regenerate ROUTER-AUTO.md (registry snapshot) in the global memory dir')
+    mp.set_defaults(func=cmd_memory_router_gen)
     mp = msub.add_parser('doctor', help='Lint-sweep a memory dir + regen INDEX_ALL.md')
     mp.add_argument('--project', default=None)
     mp.set_defaults(func=cmd_memory_doctor)
@@ -744,7 +788,7 @@ def main():
     p.add_argument('--shell', action='store_true', help='Launch a bare shell instead of Claude')
     p.set_defaults(func=cmd_new)
 
-    p = sub.add_parser('open', aliases=['attach', 'test'],
+    p = sub.add_parser('open', aliases=['attach'],
                        help='Attach to a session from `clanker new` (default: most recent)')
     p.add_argument('name', nargs='?', help='Session name (default: most recent)')
     p.set_defaults(func=cmd_open)
@@ -804,12 +848,6 @@ def main():
     p.set_defaults(func=cmd_import)
 
     # === New Tier 3 ===
-    p = sub.add_parser('orchestrate', help='Orchestrate a plan with task dispatch')
-    p.add_argument('plan', help='Path to plan markdown file')
-    p.add_argument('--project', help='Project path')
-    p.add_argument('--checkpoint', type=int, default=3, help='Checkpoint every N tasks')
-    p.set_defaults(func=cmd_orchestrate)
-
     p = sub.add_parser('cross-project', help='Cross-project pattern analysis')
     p.add_argument('--last', type=int, default=30)
     p.add_argument('--suggest', action='store_true', help='Suggest transfers')

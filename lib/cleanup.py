@@ -86,4 +86,22 @@ def run_gc(dry_run=False):
                 f.writelines(entries)
     results["proposals_pruned"] = pruned
 
+    # 5. Memory-router maintenance (sharded-router design 2026-07-19): refresh
+    # the generated registry snapshot and lint-sweep the global memory dir so
+    # on-disk violations and orphan counts surface weekly, not never.
+    if not dry_run:
+        try:
+            import subprocess
+            import sys as _sys
+            _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from memorycmd import router_gen, GLOBAL_MEM
+            router_gen()
+            lint = os.path.expanduser("~/.claude/hooks/memory-lint.sh")
+            if os.path.exists(lint) and os.path.isdir(GLOBAL_MEM):
+                r = subprocess.run(["bash", lint, "--doctor", GLOBAL_MEM],
+                                   capture_output=True, text=True, timeout=60)
+                results["memory_doctor"] = "pass" if r.returncode == 0 else "FAIL"
+        except Exception as e:
+            results["memory_doctor"] = f"error: {e}"
+
     return results

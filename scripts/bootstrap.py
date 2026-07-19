@@ -28,7 +28,7 @@ for conv in conversations:
         "timestamp": ts,
         "session_id": conv.get("conversation_id", ""),
         "project": project,
-        "cwd": f"/home/user/projects/{project}" if project != "global" else "/home/user",
+        "cwd": os.path.expanduser(f"~/projects/{project}") if project != "global" else os.path.expanduser("~"),
         "duration_s": int(conv.get("duration_seconds", 0)),
         "claude_version": conv.get("cli_version", "unknown"),
         "tool_uses": conv.get("tool_uses", {}),

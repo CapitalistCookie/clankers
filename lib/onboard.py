@@ -310,8 +310,10 @@ Tools: {", ".join(stack["tools"]) or "none detected"}
         print(f"Created: {project_claude}")
 
     # 3. Create per-project settings.json with archetype hooks
-    settings_dir = os.path.expanduser(
-        f"~/.claude/projects/-home-user-projects-{name}"
+    from memoryns import slug as _ns_slug
+    settings_dir = os.path.join(
+        os.path.expanduser("~/.claude/projects"),
+        _ns_slug(os.path.expanduser(f"~/projects/{name}")),
     )
     os.makedirs(settings_dir, exist_ok=True)
     settings_path = os.path.join(settings_dir, "settings.json")
@@ -362,29 +364,21 @@ Tools: {", ".join(stack["tools"]) or "none detected"}
             f.write(f"# Clanker local config\n{clanker_ignore}\n")
         print(f"Created .gitignore")
 
-    # 5. Add to registry
-    with open(REGISTRY_PATH) as f:
-        reg = yaml.safe_load(f)
-
-    if name not in reg.get("projects", {}):
-        reg.setdefault("projects", {})[name] = {
-            "archetype": archetype,
-            "remote": None,
-        }
-        try:
-            remote = subprocess.check_output(
-                ["git", "-C", project_path, "remote", "get-url", "origin"],
-                stderr=subprocess.DEVNULL, text=True
-            ).strip()
-            if "github.com" in remote:
-                parts = remote.replace("https://github.com/", "").replace(".git", "").split("/")
-                if len(parts) >= 2:
-                    reg["projects"][name]["remote"] = f"{parts[0]}/{parts[1]}"
-        except:
-            pass
-
-        with open(REGISTRY_PATH, "w") as f:
-            yaml.dump(reg, f, default_flow_style=False, sort_keys=False)
+    # 5. Add to registry — via the single mutator (registry.write_entry)
+    from registry import write_entry
+    remote = None
+    try:
+        r = subprocess.check_output(
+            ["git", "-C", project_path, "remote", "get-url", "origin"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        if "github.com" in r:
+            parts = r.replace("https://github.com/", "").replace(".git", "").split("/")
+            if len(parts) >= 2:
+                remote = f"{parts[0]}/{parts[1]}"
+    except Exception:
+        pass
+    if write_entry(name, {"archetype": archetype, "remote": remote}, create_only=True):
         print(f"Added to registry: {name} ({archetype})")
     else:
         print(f"Already in registry: {name}")
@@ -407,18 +401,17 @@ def remove_project(name):
     project_path = os.path.expanduser(f"~/projects/{name}")
     removed = []
 
-    # 1. Remove from registry
-    if os.path.exists(REGISTRY_PATH):
-        with open(REGISTRY_PATH) as f:
-            reg = yaml.safe_load(f)
-        if name in reg.get("projects", {}):
-            del reg["projects"][name]
-            with open(REGISTRY_PATH, "w") as f:
-                yaml.dump(reg, f, default_flow_style=False, sort_keys=False)
-            removed.append("registry")
+    # 1. Remove from registry — via the single mutator (registry.remove_entry)
+    from registry import remove_entry
+    if remove_entry(name):
+        removed.append("registry")
 
     # 2. Remove per-project settings.json
-    settings_dir = os.path.expanduser(f"~/.claude/projects/-home-user-projects-{name}")
+    from memoryns import slug as _ns_slug
+    settings_dir = os.path.join(
+        os.path.expanduser("~/.claude/projects"),
+        _ns_slug(os.path.expanduser(f"~/projects/{name}")),
+    )
     settings_path = os.path.join(settings_dir, "settings.json")
     if os.path.exists(settings_path):
         os.remove(settings_path)

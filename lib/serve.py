@@ -540,7 +540,19 @@ async def security_middleware(request, handler):
     # mobile browsers + the CDN cache the page heuristically and keep serving a
     # STALE build — which is why new terminal features didn't appear after deploy.
     # no-store forces a fresh fetch every load so a redeploy always takes effect.
-    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    # EXCEPT /vendor/: those libs change only with a repo update, and no-store
+    # made every phone page-load re-pull ~350KB of xterm.js through the tunnel
+    # (the single biggest "dashboard takes forever" cost, 2026-07-19).
+    if request.path.startswith("/vendor/"):
+        response.headers["Cache-Control"] = "public, max-age=604800"
+    elif request.path.startswith("/app/"):
+        # SPA assets change with every deploy (stable filenames), so no week-long
+        # /vendor/ cache — but no-store is wasteful too. no-cache lets the browser
+        # keep a copy and revalidate; the static handler answers with a cheap 304
+        # off Last-Modified/ETag when unchanged.
+        response.headers["Cache-Control"] = "no-cache"
+    else:
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
     # Build stamp so "did the deploy land?" is answerable with `curl -I`.
     response.headers["X-Clanker-Build"] = BUILD_ID
     if _is_https(request):
@@ -569,7 +581,9 @@ class Cache:
         self._time = time.time()
 
 
-_dashboard_cache = Cache(ttl=60)
+# TTL 150 > the refresher's 55s period: '/' serves warm cache always; the TTL
+# only matters as a staleness ceiling if the refresher task dies.
+_dashboard_cache = Cache(ttl=150)
 _status_cache = Cache(ttl=2)
 
 
@@ -655,6 +669,109 @@ def detect_session_state(pane):
     return "working" if _title_is_working(pane.get("title", "")) else "waiting"
 
 
+def classify_rest_state(tail):
+    """Classify WHY an at-rest Claude pane is at rest, from its captured tail.
+
+    Returns (substate, detail): substate in {'decision','limit','error','waiting'};
+    detail is the most relevant matched line (box-drawing stripped), '' if none.
+    The notifier previously treated every non-spinner pane as one generic
+    'needs input' — a permission dialog, a usage-limit banner, an API-error
+    banner and a plain finished prompt all pinged identically (operator:
+    'quite naive', 2026-07-19). Pure function so the patterns are testable.
+    """
+    lines = [l.strip(" │╭╮╰╯─┃┏┓┗┛┌┐└┘\t") for l in (tail or "").split("\n")]
+    text = "\n".join(lines)
+    low = text.lower()
+
+    def _detail(rx):
+        for l in reversed(lines):
+            if l and re.search(rx, l, re.I):
+                return l[:140]
+        return ""
+
+    dec_rx = r"do you want|always allow|allow once|don'?t ask again"
+    has_options = (re.search(r"(?m)^\s*❯?\s*1\.\s", text)
+                   and re.search(r"(?m)^\s*2\.\s", text))
+    if re.search(dec_rx, low) or has_options:
+        q = _detail(r"do you want") or _detail(r"\?\s*$") or _detail(r"^\s*❯?\s*1\.\s")
+        return "decision", q
+
+    lim_rx = r"usage limit|rate limit|limit reached|weekly limit|5-hour limit|resets? (at|in)\b"
+    if re.search(lim_rx, low):
+        return "limit", _detail(lim_rx)
+
+    err_rx = (r"api error|overloaded|connection (error|refused|failed)"
+              r"|request timed out|failed to connect|offline")
+    if re.search(err_rx, low):
+        return "error", _detail(err_rx)
+
+    return "waiting", ""
+
+
+def classify_working_state(tail):
+    """Classify WHAT a working (spinner) pane is doing, from its captured tail.
+
+    Returns (wsub, agents, detail): wsub in {'subagents','compacting','working'};
+    agents = best-effort count of live subagents (0 when none detected); detail
+    = the most informative activity line. Exhaustive-states request, 2026-07-19:
+    'working' alone hid fan-outs and compaction stalls from the fleet view."""
+    lines = [l.rstrip() for l in (tail or "").split("\n")]
+    text = "\n".join(lines)
+    low = text.lower()
+
+    if re.search(r"compacting (the )?conversation|context left until auto-compact: 0", low):
+        return "compacting", 0, _last_activity_line(tail)
+
+    agents = 0
+    m = re.search(r"(\d+)\s+agents?\s+(running|working)", low)
+    if m:
+        agents = int(m.group(1))
+    task_lines = [l.strip() for l in lines if re.search(r"⏺?\s*Task\(", l)]
+    if not agents and task_lines:
+        agents = len(task_lines)
+    if re.search(r"\bsubagents?\b", low) and not agents:
+        agents = 1
+    if agents:
+        detail = task_lines[-1][:140] if task_lines else _last_activity_line(tail)
+        return "subagents", agents, detail
+
+    return "working", 0, _last_activity_line(tail)
+
+
+def _last_activity_line(tail):
+    """The most recent line that says WHAT is happening: prefer Claude's ⏺
+    action/summary lines, fall back to the last non-chrome content line."""
+    lines = (tail or "").split("\n")
+    for line in reversed(lines):
+        s = line.strip()
+        if s.startswith("⏺"):
+            return s[:140]
+    for line in reversed(lines):
+        s = line.strip()
+        if s and "─" not in s and "❯" not in s and "│" not in s:
+            return s[:140]
+    return ""
+
+
+def _craft_notification(sid, tail):
+    """Build (title, priority, tags, body) for a stable at-rest session's ping,
+    by rest-substate — a blocking dialog outranks a finished turn outranks a
+    limit banner (nothing to do until reset)."""
+    sub, detail = classify_rest_state(tail)
+    if sub == "decision":
+        return (f"{sid}: decision needed", "max", "warning",
+                detail or "Claude is waiting on an approval/choice dialog")
+    if sub == "limit":
+        return (f"{sid}: usage limit hit", "default", "hourglass_flowing_sand",
+                detail or "Usage-limit banner showing")
+    if sub == "error":
+        return (f"{sid}: erroring", "high", "rotating_light",
+                detail or "Error banner showing")
+    body = _last_activity_line(tail)
+    return (f"{sid} finished — your turn", "high", "robot",
+            body or "Claude Code is waiting for input")
+
+
 # Track active PTY bridges so the reaper doesn't kill them
 _active_bridges = set()
 
@@ -698,7 +815,21 @@ class PtyBridge:
 
     def start(self):
         """Create a grouped tmux session and attach via PTY."""
-        # Set window-size to largest so the web client doesn't shrink the original terminal
+        # Web client must not fight the desktop over window size. 'largest'
+        # while the bridge lives, and the PREVIOUS value is restored on close —
+        # the old code set it permanently, so one tiled-view visit left every
+        # target session resized against its desktop clients (the operator's
+        # 3-monitor mess, 2026-07-19).
+        self._prev_window_size = None
+        try:
+            out = subprocess.run(
+                ["tmux", "show-options", "-t", self.target, "window-size"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.strip()
+            if out.startswith("window-size "):
+                self._prev_window_size = out.split(None, 1)[1]
+        except Exception:
+            pass
         subprocess.run(
             ["tmux", "set-option", "-t", self.target, "window-size", "largest"],
             capture_output=True, timeout=3,
@@ -777,6 +908,18 @@ class PtyBridge:
             ["tmux", "kill-session", "-t", self.web_session],
             capture_output=True, timeout=5,
         )
+        # Restore the target's pre-bridge window-size (see start()). Restores
+        # only when NO other bridge remains anywhere (conservative: a tiled
+        # view holds many bridges; restoring under a live one would flip its
+        # target mid-use — worst case here is a restore deferred to last-close).
+        if getattr(self, "_prev_window_size", None) and not any(
+            b for b in _active_bridges if b != self.web_session
+        ):
+            subprocess.run(
+                ["tmux", "set-option", "-t", self.target,
+                 "window-size", self._prev_window_size],
+                capture_output=True, timeout=3,
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -784,27 +927,37 @@ class PtyBridge:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def handle_index(request):
-    """Serve the live dashboard with cached data."""
-    from dashboard import _build_html
-    from dashboard_data import generate_dashboard_data
+    """Serve the live dashboard from the warm cache (see dashboard_refresher).
 
+    The build costs ~0.9s (registry git subprocesses + session-store scans);
+    paying it inline on the first request after any idle >TTL stacked a full
+    second on top of tunnel RTT — the refresher pays it off-request instead."""
     cached = _dashboard_cache.get()
     if cached:
-        return web.Response(text=cached, content_type="text/html")
+        resp = web.Response(text=cached, content_type="text/html")
+        resp.enable_compression()
+        return resp
 
-    data = generate_dashboard_data()
+    # Cold start only (first request racing the refresher's first build).
+    from dashboard import _build_html
+    from dashboard_data import generate_dashboard_data
+    data = await asyncio.to_thread(generate_dashboard_data)
     data_json = json.dumps(data, indent=None)
     base_html = _build_html(data_json)
     html = base_html.replace("</body>", _live_features_html() + "\n</body>")
     _dashboard_cache.set(html)
-    return web.Response(text=html, content_type="text/html")
+    resp = web.Response(text=html, content_type="text/html")
+    resp.enable_compression()
+    return resp
 
 
 async def handle_status(request):
     """Return current tmux session status (cached 2s)."""
     cached = _status_cache.get()
     if cached:
-        return web.json_response(cached)
+        resp = web.json_response(cached)
+        resp.enable_compression()
+        return resp
 
     panes = list_panes()
     sessions = []
@@ -812,7 +965,16 @@ async def handle_status(request):
         if p["command"] != "claude":
             continue
         state = detect_session_state(p)
-        preview = capture_pane_tail(p["target"], lines=3)
+        # 12 lines: enough to see a dialog/banner/agent-tree for substates,
+        # not just the 3-line preview.
+        preview = capture_pane_tail(p["target"], lines=12)
+        substate = ""
+        agents = 0
+        if state == "waiting":
+            substate, _ = classify_rest_state(preview)
+        elif state == "working":
+            wsub, agents, _ = classify_working_state(preview)
+            substate = "" if wsub == "working" else wsub
         preview_line = ""
         for line in reversed(preview.split("\n")):
             s = line.strip()
@@ -825,13 +987,38 @@ async def handle_status(request):
             "title": p["title"],
             "command": p["command"],
             "state": state,
+            "substate": substate,
+            "agents": agents,
             "preview": preview_line,
             "size": f"{p['width']}x{p['height']}",
         })
 
     result = {"sessions": sessions, "ntfy_configured": bool(NTFY_TOPIC)}
     _status_cache.set(result)
-    return web.json_response(result)
+    resp = web.json_response(result)
+    resp.enable_compression()
+    return resp
+
+
+async def handle_reader(request):
+    """Reader mode (mobile flagship, 2026-07-19): the session transcript's tail
+    as message units — see lib/reader.py + docs/MOBILE-READER.md. Incremental
+    via ?offset=<byte>; resolution + parsing run off-loop (subprocess + file IO)."""
+    name = request.match_info["session"]
+    if name.startswith("web-") or not _SESSION_NAME_RE.match(name):
+        return web.json_response({"error": "invalid session name"}, status=400)
+    off_raw = request.query.get("offset", "")
+    offset = int(off_raw) if off_raw.isdigit() else None
+    import reader as _reader
+    path = await asyncio.to_thread(_reader.resolve_transcript, name)
+    if not path:
+        return web.json_response(
+            {"units": [], "offset": 0, "reset": True, "error": "no-transcript"})
+    out = await asyncio.to_thread(_reader.parse_tail, path, offset)
+    out["session"] = name
+    resp = web.json_response(out)
+    resp.enable_compression()
+    return resp
 
 
 _panes_cache = Cache(ttl=2)
@@ -840,7 +1027,9 @@ async def handle_panes(request):
     """Return captured content for all Claude panes (for tiled monitor view)."""
     cached = _panes_cache.get()
     if cached:
-        return web.json_response(cached)
+        resp = web.json_response(cached)
+        resp.enable_compression()
+        return resp
 
     panes = list_panes()
     result = []
@@ -859,7 +1048,9 @@ async def handle_panes(request):
         })
 
     _panes_cache.set(result)
-    return web.json_response(result)
+    resp = web.json_response(result)
+    resp.enable_compression()
+    return resp
 
 
 def capture_pane_ansi(target, scrollback=False, scrollback_lines=400):
@@ -973,8 +1164,9 @@ async def handle_session_new(request):
     return web.json_response(result)
 
 
-# Native system monitor — the dashboard's floating compute-load view watches
-# jangmojib (the Proxmox host this VM runs on). This is strictly READ-ONLY: the
+# Native system monitor — the dashboard's floating compute-load view watches the
+# SSH target named by CLANKER_SYSMON_SSH (set in the systemd unit; typically the
+# hypervisor this VM runs on). This is strictly READ-ONLY: the
 # sampler (lib/sysmon_sampler.py) reads /proc + /sys + `df` over SSH, sleeps 1s for
 # rate deltas, prints JSON, and exits. It sends NO signals, writes NO files, and
 # kills NO processes. The SSH target, key, and script are fixed constants — no web
@@ -1274,8 +1466,39 @@ NOTIFY_STABLE_SECS = 12
 NOTIFY_COOLDOWN_SECS = int(os.environ.get("CLANKER_NTFY_COOLDOWN", "0"))
 
 
+async def _post_ntfy(http, title, priority, tags, body, now, muted_until):
+    """POST one ntfy message. Returns (delivered, muted_until) — 'delivered'
+    only on a 200 (evidence, never assumption); a 429 arms the 30-min mute."""
+    headers = {"Title": title, "Priority": priority, "Tags": tags}
+    if NTFY_TOKEN:
+        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
+    try:
+        async with http.post(
+            f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body, headers=headers, timeout=10,
+        ) as resp:
+            if resp.status == 200:
+                log.info("Notified: %s", title)
+                return True, muted_until
+            if resp.status == 429:
+                log.warning("ntfy daily quota hit (429) — muting publishes 30 min")
+                return False, now + 1800
+            log.warning("ntfy rejected (%s): %s", resp.status,
+                        (await resp.text())[:200])
+    except Exception as e:
+        log.warning("ntfy failed: %s", e)
+    return False, muted_until
+
+
 async def monitor_sessions(app):
-    """Poll Claude sessions and ntfy when one settles into 'waiting' for the user.
+    """Poll Claude sessions and ntfy on every state worth the operator's attention.
+
+    Signals (exhaustive-states pass, 2026-07-19):
+      - working→waiting settle, classified: decision (max prio, the question) /
+        limit (the reset line) / error / finished (last ⏺ activity line)
+      - subagent fan-out: first sight of agent activity per working episode
+        (low prio, informational, says what fanned out)
+      - vanished-mid-work: pane gone while last seen working (crash/kill)
+      - subagent limit-kills: new pending entries in agent_resume_queue.jsonl
 
     Three gates kill the false-firing:
       1. TRANSITION — only an observed working→waiting edge arms a notification.
@@ -1289,6 +1512,11 @@ async def monitor_sessions(app):
     notified = set()       # sessions already pinged for their current episode
     last_ping = {}         # session -> ts of last DELIVERED ping (cooldown)
     muted_until = 0.0      # quota backoff: no publish attempts before this ts
+    agents_pinged = set()  # sessions already pinged for their current fan-out
+    # Subagent limit-kill watcher: the SubagentStop hook appends to this queue;
+    # start at the current size so historical entries never burst on restart.
+    queue_path = os.path.expanduser("~/.claude/agent_resume_queue.jsonl")
+    queue_offset = os.path.getsize(queue_path) if os.path.exists(queue_path) else 0
 
     async with ClientSession() as http:
         while True:
@@ -1298,12 +1526,67 @@ async def monitor_sessions(app):
                 live = {p["session"] for p in panes}
                 now = time.time()
 
-                # Drop bookkeeping for sessions that disappeared.
-                for sid in [s for s in prev_state if s not in live]:
+                # Drop bookkeeping for sessions that disappeared. A session that
+                # vanishes while last observed WORKING likely crashed / was
+                # OOM-killed / hit a hard limit — that used to become silence
+                # (state naivety fix, 2026-07-19). One aggregate ping when
+                # several vanish together (tmux server restart) instead of a burst.
+                gone = [s for s in prev_state if s not in live]
+                crashed = [s for s in gone if prev_state.get(s) == "working"]
+                for sid in gone:
                     prev_state.pop(sid, None)
                     waiting_since.pop(sid, None)
                     last_ping.pop(sid, None)
                     notified.discard(sid)
+                if crashed and NTFY_TOPIC and now >= muted_until:
+                    names = ", ".join(sorted(crashed)[:6])
+                    title = (f"{crashed[0]} vanished mid-work" if len(crashed) == 1
+                             else f"{len(crashed)} sessions vanished mid-work")
+                    _, muted_until = await _post_ntfy(
+                        http, title, "high", "skull",
+                        f"tmux pane(s) disappeared while working: {names}",
+                        now, muted_until)
+                for sid in gone:
+                    agents_pinged.discard(sid)
+
+                # Subagent limit-kills: the SubagentStop hook queues them in
+                # agent_resume_queue.jsonl — new pending entries earn a ping so
+                # a dead lane isn't discovered hours later at the desk. Offset
+                # advances only once processed (or when ntfy is unconfigured),
+                # so a quota-mute delays the ping instead of dropping it.
+                try:
+                    qsize = (os.path.getsize(queue_path)
+                             if os.path.exists(queue_path) else 0)
+                    if qsize < queue_offset:
+                        queue_offset = 0  # queue truncated/cleared
+                    if qsize > queue_offset:
+                        if not NTFY_TOPIC:
+                            queue_offset = qsize
+                        elif now >= muted_until:
+                            with open(queue_path) as qf:
+                                qf.seek(queue_offset)
+                                fresh = qf.read()
+                            queue_offset = qsize
+                            for qline in fresh.strip().split("\n"):
+                                if not qline.strip():
+                                    continue
+                                try:
+                                    e = json.loads(qline)
+                                except json.JSONDecodeError:
+                                    continue
+                                if e.get("status") != "pending":
+                                    continue
+                                proj = os.path.basename(e.get("cwd", "")) or "?"
+                                body = (e.get("prompt", "") or "").strip()[:120] \
+                                    or "queued for resume"
+                                reset = e.get("reset_hint", "")
+                                if reset and reset != "unknown":
+                                    body = f"resets {reset} — {body}"
+                                _, muted_until = await _post_ntfy(
+                                    http, f"subagent limit-killed: {proj}",
+                                    "high", "zzz", body, now, muted_until)
+                except Exception as e:
+                    log.debug("resume-queue watch error: %s", e)
 
                 for p in panes:
                     sid = p["session"]
@@ -1316,6 +1599,19 @@ async def monitor_sessions(app):
                         # wait can notify again.
                         waiting_since.pop(sid, None)
                         notified.discard(sid)
+                        # Fan-out visibility: first sight of subagent activity in
+                        # this working episode -> one informational ping saying
+                        # what fanned out (exhaustive-states request, 2026-07-19).
+                        if (state == "working" and sid not in agents_pinged
+                                and NTFY_TOPIC and now >= muted_until):
+                            wtail = capture_pane_tail(p["target"], lines=12)
+                            wsub, agents, detail = classify_working_state(wtail)
+                            if wsub == "subagents":
+                                agents_pinged.add(sid)
+                                _, muted_until = await _post_ntfy(
+                                    http, f"{sid}: {agents} agent(s) fanned out",
+                                    "low", "gear",
+                                    detail or "subagents working", now, muted_until)
                         continue
 
                     if sid not in waiting_since:
@@ -1330,6 +1626,8 @@ async def monitor_sessions(app):
                     if sid in notified or now - waiting_since[sid] < NOTIFY_STABLE_SECS:
                         continue
                     notified.add(sid)
+                    # a stable wait closes the working episode: next fan-out pings again
+                    agents_pinged.discard(sid)
 
                     if not NTFY_TOPIC:
                         continue
@@ -1339,41 +1637,15 @@ async def monitor_sessions(app):
                         continue
                     if now < muted_until:
                         continue
-                    preview = capture_pane_tail(p["target"], lines=4)
-                    last_line = ""
-                    for line in reversed(preview.split("\n")):
-                        s = line.strip()
-                        if s and "─" not in s and "❯" not in s and "│" not in s:
-                            last_line = s[:100]
-                            break
-                    headers = {
-                        "Title": f"{sid} needs input",
-                        "Priority": "high",
-                        "Tags": "robot",
-                    }
-                    if NTFY_TOKEN:
-                        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
-                    try:
-                        async with http.post(
-                            f"{NTFY_SERVER}/{NTFY_TOPIC}",
-                            data=last_line or "Claude Code is waiting for input",
-                            headers=headers,
-                            timeout=10,
-                        ) as resp:
-                            # "Notified" only on evidence — a 429 (daily quota) or
-                            # any other rejection must be loud, never logged as sent.
-                            if resp.status == 200:
-                                last_ping[sid] = now
-                                log.info("Notified: %s", sid)
-                            elif resp.status == 429:
-                                muted_until = now + 1800
-                                log.warning(
-                                    "ntfy daily quota hit (429) — muting publishes 30 min")
-                            else:
-                                log.warning("ntfy rejected (%s): %s", resp.status,
-                                            (await resp.text())[:200])
-                    except Exception as e:
-                        log.warning("ntfy failed: %s", e)
+                    # 15 lines so a permission dialog / limit banner / error
+                    # banner above the prompt is visible to the classifier —
+                    # the ping now says WHAT the session is waiting on.
+                    tail = capture_pane_tail(p["target"], lines=15)
+                    title, priority, tags, body = _craft_notification(sid, tail)
+                    delivered, muted_until = await _post_ntfy(
+                        http, title, priority, tags, body, now, muted_until)
+                    if delivered:
+                        last_ping[sid] = now
             except Exception as e:
                 log.debug("Monitor error: %s", e)
 
@@ -1476,15 +1748,41 @@ async def orch_supervise(app):
             log.debug("orch supervise error: %s", e)
 
 
+async def dashboard_refresher(app):
+    """Keep the dashboard HTML cache warm OFF-request.
+
+    generate_dashboard_data costs ~0.9s (registry git subprocesses + session
+    store scans). Built inline, the first request after any idle > cache TTL
+    stacked that on top of tunnel RTT — the recurring 'dashboard takes forever'
+    (2026-07-19). Refresh every 55s < the 150s TTL, so '/' always serves warm."""
+    from dashboard import _build_html
+    from dashboard_data import generate_dashboard_data
+    first = True
+    while True:
+        try:
+            t0 = time.time()
+            data = await asyncio.to_thread(generate_dashboard_data)
+            html = _build_html(json.dumps(data, indent=None)).replace(
+                "</body>", _live_features_html() + "\n</body>")
+            _dashboard_cache.set(html)
+            (log.info if first else log.debug)(
+                "dashboard cache warmed in %.2fs", time.time() - t0)
+            first = False
+        except Exception as e:
+            log.warning("dashboard refresh failed: %s", e)
+        await asyncio.sleep(55)
+
+
 async def start_background(app):
     cleanup_web_sessions()
     app["monitor_task"] = asyncio.create_task(monitor_sessions(app))
     app["reaper_task"] = asyncio.create_task(session_reaper(app))
     app["orch_task"] = asyncio.create_task(orch_supervise(app))
+    app["dashboard_task"] = asyncio.create_task(dashboard_refresher(app))
 
 
 async def stop_background(app):
-    for key in ("monitor_task", "reaper_task", "orch_task"):
+    for key in ("monitor_task", "reaper_task", "orch_task", "dashboard_task"):
         task = app.get(key)
         if task:
             task.cancel()
@@ -1500,268 +1798,22 @@ async def stop_background(app):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _live_features_html():
+    """Markup appended before </body> for the live features (terminal, sysmon,
+    tiled view, orchestration). The CSS/JS now live in lib/web/app.css +
+    lib/web/live.js (served at /app/); this returns only the vendor <script>
+    tags, the static overlay markup, and the deferred /app/live.js include —
+    which runs after app.js (defer preserves document order)."""
     return '''
 <!-- ─── Live Features: xterm.js + terminal + notifications ─── -->
 <link rel="stylesheet" href="/vendor/xterm.min.css">
 <script defer src="/vendor/xterm.min.js"></script>
+<script defer src="/vendor/addon-webgl.min.js"></script>
 <script defer src="/vendor/addon-fit.min.js"></script>
 <script defer src="/vendor/addon-web-links.min.js"></script>
+<script defer src="/vendor/marked.min.js"></script>
+<script defer src="/vendor/purify.min.js"></script>
+<script defer src="/app/reader.js"></script>
 <!-- Pretext available at https://esm.sh/@chenglou/pretext@0.0.4 — will be used when we move to Canvas renderer -->
-
-<style>
-.session-card {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 10px 0; border-bottom: 1px solid rgba(87, 83, 78, 0.3);
-  cursor: pointer; transition: background 0.15s;
-}
-.session-card:hover { background: rgba(255,255,255,0.02); padding-left: 8px; padding-right: 8px; margin: 0 -8px; }
-.fav-star { cursor: pointer; color: var(--border); font-size: 16px; line-height: 1; margin-right: 10px; flex-shrink: 0; transition: color 0.15s; }
-.fav-star.on { color: var(--accent-amber); }
-.fav-star:hover { color: var(--accent-amber); }
-.session-info { flex: 1; min-width: 0; }
-.session-name { font-family: var(--font-mono); font-size: 13px; color: var(--accent-cream); }
-.session-preview {
-  font-family: var(--font-mono); font-size: 10px; color: var(--text-muted);
-  margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.session-badge {
-  font-family: var(--font-mono); font-size: 9px; text-transform: uppercase;
-  letter-spacing: 0.1em; padding: 3px 8px; flex-shrink: 0; margin-left: 12px;
-}
-.session-badge.working { color: var(--accent-amber); border: 1px solid var(--accent-amber); }
-.session-badge.waiting { color: var(--bg-void); background: var(--accent-olive); }
-.session-badge.idle { color: var(--text-muted); border: 1px solid var(--border); }
-
-.terminal-overlay {
-  position: fixed; left: 0; top: 0; width: 100%; height: 100%;
-  background: rgba(12, 10, 9, 0.95);
-  z-index: 1000; display: none; flex-direction: column;
-}
-.terminal-overlay.open { display: flex; }
-.terminal-header {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 4px 10px; background: var(--bg-deep);
-  border-bottom: 1px solid var(--accent-terracotta); flex-shrink: 0;
-}
-.terminal-header h3 {
-  font-family: var(--font-mono); font-size: 0.85rem;
-  color: var(--accent-cream); font-weight: 500;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50vw;
-}
-.terminal-header .session-state {
-  font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); margin-left: 8px;
-}
-.terminal-header .hdr-actions { display: flex; align-items: center; gap: 4px; }
-.terminal-hdr-btn {
-  cursor: pointer; color: var(--text-muted); font-size: 15px; line-height: 1;
-  padding: 4px 7px; background: var(--bg-surface); border: 1px solid var(--border);
-}
-.terminal-hdr-btn:hover { color: var(--accent-cream); border-color: var(--accent-terracotta); }
-.terminal-close {
-  cursor: pointer; color: var(--text-muted); font-size: 22px;
-  line-height: 1; padding: 2px 6px; transition: color 0.15s;
-}
-.terminal-close:hover { color: var(--accent-red); }
-.terminal-body { flex: 1; overflow: hidden; background: #0C0A09; padding: 4px; }
-.live-terminal-pre {
-  font-family: var(--font-mono); font-size: 14px; line-height: 1.35;
-  color: #FAFAF9; background: #0C0A09; padding: 8px 12px;
-  white-space: normal; overflow-y: auto; overflow-x: hidden; height: 100%; margin: 0; box-sizing: border-box;
-  outline: none; cursor: text; contain: content;
-  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
-  -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
-}
-.live-terminal-pre:focus { box-shadow: inset 0 0 0 1px var(--accent-terracotta); }
-/* TUI panes: the frame can be TALLER than a phone viewport (a 50-row pane plus
-   wrapped lines), so native pan stays enabled to reach the top of the CURRENT
-   frame — a brand-new session has no transcript to page, which made its banner
-   unreachable when native scroll was disabled. App-level paging (wheel SGR)
-   engages only at the frame's edges (see the wheel/touch handlers);
-   overscroll-behavior keeps momentum from rubber-banding the page. */
-.live-terminal-pre.tui-view { overflow-y: auto; touch-action: pan-y; overscroll-behavior: contain; }
-/* Per-line wrap policy (adaptive): prose lines wrap to the screen; decoration
-   lines (long horizontal rules / box borders) clip to one row instead of
-   wrapping into several repeated rows of the same character. */
-.live-terminal-pre .tline { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 1.15em; }
-.live-terminal-pre .tline.rule { white-space: nowrap; overflow: hidden; }
-.live-terminal-pre .tline.tfoot { white-space: pre; overflow: hidden; text-overflow: ellipsis; }
-.live-terminal-pre .tline.todo-sum { opacity: 0.5; font-style: italic; }
-@media (max-width: 768px) { .live-terminal-pre { font-size: 12px; } }
-/* Jump-to-live pill — appears when you've scrolled up into history. */
-.jump-live {
-  position: absolute; right: 14px; bottom: 12px; z-index: 5;
-  background: var(--accent-olive); color: var(--bg-void); border: none;
-  font-family: var(--font-mono); font-size: 11px; font-weight: 700;
-  padding: 7px 14px; border-radius: 16px; cursor: pointer; display: none;
-  box-shadow: 0 2px 10px rgba(0,0,0,0.5); letter-spacing: 0.03em;
-}
-.jump-live.show { display: block; }
-.terminal-body { position: relative; }
-/* Hidden capture textarea: tap the terminal to type directly into the session
-   (no reply bar). Invisible but IN-PLACE (bottom of the terminal body) so the
-   browser never has anything off-canvas to scroll into view on focus, and
-   font-size 16px so iOS doesn't auto-zoom the page when it gains focus. */
-.terminal-input-capture {
-  position: absolute; left: 0; bottom: 0; width: 1px; height: 1px;
-  opacity: 0; border: 0; padding: 0; resize: none; font-size: 16px;
-}
-.live-terminal-pre::-webkit-scrollbar { width: 6px; }
-.live-terminal-pre::-webkit-scrollbar-track { background: transparent; }
-.live-terminal-pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-.mobile-input {
-  display: none; gap: 4px; padding: 4px 6px; flex-wrap: nowrap; align-items: center;
-  background: var(--bg-deep); border-top: 1px solid var(--border); flex-shrink: 0;
-  overflow-x: auto; -webkit-overflow-scrolling: touch;
-}
-@media (max-width: 768px) { .mobile-input { display: flex; } }
-.mobile-input button.signal { flex: 1 0 auto; min-width: 34px; padding: 7px 6px; }
-.mobile-input button {
-  background: var(--bg-surface); color: var(--text-secondary); border: 1px solid var(--border);
-  padding: 7px 10px; font-family: var(--font-mono); font-size: 12px; line-height: 1;
-  letter-spacing: 0.03em; cursor: pointer; transition: background 0.15s; white-space: nowrap;
-}
-.mobile-input button:hover { background: #a33a0a; color: var(--accent-cream); }
-.mobile-input button.signal { background: var(--bg-surface); color: var(--text-secondary); }
-.mobile-input button.signal:hover { background: var(--accent-red); color: white; }
-
-/* New-session modal */
-.newsess-overlay {
-  position: fixed; inset: 0; background: rgba(12,10,9,0.75); z-index: 1100;
-  display: none; align-items: center; justify-content: center;
-}
-.newsess-overlay.open { display: flex; }
-.newsess-box {
-  background: var(--bg-deep); border: 1px solid var(--accent-terracotta);
-  padding: 20px; width: min(420px, 92vw); font-family: var(--font-mono);
-}
-.newsess-box h3 {
-  font-family: var(--font-display); font-size: 1.25rem; color: var(--accent-cream);
-  font-weight: 400; margin: 0 0 14px;
-}
-.newsess-box label.row { display: block; font-size: 11px; color: var(--text-muted);
-  text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
-.newsess-box input[type=text] {
-  width: 100%; box-sizing: border-box; background: var(--bg-panel);
-  border: 1px solid var(--border); color: var(--text-primary);
-  font-family: var(--font-mono); font-size: 16px; padding: 10px 12px;
-  outline: none; margin-bottom: 14px;
-}
-.newsess-box input[type=text]:focus { border-color: var(--accent-terracotta); }
-.newsess-box label.chk {
-  display: flex; align-items: center; gap: 8px; font-size: 12px;
-  color: var(--text-secondary); margin-bottom: 18px; cursor: pointer;
-}
-.newsess-box label.chk input { width: 16px; height: 16px; }
-.newsess-box .hint { font-size: 10px; color: var(--text-muted); margin: -8px 0 16px; line-height: 1.4; }
-.newsess-actions { display: flex; gap: 8px; justify-content: flex-end; }
-.newsess-actions button {
-  font-family: var(--font-mono); font-size: 11px; padding: 10px 18px;
-  text-transform: uppercase; letter-spacing: 0.05em; cursor: pointer; border: none;
-}
-.newsess-actions .go { background: var(--accent-terracotta); color: var(--accent-cream); }
-.newsess-actions .go:hover { background: #a33a0a; }
-.newsess-actions .cancel { background: var(--bg-surface); color: var(--text-secondary); border: 1px solid var(--border); }
-
-/* Floating system-monitor button — opens the native System Monitor overlay.
-   Available from anywhere on the dashboard; sits under the overlays (z 1000). */
-.fab-btop {
-  position: fixed; right: 18px; bottom: 18px; z-index: 990;
-  width: 54px; height: 54px; border-radius: 50%;
-  background: var(--accent-terracotta); color: var(--accent-cream); border: none;
-  font-family: var(--font-mono); font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
-  cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,0.45);
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
-  transition: background 0.15s, transform 0.1s;
-}
-.fab-btop:hover { background: #a33a0a; }
-.fab-btop:active { transform: scale(0.94); }
-.fab-btop .ic { font-size: 16px; line-height: 1; }
-.fab-btop:disabled { opacity: 0.6; cursor: default; }
-/* Hidden while any overlay is open — the terminal header carries its own sys
-   button, so the monitor stays reachable from a terminal without the FAB
-   floating over the control bar / live pill. */
-body.overlay-open .fab-btop { display: none; }
-@media (max-width: 768px) { .fab-btop { right: 14px; bottom: 14px; width: 48px; height: 48px; font-size: 9px; } }
-
-/* ── Native System Monitor overlay (replaces btop-in-a-terminal on mobile) ── */
-.sysmon-overlay {
-  position: fixed; left: 0; top: 0; width: 100%; height: 100%;
-  background: var(--bg-void); z-index: 1050; display: none; flex-direction: column;
-}
-.sysmon-overlay.open { display: flex; }
-.sysmon-header {
-  display: flex; align-items: center; gap: 10px; padding: 10px 16px;
-  background: var(--bg-deep); border-bottom: 2px solid var(--accent-terracotta); flex-shrink: 0;
-}
-.sysmon-header h3 { font-family: var(--font-display); font-size: 1.25rem; color: var(--accent-cream); font-weight: 400; }
-.sysmon-header .sm-host { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
-.sysmon-header .sm-age { margin-left: auto; font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
-.sysmon-close { cursor: pointer; color: var(--text-muted); font-size: 26px; line-height: 1; padding: 2px 6px; }
-.sysmon-close:hover { color: var(--accent-red); }
-.sysmon-body { flex: 1; overflow-y: auto; padding: 12px; display: grid; gap: 12px;
-  grid-template-columns: 1fr; -webkit-overflow-scrolling: touch; }
-@media (min-width: 820px) { .sysmon-body { grid-template-columns: 1fr 1fr; } }
-.sm-card { background: var(--bg-panel); border: 1px solid var(--border); padding: 12px 14px; }
-.sm-card.wide { grid-column: 1 / -1; }
-.sm-card h4 {
-  font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em;
-  color: var(--text-secondary); margin: 0 0 10px; display: flex; align-items: center; gap: 8px;
-}
-.sm-card h4 .sm-sub { margin-left: auto; color: var(--text-muted); letter-spacing: 0.04em; font-size: 10px; }
-.sm-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.sm-chip {
-  font-family: var(--font-mono); font-size: 11px; padding: 4px 9px;
-  background: var(--bg-surface); color: var(--text-secondary); border: 1px solid var(--border);
-}
-.sm-chip b { color: var(--accent-cream); font-weight: 500; }
-/* labelled progress bar */
-.sm-bar-row { display: flex; align-items: center; gap: 8px; margin: 5px 0; font-family: var(--font-mono); font-size: 11px; }
-.sm-bar-row .sm-lbl { flex: 0 0 auto; color: var(--text-muted); min-width: 38px; }
-.sm-bar-row .sm-val { flex: 0 0 auto; color: var(--text-secondary); margin-left: auto; white-space: nowrap; }
-.sm-bar { flex: 1 1 auto; height: 12px; background: var(--bg-void); border: 1px solid var(--border); overflow: hidden; position: relative; }
-.sm-bar > span { display: block; height: 100%; background: var(--accent-olive); transition: width 0.4s ease; }
-.sm-bar.warn > span { background: var(--accent-amber); }
-.sm-bar.crit > span { background: var(--accent-red); }
-/* per-core grid */
-.sm-cores { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
-@media (min-width: 520px) { .sm-cores { grid-template-columns: repeat(8, 1fr); } }
-.sm-core { font-family: var(--font-mono); font-size: 9px; color: var(--text-muted); text-align: center; }
-.sm-core .sm-cbar { height: 5px; background: var(--bg-void); border: 1px solid var(--border); margin-top: 2px; overflow: hidden; }
-.sm-core .sm-cbar > span { display: block; height: 100%; background: var(--accent-olive); }
-.sm-core .sm-cbar.warn > span { background: var(--accent-amber); }
-.sm-core .sm-cbar.crit > span { background: var(--accent-red); }
-/* process table */
-.sm-proc-ctl { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
-.sm-proc-ctl input {
-  flex: 1 1 auto; background: var(--bg-void); border: 1px solid var(--border); color: var(--text-primary);
-  font-family: var(--font-mono); font-size: 13px; padding: 6px 8px; outline: none;
-}
-.sm-proc-ctl input:focus { border-color: var(--accent-terracotta); }
-.sm-sort-btn {
-  font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
-  padding: 6px 10px; background: var(--bg-surface); color: var(--text-muted); border: 1px solid var(--border); cursor: pointer;
-}
-.sm-sort-btn.active { background: var(--accent-terracotta); color: var(--bg-void); border-color: var(--accent-terracotta); }
-.sm-proc { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11px; }
-.sm-proc th { text-align: left; color: var(--text-muted); font-weight: 400; padding: 3px 6px; border-bottom: 1px solid var(--border); font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; }
-.sm-proc td { padding: 3px 6px; border-bottom: 1px solid rgba(87,83,78,0.18); color: var(--text-secondary); white-space: nowrap; }
-.sm-proc td.cmd { color: var(--accent-cream); width: 99%; overflow: hidden; text-overflow: ellipsis; max-width: 0; }
-.sm-proc td.num { text-align: right; }
-.sm-proc td.hot { color: var(--accent-amber); }
-.sm-err { font-family: var(--font-mono); font-size: 12px; color: var(--accent-red); padding: 10px; }
-
-.notif-badge {
-  position: fixed; top: 16px; right: 16px; background: var(--accent-olive);
-  color: var(--bg-void); font-family: var(--font-mono); font-size: 11px;
-  font-weight: 700; padding: 8px 14px; z-index: 999; cursor: pointer;
-  display: none; letter-spacing: 0.05em;
-}
-.notif-badge.visible { display: block; animation: notifPulse 2s ease-in-out infinite; }
-@keyframes notifPulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(101, 163, 13, 0.4); }
-  50% { box-shadow: 0 0 0 8px rgba(101, 163, 13, 0); }
-}
-</style>
 
 <div class="notif-badge" id="notif-badge" onclick="openWaitingSession()"></div>
 <button class="fab-btop" id="fab-btop" onclick="openSysmon()" title="System monitor — hypervisor"><span class="ic">▤</span>sys</button>
@@ -1784,11 +1836,17 @@ body.overlay-open .fab-btop { display: none; }
     <h3 id="terminal-title"></h3>
     <div class="hdr-actions">
       <span class="session-state" id="terminal-state"></span>
+      <button class="terminal-hdr-btn" id="terminal-mode-btn" onclick="toggleMobileMode()" title="Reader ⇄ Terminal (mobile)">📖</button>
+      <button class="terminal-hdr-btn" onclick="toggleComposeMode()" title="Compose bar (native autocorrect/glide typing; Enter sends the whole line)">⌨</button>
       <button class="terminal-hdr-btn" onclick="openSysmon()" title="System monitor">▤</button>
       <span class="terminal-close" onclick="closeTerminal()">&times;</span>
     </div>
   </div>
   <div class="terminal-body" id="terminal-body"></div>
+  <div class="compose-bar" id="compose-bar">
+    <textarea id="compose-input" rows="1" placeholder="Message — Enter sends, Shift+Enter = newline" enterkeyhint="send" autocomplete="on" autocapitalize="sentences" spellcheck="true"></textarea>
+    <button class="compose-send" id="compose-send" title="Send">➤</button>
+  </div>
   <div class="mobile-input">
     <button class="signal" id="key-esc" title="Escape · hold: hide/show todos">esc</button>
     <button class="signal" onclick="sendNamed('Tab')" title="Tab">tab</button>
@@ -1818,1521 +1876,7 @@ body.overlay-open .fab-btop { display: none; }
   </div>
 </div>
 
-<script>
-let liveWs = null, liveSession = null;
-let statusInterval = null, waitingSessions = [];
-
-let livePanelEl = null;
-// Place Live Sessions: on mobile, right above the Projects panel (operator wants
-// it near the top); on desktop, in its original spot above the first 3-col grid.
-function placeLivePanel() {
-  if (!livePanelEl) return;
-  const projectsPanel = document.querySelector('.panel[data-label="PROJECTS"]');
-  const projectsGrid = projectsPanel ? projectsPanel.closest('.grid') : null;
-  const grid3 = document.querySelectorAll('.grid-3')[0];
-  if (isMobileView() && projectsGrid && projectsGrid.parentNode) {
-    if (livePanelEl.nextElementSibling !== projectsGrid)
-      projectsGrid.parentNode.insertBefore(livePanelEl, projectsGrid);
-  } else if (grid3 && grid3.parentNode) {
-    if (livePanelEl.nextElementSibling !== grid3)
-      grid3.parentNode.insertBefore(livePanelEl, grid3);
-  }
-}
-
-(function injectLivePanel() {
-  const grid3 = document.querySelectorAll('.grid-3')[0];
-  if (!grid3) return;
-  const livePanel = document.createElement('div');
-  livePanel.className = 'grid live-panel';
-  livePanel.style.cssText = 'grid-template-columns:1fr; margin-bottom:2px;';
-  livePanel.innerHTML = '<div class="panel" data-label="LIVE" style="animation-delay:0.5s"><h2>Live Sessions</h2><div id="live-sessions"></div></div>';
-  livePanelEl = livePanel;
-  grid3.parentNode.insertBefore(livePanel, grid3);
-  placeLivePanel();
-  // Re-place if the viewport crosses the mobile breakpoint (rotate / resize).
-  if (window.matchMedia) {
-    const mq = window.matchMedia('(max-width: 768px)');
-    (mq.addEventListener ? mq.addEventListener.bind(mq, 'change') : mq.addListener.bind(mq))(placeLivePanel);
-  }
-  fetchStatus();
-  statusInterval = setInterval(() => { if (!document.hidden) fetchStatus(); }, 5000);
-  if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission();
-})();
-
-async function fetchStatus() {
-  try {
-    const r = await fetch('/api/status');
-    if (r.status === 401) { window.location = '/auth/login'; return; }
-    const data = await r.json();
-    renderLiveSessions(data.sessions);
-    updateNotifications(data.sessions);
-  } catch (e) {}
-}
-
-// ─── Favourites (per-browser, localStorage) — favourited sessions sort to the top ───
-let favSessions = new Set(JSON.parse(localStorage.getItem('clanker_fav_sessions') || '[]'));
-function saveFavs() { localStorage.setItem('clanker_fav_sessions', JSON.stringify([...favSessions])); }
-function toggleFav(name, ev) {
-  if (ev) ev.stopPropagation();
-  favSessions.has(name) ? favSessions.delete(name) : favSessions.add(name);
-  saveFavs();
-  fetchStatus();   // re-render the list immediately
-}
-const STATE_RANK = { waiting: 0, working: 1, idle: 2 };
-function favStateSort(a, b) {
-  const fa = favSessions.has(a.session) ? 0 : 1, fb = favSessions.has(b.session) ? 0 : 1;
-  if (fa !== fb) return fa - fb;                                  // favourites first
-  return (STATE_RANK[a.state] ?? 3) - (STATE_RANK[b.state] ?? 3); // then by activity
-}
-function favStar(name) {
-  const on = favSessions.has(name);
-  return `<span class="fav-star ${on ? 'on' : ''}" title="Favourite" onclick="toggleFav('${name}', event)">${on ? '★' : '☆'}</span>`;
-}
-
-function renderLiveSessions(sessions) {
-  const el = document.getElementById('live-sessions');
-  if (!el) return;
-  const sorted = sessions.filter(s => s.command === 'claude').sort(favStateSort);
-  el.innerHTML = sorted.map(s => `
-    <div class="session-card" onclick="openTerminal('${s.session}')">
-      ${favStar(s.session)}
-      <div class="session-info">
-        <div class="session-name">${s.session}</div>
-        <div class="session-preview">${escapeHtml(s.preview)}</div>
-      </div>
-      <span class="session-badge ${s.state}">${s.state}</span>
-    </div>
-  `).join('') || '<div class="no-data">No active Claude Code sessions</div>';
-}
-
-function updateNotifications(sessions) {
-  const waiting = sessions.filter(s => s.state === 'waiting');
-  const badge = document.getElementById('notif-badge');
-  waitingSessions = waiting;
-  if (waiting.length > 0) {
-    badge.textContent = waiting.length + ' session' + (waiting.length > 1 ? 's' : '') + ' waiting';
-    badge.classList.add('visible');
-    if (!liveSession && 'Notification' in window && Notification.permission === 'granted') {
-      new Notification('Clanker: Input needed', {
-        body: waiting.map(s => s.session).join(', '), tag: 'clanker-input', renotify: true,
-      });
-    }
-  } else { badge.classList.remove('visible'); }
-}
-
-function openWaitingSession() {
-  if (waitingSessions.length > 0) openTerminal(waitingSessions[0].session);
-}
-
-let liveTerm = null, liveFit = null, liveResizeHandler = null;
-let liveMode = null;   // 'pty' (xterm, desktop) | 'view' (capture, wraps, mobile)
-let livePre = null;    // the <pre> element in view mode
-let liveName = null;   // current session name (kept for reconnect)
-let reconnectTimer = null, reconnectDelay = 600;
-
-function setTermState(s) { const el = document.getElementById('terminal-state'); if (el) el.textContent = s; }
-
-// Mobile browsers suspend a backgrounded tab and drop its WebSocket; without
-// this the terminal looked dead until you exited and re-opened it. Reconnect
-// whenever the socket closes while the terminal is still open, and immediately
-// when the tab returns to the foreground.
-function liveSocketDead() { return !liveWs || liveWs.readyState > 1; }  // 2=CLOSING 3=CLOSED
-function reconnectLive() {
-  if (!liveMode || !liveName) return;               // terminal was closed
-  setTermState('reconnecting');
-  (liveMode === 'view' ? connectView : connectPty)(liveName);
-}
-function scheduleReconnect() {
-  if (!liveMode || !liveName || reconnectTimer) return;
-  if (document.hidden) return;                       // reconnect on return instead
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (liveMode && liveName && liveSocketDead()) reconnectLive();
-  }, reconnectDelay);
-  reconnectDelay = Math.min(reconnectDelay * 2, 5000);
-}
-function liveSendResize() {
-  if (liveTerm && liveWs && liveWs.readyState === WebSocket.OPEN)
-    liveWs.send(JSON.stringify({ type: 'resize', cols: liveTerm.cols, rows: liveTerm.rows }));
-}
-
-// Raw key→byte-sequence map for PTY mode (built via fromCharCode so no
-// backslash-escapes live in the Python-embedded JS string).
-const PTYSEQ = {
-  'Enter':  String.fromCharCode(13),
-  'Escape': String.fromCharCode(27),
-  'Tab':    String.fromCharCode(9),
-  'BSpace': String.fromCharCode(127),
-  'Up':     String.fromCharCode(27) + '[A',
-  'Down':   String.fromCharCode(27) + '[B',
-  'Left':   String.fromCharCode(27) + '[D',
-  'Right':  String.fromCharCode(27) + '[C',
-  'PPage':  String.fromCharCode(27) + '[5~',
-  'NPage':  String.fromCharCode(27) + '[6~',
-  'C-c':    String.fromCharCode(3),
-  'C-d':    String.fromCharCode(4),
-};
-
-function isMobileView() { return window.matchMedia('(max-width: 768px)').matches; }
-
-function openTerminal(name) {
-  liveSession = name; liveName = name;
-  reconnectDelay = 600;
-  document.getElementById('terminal-title').textContent = name;
-  const overlay = document.getElementById('terminal-overlay');
-  overlay.classList.add('open');
-  updateFab();
-  document.getElementById('terminal-body').innerHTML = '';
-  applyTerminalViewport();
-  // Mobile: capture-view (wraps in flight, never attaches/resizes the real
-  // session). Desktop: xterm.js over the PTY bridge (true interactivity).
-  if (isMobileView()) buildViewTerminal(name);
-  else buildPtyTerminal(name);
-}
-
-// ── Desktop: xterm.js over the PTY bridge ──
-function buildPtyTerminal(name) {
-  liveMode = 'pty';
-  const container = document.getElementById('terminal-body');
-  const term = new Terminal({
-    theme: XTERM_THEME, fontFamily: 'JetBrains Mono, ui-monospace, monospace',
-    fontSize: 13, cursorBlink: true, scrollback: 5000, allowProposedApi: true,
-  });
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  try { term.loadAddon(new WebLinksAddon.WebLinksAddon()); } catch (e) {}
-  term.open(container);
-  try { fit.fit(); } catch (e) {}
-  liveTerm = term; liveFit = fit;
-  // term/onData persist across reconnects; route input through the live socket.
-  term.onData(d => { if (liveWs && liveWs.readyState === WebSocket.OPEN) liveWs.send(JSON.stringify({ type: 'input', data: d })); });
-  term.onResize(() => liveSendResize());
-  liveResizeHandler = () => { try { fit.fit(); liveSendResize(); } catch (e) {} };
-  window.addEventListener('resize', liveResizeHandler);
-  connectPty(name);
-  setTimeout(() => { try { fit.fit(); liveSendResize(); } catch (e) {} }, 60);
-}
-
-function connectPty(name) {
-  if (liveWs) { try { liveWs.close(); } catch (e) {} }
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/ws/terminal/${name}`);
-  ws.binaryType = 'arraybuffer';
-  liveWs = ws;
-  ws.onopen = () => {
-    reconnectDelay = 600; setTermState('connected');
-    try { liveFit.fit(); } catch (e) {}
-    liveSendResize();
-    if (liveTerm) liveTerm.focus();
-  };
-  ws.onmessage = (e) => { if (liveTerm) liveTerm.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data)); };
-  ws.onclose = () => { setTermState('disconnected'); scheduleReconnect(); };
-  ws.onerror = () => { setTermState('error'); };
-}
-
-// ── Mobile: capture-pane view. Streams `capture-pane -e -p` (read-only) and
-// renders ANSI per-line so prose wraps but decoration rules clip (adaptive wrap).
-// Typing goes through a hidden textarea (tap the terminal) — no reply bar.
-// SCROLLBACK: Claude Code (and other TUIs) run on the terminal's ALTERNATE screen,
-// which has NO tmux scrollback — the transcript lives inside the app. So to scroll
-// back we send the session its own PageUp/PagePown (Claude scrolls its transcript)
-// and the next capture shows the earlier content. Works via the ⇞/⇟ keys, the
-// mouse wheel, and a touch drag. ──
-let viewPending = null, viewRaf = null, viewCapture = null, viewLastFrame = null;
-let jumpLiveBtn = null, viewScrolledUp = false, viewIsTui = false;
-let viewAppScrolled = false;   // the APP's transcript was paged up (vs native pan only)
-let viewStickBottom = true;    // follow the live tail through size changes (keyboard)
-let viewResizeObs = null;
-let viewLastCH = 0;            // clientHeight at the last scroll event (resize detector)
-
-function _viewRenderNow() {
-  viewRaf = null;
-  if (viewPending == null || !livePre) return;
-  viewLastFrame = viewPending;   // kept so display toggles can re-render instantly
-  // Stick-to-bottom: a new frame keeps the view anchored to the live tail, but
-  // only if the user was already there — someone inspecting the top of the frame
-  // (e.g. a fresh session's banner) must not be yanked back down every capture.
-  const atBottom = livePre.scrollHeight - livePre.scrollTop - livePre.clientHeight < 24;
-  livePre.innerHTML = renderAnsiToLines(viewPending);
-  if (atBottom) livePre.scrollTop = livePre.scrollHeight;
-  viewPending = null;
-}
-function _viewSchedule() {
-  // Paint the latest frame on the next display refresh (rAF) — aligned to the
-  // screen so motion is smooth, coalesced (only the newest frame is drawn), and
-  // paused entirely while the tab is hidden (battery; repaints on return).
-  if (document.hidden || viewRaf) return;
-  viewRaf = requestAnimationFrame(_viewRenderNow);
-}
-
-function _setScrolled(v) {
-  viewScrolledUp = v;
-  if (jumpLiveBtn) jumpLiveBtn.classList.toggle('show', v);
-}
-// ⇞/⇟ buttons: pan the local frame first; once it's at its edge, page the app's
-// own transcript (PageUp/PageDown). A fresh session with no transcript to page is
-// still fully viewable via the local pan.
-function viewScroll(dir) {
-  if (livePre) {
-    const room = dir === 'up'
-      ? livePre.scrollTop > 4
-      : livePre.scrollHeight - livePre.scrollTop - livePre.clientHeight > 4;
-    if (room) {
-      livePre.scrollTop += (dir === 'up' ? -0.9 : 0.9) * livePre.clientHeight;
-      return;
-    }
-  }
-  wsKey(dir === 'up' ? 'PPage' : 'NPage');
-  if (dir === 'up') { viewAppScrolled = true; _setScrolled(true); }
-}
-// Return the VIEW to the live tail: anchor the local frame and re-arm
-// stick-to-bottom so size changes (the soft keyboard opening/closing) keep the
-// input line in sight. Used whenever the user acts on the session — typing is
-// an implicit "show me where I'm typing".
-function _viewSnapLive() {
-  viewAppScrolled = false;
-  viewStickBottom = true;
-  if (livePre) livePre.scrollTop = livePre.scrollHeight;
-  _setScrolled(false);
-}
-// Snap back to the live tail: page the app back down (only if its transcript was
-// actually scrolled) and re-anchor the local frame.
-function jumpToLive() {
-  if (viewAppScrolled) for (let i = 0; i < 14; i++) wsKey('NPage');
-  _viewSnapLive();
-}
-
-// ── line-smooth scroll: a wheel/drag sends the TUI mouse-wheel events (it scrolls
-// its transcript line-by-line). `n` = notches, batched into one message. Gated to
-// TUIs so a plain shell never receives stray mouse bytes. ──
-function wsWheel(dir, n) {
-  if (!viewIsTui || !liveWs || liveWs.readyState !== WebSocket.OPEN) return;
-  const ESC = String.fromCharCode(27);
-  const one = ESC + (dir === 'up' ? '[<64;1;1M' : '[<65;1;1M');
-  liveWs.send(JSON.stringify({ type: 'keys', data: one.repeat(Math.max(1, Math.min(16, n))) }));
-  if (dir === 'up') { viewAppScrolled = true; _setScrolled(true); }
-}
-
-// Coalesce wheel/drag input to ONE batched send per animation frame, so a fast
-// flick can't flood the session with dozens of send-keys (which itself lags).
-let wheelAccum = 0, wheelRaf = null;
-function _flushWheel() {
-  wheelRaf = null;
-  if (!wheelAccum) return;
-  const n = wheelAccum; wheelAccum = 0;
-  wsWheel(n > 0 ? 'up' : 'down', Math.abs(n));   // +lines = scroll up (older)
-}
-function queueWheel(lines) {
-  if (!viewIsTui || !lines) return;
-  wheelAccum += lines;
-  if (!wheelRaf) wheelRaf = requestAnimationFrame(_flushWheel);
-}
-
-function buildViewTerminal(name) {
-  liveMode = 'view';
-  viewPending = null; viewScrolledUp = false; viewAppScrolled = false; viewStickBottom = true;
-  viewLastCH = 0;
-  const container = document.getElementById('terminal-body');
-  const pre = document.createElement('pre');
-  pre.className = 'live-terminal-pre';
-  pre.id = 'live-pre';
-  container.appendChild(pre);
-  livePre = pre;
-
-  // "↓ live" pill — shown when scrolled up; tap to return to the live tail.
-  const jl = document.createElement('button');
-  jl.className = 'jump-live'; jl.textContent = '↓ live';
-  jl.addEventListener('click', jumpToLive);
-  container.appendChild(jl);
-  jumpLiveBtn = jl;
-
-  // Hidden textarea captures the soft keyboard; tapping the terminal focuses it.
-  const ta = document.createElement('textarea');
-  ta.className = 'terminal-input-capture';
-  ta.setAttribute('autocomplete', 'off'); ta.setAttribute('autocapitalize', 'off');
-  ta.setAttribute('autocorrect', 'off'); ta.setAttribute('spellcheck', 'false');
-  container.appendChild(ta);
-  viewCapture = ta;
-  ta.addEventListener('input', () => { if (ta.value) { sendText(ta.value); ta.value = ''; } });
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); sendNamed('Enter'); ta.value = ''; }
-    else if (e.key === 'Backspace' && !ta.value) { e.preventDefault(); sendNamed('BSpace'); }
-  });
-
-  // A tap (not a drag) focuses the input. `click` covers mouse/desktop; the
-  // explicit tap detector in touchend covers mobile, where browsers' tap-to-click
-  // heuristics get strict over a pan-y scroller (a few px of finger noise
-  // suppresses the click). A tap = barely moved, quick, and didn't scroll.
-  pre.addEventListener('click', () => {
-    if (viewCapture) viewCapture.focus({ preventScroll: true });
-  });
-  let tapY = null, tapT = 0, tapST = 0;
-
-  // The pill tracks the LOCAL scroll position too: visible whenever the view is
-  // away from the live tail (natively panned up, or app transcript paged up).
-  pre.addEventListener('scroll', () => {
-    // A box resize (soft keyboard opening/closing) fires a scroll event with the
-    // OLD scrollTop against the NEW geometry — that's the box moving under the
-    // user, not the user scrolling. Detect it by the height change and don't let
-    // it overwrite their intent; the ResizeObserver below re-anchors.
-    if (pre.clientHeight !== viewLastCH) { viewLastCH = pre.clientHeight; return; }
-    const nearBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
-    viewStickBottom = nearBottom;
-    if (!nearBottom) _setScrolled(true);
-    else if (!viewAppScrolled) _setScrolled(false);
-  }, { passive: true });
-
-  // Soft keyboard (or rotation) resizes the terminal: if the user was following
-  // the live tail, keep them there — the input box rides up above the keyboard
-  // and drops back down when it dismisses. A deliberately scrolled-up reader is
-  // left where they are.
-  viewResizeObs = new ResizeObserver(() => {
-    viewLastCH = pre.clientHeight;
-    if (viewStickBottom) pre.scrollTop = pre.scrollHeight;
-  });
-  viewResizeObs.observe(pre);
-
-  // Scrolling a TUI is two-layered: within the frame the browser pans natively
-  // (the frame is often taller than a phone viewport — wrapped lines, 50-row
-  // panes, a fresh session's banner). Only a pull BEYOND the frame's edge pages
-  // the app's own transcript via line-granular mouse-wheel SGR. For a plain
-  // shell (viewIsTui false) everything stays native.
-  const atEdge = (up) => up
-    ? pre.scrollTop <= 2
-    : pre.scrollHeight - pre.scrollTop - pre.clientHeight <= 2;
-  const frameScrolls = () => pre.scrollHeight - pre.clientHeight > 4;
-  pre.addEventListener('wheel', (e) => {
-    if (!viewIsTui) return;
-    const up = e.deltaY < 0;
-    if (frameScrolls() && !atEdge(up)) return;   // native wheel pans the frame
-    e.preventDefault();
-    const notches = Math.max(1, Math.min(8, Math.round(Math.abs(e.deltaY) / 32)));
-    queueWheel(up ? notches : -notches);   // +up = older
-  }, { passive: false });
-  let tY = null, tAcc = 0;
-  const WHEEL_PX = 14;   // px of drag per line — fine-grained, smooth
-  pre.addEventListener('touchstart', (e) => {
-    tY = e.touches[0].clientY; tAcc = 0;
-    tapY = tY; tapT = Date.now(); tapST = pre.scrollTop;
-  }, { passive: true });
-  pre.addEventListener('touchmove', (e) => {
-    if (!viewIsTui || tY == null) return;
-    const y = e.touches[0].clientY;
-    const dy = y - tY;
-    // Within the frame the browser pans natively (touch-action: pan-y); only a
-    // pull at the edge pages the app. (Mid-gesture the browser may ignore a late
-    // preventDefault once a native pan owns the gesture — lifting the finger and
-    // dragging again at the edge always engages the app paging.)
-    if (frameScrolls() && !atEdge(dy > 0)) { tY = y; tAcc = 0; return; }
-    tAcc += dy; tY = y;
-    const lines = Math.trunc(tAcc / WHEEL_PX);
-    if (lines !== 0) {
-      queueWheel(lines);   // drag DOWN (positive) reveals EARLIER content
-      tAcc -= lines * WHEEL_PX;
-      e.preventDefault();
-    }
-  }, { passive: false });
-  pre.addEventListener('touchend', (e) => {
-    const t = e.changedTouches && e.changedTouches[0];
-    if (t && tapY != null && Math.abs(t.clientY - tapY) < 8 &&
-        Date.now() - tapT < 350 && Math.abs(pre.scrollTop - tapST) < 4 &&
-        viewCapture) viewCapture.focus({ preventScroll: true });
-    tY = null; tapY = null;
-  });
-
-  connectView(name);
-  // No auto-focus: opening a session must NOT raise the soft keyboard. The
-  // keyboard appears only when the user taps the terminal (the `pre` click
-  // handler above focuses the capture textarea on demand).
-}
-
-function connectView(name) {
-  if (liveWs) { try { liveWs.close(); } catch (e) {} }
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/ws/view/${name}`);
-  liveWs = ws;
-  ws.onopen = () => { reconnectDelay = 600; setTermState('connected'); };
-  ws.onmessage = (e) => {
-    let msg; try { msg = JSON.parse(e.data); } catch (err) { return; }
-    if (msg.type === 'content') { viewPending = msg.data || ''; _viewSchedule(); }
-    else if (msg.type === 'meta') {
-      viewIsTui = !!msg.tui;
-      // TUIs scroll via wheel events → disable native scroll (no bounce). A shell
-      // keeps native scroll. Toggled here because meta arrives after the pre exists.
-      if (livePre) livePre.classList.toggle('tui-view', viewIsTui);
-    }
-  };
-  ws.onclose = () => { setTermState('disconnected'); scheduleReconnect(); };
-  ws.onerror = () => { setTermState('error'); };
-}
-
-function closeTerminal() {
-  // If we scrolled the shared session's transcript up, return it to the live tail
-  // BEFORE disconnecting — otherwise the desktop Claude session (same tmux pane)
-  // is left scrolled up. A native-only pan never touched the pane, so it needs no
-  // reset. Send the page-downs while the socket is still open.
-  if (viewAppScrolled && liveWs && liveWs.readyState === WebSocket.OPEN) {
-    for (let i = 0; i < 16; i++) wsKey('NPage');
-  }
-  document.getElementById('terminal-overlay').classList.remove('open');
-  updateFab();
-  if (liveResizeHandler) { window.removeEventListener('resize', liveResizeHandler); liveResizeHandler = null; }
-  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-  // Null these BEFORE closing the socket so onclose's scheduleReconnect bails.
-  liveMode = null; liveName = null;
-  if (liveWs) { try { liveWs.close(); } catch (e) {} liveWs = null; }
-  if (liveTerm) { try { liveTerm.dispose(); } catch (e) {} liveTerm = null; }
-  if (viewRaf) { cancelAnimationFrame(viewRaf); viewRaf = null; }
-  if (wheelRaf) { cancelAnimationFrame(wheelRaf); wheelRaf = null; }
-  wheelAccum = 0;
-  viewPending = null; viewCapture = null; jumpLiveBtn = null; viewScrolledUp = false; viewIsTui = false;
-  viewAppScrolled = false; viewStickBottom = true;
-  if (viewResizeObs) { viewResizeObs.disconnect(); viewResizeObs = null; }
-  liveFit = null; livePre = null;
-  liveSession = null;
-  resetTerminalViewport();
-}
-
-// ── Unified input: routes to the PTY byte-stream or the capture-view send-keys
-// protocol depending on which renderer is active. ──
-function sendText(text) {
-  if (!text || !liveWs || liveWs.readyState !== WebSocket.OPEN) return;
-  if (liveMode === 'view') liveWs.send(JSON.stringify({ type: 'keys', data: text }));
-  else { liveWs.send(JSON.stringify({ type: 'input', data: text })); if (liveTerm) liveTerm.focus(); }
-  _viewSnapLive();   // typing snaps the view back to the live tail (input line)
-}
-
-// Raw named-key send (no scroll-state side effect) — used by viewScroll.
-function wsKey(key) {
-  if (!liveWs || liveWs.readyState !== WebSocket.OPEN) return;
-  if (liveMode === 'view') {
-    liveWs.send(JSON.stringify({ type: 'key', data: key }));
-  } else {
-    const seq = PTYSEQ[key];
-    if (seq != null) { liveWs.send(JSON.stringify({ type: 'input', data: seq })); if (liveTerm) liveTerm.focus(); }
-  }
-}
-
-function sendNamed(key) {   // key: Enter|Escape|Tab|Up|Down|Left|Right|C-c|...
-  wsKey(key);
-  // Any non-scroll key returns the TUI to the live tail (the input sits there).
-  if (key !== 'PPage' && key !== 'NPage') _viewSnapLive();
-}
-
-// ── Todo-list visibility (display-only). Hidden by default on mobile, where the
-// checklist eats most of the screen; the pane itself is never sent any keys. ──
-let todosHidden = localStorage.getItem('clanker_todos_hidden') === null
-  ? isMobileView() : localStorage.getItem('clanker_todos_hidden') === '1';
-function toggleTodos() {
-  todosHidden = !todosHidden;
-  localStorage.setItem('clanker_todos_hidden', todosHidden ? '1' : '0');
-  if (navigator.vibrate) navigator.vibrate(15);
-  if (viewLastFrame != null) { viewPending = viewLastFrame; _viewSchedule(); }
-}
-// esc: tap = send Escape; hold 550ms = hide/show the todo list.
-(() => {
-  const b = document.getElementById('key-esc');
-  if (!b) return;
-  let t = null, held = false;
-  b.addEventListener('pointerdown', () => {
-    held = false; clearTimeout(t);
-    t = setTimeout(() => { held = true; toggleTodos(); }, 550);
-  });
-  b.addEventListener('pointerup', () => { clearTimeout(t); if (!held) sendNamed('Escape'); held = false; });
-  b.addEventListener('pointerleave', () => clearTimeout(t));
-  b.addEventListener('pointercancel', () => clearTimeout(t));
-  b.addEventListener('contextmenu', e => e.preventDefault());
-})();
-
-// When the tab returns to the foreground: if the socket died while we were
-// backgrounded (mobile suspends the tab + drops the WS), reconnect right away so
-// the terminal is live again WITHOUT the operator having to exit and re-open it.
-// Otherwise just paint the latest buffered frame (rendering is skipped while hidden).
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) return;
-  if (liveMode && liveName && liveSocketDead()) {
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    reconnectDelay = 600;
-    reconnectLive();
-  } else if (liveMode === 'view' && viewPending != null) {
-    _viewSchedule();
-  }
-});
-// Some mobile browsers fire pageshow (bfcache restore) but not visibilitychange.
-window.addEventListener('pageshow', () => {
-  if (liveMode && liveName && liveSocketDead()) reconnectLive();
-});
-
-// ── Keep the terminal (and its input bar) above the on-screen keyboard.
-// The soft keyboard shrinks the VISUAL viewport but not the layout viewport, so
-// a position:fixed overlay would otherwise sit behind the keyboard. Pin the
-// overlay box to the visual viewport. ──
-function applyTerminalViewport() {
-  const vv = window.visualViewport;
-  const ov = document.getElementById('terminal-overlay');
-  if (!vv || !ov.classList.contains('open')) return;
-  ov.style.top = vv.offsetTop + 'px';
-  ov.style.left = vv.offsetLeft + 'px';
-  ov.style.height = vv.height + 'px';
-  ov.style.width = vv.width + 'px';
-}
-function resetTerminalViewport() {
-  const ov = document.getElementById('terminal-overlay');
-  ov.style.top = ov.style.left = ov.style.height = ov.style.width = '';
-}
-if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', applyTerminalViewport);
-  window.visualViewport.addEventListener('scroll', applyTerminalViewport);
-}
-
-document.addEventListener('keydown', (e) => {
-  if (e.key !== 'Escape') return;
-  if (document.getElementById('newsess-overlay').classList.contains('open')) { closeNewSession(); return; }
-  if (document.getElementById('sysmon-overlay').classList.contains('open')) { closeSysmon(); return; }
-  if (document.getElementById('terminal-overlay').classList.contains('open')) closeTerminal();
-});
-// ─── New Session (launch a fresh tmux instance from the WebUI) ───
-function openNewSession() {
-  document.getElementById('newsess-name').value = '';
-  document.getElementById('newsess-shell').checked = false;
-  document.getElementById('newsess-overlay').classList.add('open');
-  updateFab();
-  setTimeout(() => document.getElementById('newsess-name').focus(), 60);
-}
-function closeNewSession() { document.getElementById('newsess-overlay').classList.remove('open'); updateFab(); }
-
-// ─── Native System Monitor (floating button → overlay, real-time WS stream) ───
-let sysmonWs = null, sysmonSort = 'cpu', sysmonFilter = '', sysmonReconnect = null;
-
-// Floating sys FAB hides whenever an overlay is open (the terminal header carries
-// its own sys button, so the monitor stays reachable while viewing a terminal).
-function updateFab() {
-  const any = ['terminal-overlay', 'sysmon-overlay', 'newsess-overlay']
-    .some(id => document.getElementById(id).classList.contains('open'));
-  document.body.classList.toggle('overlay-open', any);
-}
-function openSysmon() {
-  document.getElementById('sysmon-overlay').classList.add('open');
-  updateFab();
-  connectSysmon();
-}
-function closeSysmon() {
-  document.getElementById('sysmon-overlay').classList.remove('open');
-  updateFab();
-  if (sysmonReconnect) { clearTimeout(sysmonReconnect); sysmonReconnect = null; }
-  if (sysmonWs) { try { sysmonWs.close(); } catch (e) {} sysmonWs = null; }
-}
-// Real-time: one WebSocket streaming a JSON snapshot ~every second (one persistent
-// SSH loop on the host), instead of polling. Reconnects if the socket drops.
-function connectSysmon() {
-  if (sysmonWs) { try { sysmonWs.close(); } catch (e) {} }
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/ws/sysmon`);
-  sysmonWs = ws;
-  ws.onmessage = (e) => {
-    let d; try { d = JSON.parse(e.data); } catch (err) { return; }
-    if (d.error) { renderSysmonError(d.error); return; }
-    renderSysmon(d);
-  };
-  ws.onclose = () => {
-    if (!document.getElementById('sysmon-overlay').classList.contains('open')) return;
-    if (sysmonReconnect) clearTimeout(sysmonReconnect);
-    sysmonReconnect = setTimeout(() => { if (!document.hidden) connectSysmon(); }, 1500);
-  };
-  ws.onerror = () => {};
-}
-
-// ── formatters ──
-function smBytes(n) {
-  if (n == null) return '—';
-  const u = ['B','K','M','G','T','P']; let i = 0; n = Math.abs(n);
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return (n >= 100 || i === 0 ? Math.round(n) : n.toFixed(1)) + u[i];
-}
-function smRate(n) { return smBytes(n) + '/s'; }
-function smCls(pct) { return pct >= 85 ? 'crit' : pct >= 60 ? 'warn' : ''; }
-function smDur(s) {
-  s = Math.floor(s || 0); const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60);
-  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
-}
-function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
-
-function bar(label, pct, valText, extraCls) {
-  const c = smCls(pct);
-  return `<div class="sm-bar-row"><span class="sm-lbl">${esc(label)}</span>`
-    + `<span class="sm-bar ${c} ${extraCls||''}"><span style="width:${Math.max(0,Math.min(100,pct)).toFixed(1)}%"></span></span>`
-    + `<span class="sm-val">${valText}</span></div>`;
-}
-
-let _sysmonLast = null;
-function renderSysmon(d) {
-  _sysmonLast = d;
-  document.getElementById('sm-host').textContent = (d.host || '') + (d.model ? ' · ' + d.model : '');
-  document.getElementById('sm-age').textContent = '● live';
-  // Don't rebuild the body while the user is typing in the process filter — a full
-  // innerHTML swap would steal focus. The snapshot is stored; the next poll after
-  // they blur repaints. (The header age above still updates.)
-  const af = document.activeElement;
-  if (af && af.id === 'sm-filter') return;
-
-  const memPct = d.mem.total ? 100 * d.mem.used / d.mem.total : 0;
-  const swapPct = d.swap.total ? 100 * d.swap.used / d.swap.total : 0;
-  const loadPctOfCores = d.ncpu ? 100 * d.load[0] / d.ncpu : 0;
-
-  // ── CPU card ──
-  let cpu = `<div class="sm-card"><h4>CPU <span class="sm-sub">${d.ncpu} threads</span></h4>`;
-  cpu += `<div class="sm-chips">`
-    + `<span class="sm-chip"><b>${d.cpu}%</b> total</span>`
-    + (d.temp != null ? `<span class="sm-chip" style="${d.temp>=85?'border-color:var(--accent-red)':''}"><b>${d.temp}°C</b></span>` : '')
-    + (d.freq != null ? `<span class="sm-chip"><b>${(d.freq/1000).toFixed(2)}</b>GHz</span>` : '')
-    + `<span class="sm-chip">load <b>${d.load[0].toFixed(2)}</b> ${d.load[1].toFixed(2)} ${d.load[2].toFixed(2)}</span>`
-    + `<span class="sm-chip">tasks <b>${esc(d.tasks)}</b></span>`
-    + `<span class="sm-chip">up <b>${smDur(d.uptime)}</b></span>`
-    + `</div>`;
-  cpu += bar('all', d.cpu, d.cpu + '%');
-  cpu += `<div class="sm-cores">` + d.cores.map((c, i) =>
-    `<div class="sm-core">${i}<div class="sm-cbar ${smCls(c)}"><span style="width:${c}%"></span></div></div>`).join('') + `</div>`;
-  cpu += `</div>`;
-
-  // ── Memory card ──
-  let mem = `<div class="sm-card"><h4>Memory</h4>`;
-  mem += bar('RAM', memPct, `${smBytes(d.mem.used)} / ${smBytes(d.mem.total)}`);
-  mem += `<div class="sm-chips" style="margin-top:6px">`
-    + `<span class="sm-chip">avail <b>${smBytes(d.mem.avail)}</b></span>`
-    + `<span class="sm-chip">cached <b>${smBytes(d.mem.cached)}</b></span>`
-    + `<span class="sm-chip">buffers <b>${smBytes(d.mem.buffers)}</b></span></div>`;
-  mem += d.swap.total ? bar('swap', swapPct, `${smBytes(d.swap.used)} / ${smBytes(d.swap.total)}`)
-                      : `<div class="sm-bar-row"><span class="sm-lbl">swap</span><span class="sm-val">none</span></div>`;
-  mem += `</div>`;
-
-  // ── Network card ──
-  let net = `<div class="sm-card"><h4>Network</h4>`;
-  net += (d.net.length ? d.net.map(n =>
-    `<div class="sm-bar-row"><span class="sm-lbl" style="min-width:74px">${esc(n.iface)}</span>`
-    + `<span class="sm-val" style="margin-left:0">↓ ${smRate(n.rx)}</span>`
-    + `<span class="sm-val">↑ ${smRate(n.tx)}</span></div>`).join('')
-    : `<div class="no-data">no active interfaces</div>`);
-  net += `</div>`;
-
-  // ── Disk card (I/O + filesystems) ──
-  let disk = `<div class="sm-card"><h4>Disk</h4>`;
-  if (d.disk_io.length) {
-    disk += `<div style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);margin-bottom:4px">I/O</div>`;
-    disk += d.disk_io.map(x =>
-      `<div class="sm-bar-row"><span class="sm-lbl" style="min-width:64px">${esc(x.dev)}</span>`
-      + `<span class="sm-val" style="margin-left:0">r ${smRate(x.read)}</span>`
-      + `<span class="sm-val">w ${smRate(x.write)}</span></div>`).join('');
-  }
-  if (d.fs.length) {
-    disk += `<div style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono);margin:8px 0 4px">Filesystems</div>`;
-    disk += d.fs.map(f => bar(f.mount.length > 18 ? '…' + f.mount.slice(-17) : f.mount, f.pct,
-      `${smBytes(f.used)}/${smBytes(f.total)} (${f.pct}%)`)).join('');
-  }
-  disk += `</div>`;
-
-  // ── Processes card ──
-  let proc = `<div class="sm-card wide"><h4>Processes <span class="sm-sub">${d.top.length} shown</span></h4>`;
-  proc += `<div class="sm-proc-ctl">`
-    + `<input id="sm-filter" placeholder="filter…" value="${esc(sysmonFilter)}" oninput="sysmonOnFilter(this.value)" autocomplete="off" autocapitalize="off" spellcheck="false">`
-    + `<button class="sm-sort-btn ${sysmonSort==='cpu'?'active':''}" onclick="sysmonSetSort('cpu')">CPU</button>`
-    + `<button class="sm-sort-btn ${sysmonSort==='mem'?'active':''}" onclick="sysmonSetSort('mem')">MEM</button></div>`;
-  proc += renderProcTable(d.top);
-  proc += `</div>`;
-
-  document.getElementById('sysmon-body').innerHTML = cpu + mem + net + disk + proc;
-}
-
-function renderProcTable(rows) {
-  let list = rows.slice();
-  const f = sysmonFilter.trim().toLowerCase();
-  if (f) list = list.filter(p => (p.cmd || '').toLowerCase().includes(f) || String(p.pid).includes(f) || (p.user||'').toLowerCase().includes(f));
-  list.sort((a, b) => (sysmonSort === 'mem' ? b.mem - a.mem : b.cpu - a.cpu));
-  let t = `<table class="sm-proc"><thead><tr><th>PID</th><th>USER</th><th class="num">CPU%</th><th class="num">MEM%</th><th class="num">RSS</th><th>COMMAND</th></tr></thead><tbody>`;
-  t += list.map(p =>
-    `<tr><td>${p.pid}</td><td>${esc(p.user)}</td>`
-    + `<td class="num ${p.cpu>=50?'hot':''}">${p.cpu.toFixed(1)}</td>`
-    + `<td class="num ${p.mem>=20?'hot':''}">${p.mem.toFixed(1)}</td>`
-    + `<td class="num">${smBytes(p.rss)}</td><td class="cmd">${esc(p.cmd)}</td></tr>`).join('');
-  t += `</tbody></table>`;
-  return t;
-}
-
-// Sort/filter re-render the process table from the last snapshot (no refetch).
-function sysmonSetSort(s) {
-  sysmonSort = s;
-  document.querySelectorAll('.sm-sort-btn').forEach(b => b.classList.toggle('active', b.textContent.toLowerCase() === s));
-  if (_sysmonLast) document.querySelector('.sm-proc').outerHTML = renderProcTable(_sysmonLast.top);
-}
-function sysmonOnFilter(v) {
-  sysmonFilter = v;
-  if (_sysmonLast) document.querySelector('.sm-proc').outerHTML = renderProcTable(_sysmonLast.top);
-}
-function renderSysmonError(msg) {
-  document.getElementById('sysmon-body').innerHTML = `<div class="sm-card wide"><div class="sm-err">monitor unavailable: ${esc(msg)}</div></div>`;
-}
-
-async function createNewSession() {
-  const go = document.getElementById('newsess-go');
-  const name = document.getElementById('newsess-name').value.trim();
-  const shell = document.getElementById('newsess-shell').checked;
-  go.disabled = true; go.textContent = 'Creating…';
-  try {
-    const r = await fetch('/api/session/new', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, shell }),
-    });
-    const d = await r.json();
-    if (!r.ok || d.error) { alert('Could not create session: ' + (d.error || r.status)); return; }
-    closeNewSession();
-    fetchStatus();
-    // A bare shell isn't in the claude-filtered list; open it directly either way.
-    openTerminal(d.session);
-  } catch (e) { alert('create error'); }
-  finally { go.disabled = false; go.textContent = 'Create & Open'; }
-}
-
-function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
-// ─── Tiled View ───
-let tiledActive = false;
-let tiledTerminals = {};
-let tiledInterval = null;
-let prevTiledStates = {};
-let tiledSelectedSessions = new Set();
-let tiledLayout = 'grid';
-let allSessions = []; // cached for session switcher
-
-const XTERM_THEME = {
-  background: '#0C0A09', foreground: '#FAFAF9', cursor: '#C2410C',
-  black: '#1C1917', red: '#DC2626', green: '#65A30D', yellow: '#D97706',
-  blue: '#2563EB', magenta: '#9333EA', cyan: '#0891B2', white: '#A8A29E',
-  brightBlack: '#57534E', brightRed: '#EF4444', brightGreen: '#84CC16',
-  brightYellow: '#F59E0B', brightBlue: '#3B82F6', brightMagenta: '#A855F7',
-  brightCyan: '#06B6D4', brightWhite: '#FAFAF9',
-};
-
-// ─── ANSI Color Map ───
-const ANSI_COLORS = {
-  '30': '#1C1917', '31': '#DC2626', '32': '#65A30D', '33': '#D97706',
-  '34': '#2563EB', '35': '#9333EA', '36': '#0891B2', '37': '#A8A29E',
-  '90': '#57534E', '91': '#EF4444', '92': '#84CC16', '93': '#F59E0B',
-  '94': '#3B82F6', '95': '#A855F7', '96': '#06B6D4', '97': '#FAFAF9',
-};
-const ANSI_BG_COLORS = {
-  '40': '#1C1917', '41': '#DC2626', '42': '#65A30D', '43': '#D97706',
-  '44': '#2563EB', '45': '#9333EA', '46': '#0891B2', '47': '#A8A29E',
-  '100': '#57534E', '101': '#EF4444', '102': '#84CC16', '103': '#F59E0B',
-  '104': '#3B82F6', '105': '#A855F7', '106': '#06B6D4', '107': '#FAFAF9',
-};
-
-// 256-color lookup (16-231: 6x6x6 cube, 232-255: grayscale)
-function color256(n) {
-  if (n < 16) {
-    const basic = ['#1C1917','#DC2626','#65A30D','#D97706','#2563EB','#9333EA','#0891B2','#A8A29E',
-                   '#57534E','#EF4444','#84CC16','#F59E0B','#3B82F6','#A855F7','#06B6D4','#FAFAF9'];
-    return basic[n];
-  }
-  if (n < 232) {
-    const i = n - 16;
-    const r = Math.floor(i / 36) * 51;
-    const g = Math.floor((i % 36) / 6) * 51;
-    const b = (i % 6) * 51;
-    return `rgb(${r},${g},${b})`;
-  }
-  const v = (n - 232) * 10 + 8;
-  return `rgb(${v},${v},${v})`;
-}
-
-function parseAnsiToSegments(text) {
-  const segments = [];
-  let fg = null, bg = null, bold = false, italic = false, underline = false, dim = false;
-  // Split on ESC[ (real escape char is \\x1b = \\u001b)
-  const parts = text.split('\\u001b[');
-
-  // First part has no escape prefix
-  if (parts[0]) segments.push({ text: parts[0], fg: null, bg: null, bold: false, italic: false, underline: false, dim: false });
-
-  for (let i = 1; i < parts.length; i++) {
-    // Find the CSI terminator (any letter). Only process SGR codes (ending in 'm').
-    const termMatch = parts[i].match(/^([0-9;]*)([A-Za-z])/);
-    if (!termMatch) { segments.push({ text: parts[i], fg, bg, bold, italic, underline, dim }); continue; }
-    if (termMatch[2] !== 'm') {
-      // Non-SGR sequence (cursor move, erase, etc.) — skip the code, keep any trailing text
-      const rest = parts[i].substring(termMatch[0].length);
-      if (rest) segments.push({ text: rest, fg, bg, bold, italic, underline, dim });
-      continue;
-    }
-    const mIdx = termMatch[0].length - 1;
-    // mIdx now points to 'm'
-
-    const codes = parts[i].substring(0, mIdx).split(';');
-    const rest = parts[i].substring(mIdx + 1);
-
-    for (let j = 0; j < codes.length; j++) {
-      const c = codes[j];
-      if (c === '0' || c === '') { fg = null; bg = null; bold = false; italic = false; underline = false; dim = false; }
-      else if (c === '1') bold = true;
-      else if (c === '2') dim = true;
-      else if (c === '3') italic = true;
-      else if (c === '4') underline = true;
-      else if (c === '22') { bold = false; dim = false; }
-      else if (c === '23') italic = false;
-      else if (c === '24') underline = false;
-      else if (c === '39') fg = null;
-      else if (c === '49') bg = null;
-      else if (ANSI_COLORS[c]) fg = ANSI_COLORS[c];
-      else if (ANSI_BG_COLORS[c]) bg = ANSI_BG_COLORS[c];
-      else if (c === '38' && codes[j+1] === '5') { fg = color256(parseInt(codes[j+2])); j += 2; }
-      else if (c === '48' && codes[j+1] === '5') { bg = color256(parseInt(codes[j+2])); j += 2; }
-      else if (c === '38' && codes[j+1] === '2') { fg = `rgb(${codes[j+2]},${codes[j+3]},${codes[j+4]})`; j += 4; }
-      else if (c === '48' && codes[j+1] === '2') { bg = `rgb(${codes[j+2]},${codes[j+3]},${codes[j+4]})`; j += 4; }
-    }
-
-    if (rest) segments.push({ text: rest, fg, bg, bold, italic, underline, dim });
-  }
-  return segments;
-}
-
-function renderAnsiToHTML(ansiText) {
-  const segments = parseAnsiToSegments(ansiText);
-  let html = '';
-  for (const seg of segments) {
-    if (!seg.text) continue;
-    let style = '';
-    if (seg.fg) style += `color:${seg.fg};`;
-    if (seg.bg) style += `background:${seg.bg};`;
-    if (seg.bold) style += 'font-weight:700;';
-    if (seg.dim) style += 'opacity:0.6;';
-    if (seg.italic) style += 'font-style:italic;';
-    if (seg.underline) style += 'text-decoration:underline;';
-    const escaped = seg.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    html += style ? `<span style="${style}">${escaped}</span>` : escaped;
-  }
-  return html;
-}
-
-// Characters that make up horizontal rules / box borders. A line that is almost
-// entirely these is decoration — clip it to one row rather than wrap it into
-// several identical-looking rows (the mobile clutter the operator flagged).
-const RULE_CHARS = new Set([
-  '─','━','│','┃','┄','┅','┆','┇',
-  '┈','┉','┊','┋','═','║','╌','╍',
-  '╭','╮','╯','╰','╱','╴','╶','╸','╺',
-  '├','┤','┬','┴','┼','▀','▁','▔','▔',
-  '-','—','–','_','=','·','⎯','•',
-]);
-function isRuleLine(visible) {
-  const t = (visible || '').trim();
-  if (t.length < 10) return false;
-  let rule = 0, other = 0;
-  for (const ch of t) {
-    if (ch === ' ') continue;
-    if (RULE_CHARS.has(ch)) rule++; else other++;
-  }
-  return rule >= 8 && other <= Math.max(2, rule * 0.12);
-}
-
-// Per-line renderer: splits the styled segments into lines, decides wrap vs
-// clip per line, and emits one <div> each. Reuses parseAnsiToSegments so the
-// (correct) ANSI decoding isn't duplicated.
-// A TUI todo-checklist row (the task list Claude renders above its input box).
-const TODO_ROW_RE = /^\\s*(?:⎿\\s*)?[☐☒☑◻◼✓✔]/;
-// The panel's trailer row, e.g. "… +6 completed".
-const TODO_TRAILER_RE = /^\\s*(?:…|\\.{3})?\\s*\\+\\d+\\s+completed\\b/;
-function renderAnsiToLines(ansiText) {
-  const segments = parseAnsiToSegments(ansiText);
-  const lines = [[]];
-  for (const seg of segments) {
-    const parts = (seg.text || '').split('\\n');
-    for (let k = 0; k < parts.length; k++) {
-      if (k > 0) lines.push([]);
-      if (parts[k]) lines[lines.length - 1].push({ ...seg, text: parts[k] });
-    }
-  }
-  // Materialize rows first so the TUI's bottom chrome (input-box rules, status
-  // zone, todo list) can be located before any HTML is emitted.
-  const rows = lines.map(line => {
-    let visible = '', inner = '';
-    for (const seg of line) {
-      visible += seg.text;
-      let style = '';
-      if (seg.fg) style += `color:${seg.fg};`;
-      if (seg.bg) style += `background:${seg.bg};`;
-      if (seg.bold) style += 'font-weight:700;';
-      if (seg.dim) style += 'opacity:0.6;';
-      if (seg.italic) style += 'font-style:italic;';
-      if (seg.underline) style += 'text-decoration:underline;';
-      const esc = seg.text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      inner += style ? `<span style="${style}">${esc}</span>` : esc;
-    }
-    return { visible, inner, cls: isRuleLine(visible) ? 'tline rule' : 'tline' };
-  });
-
-  // Locate the input box: the last two rule lines near the bottom of the frame.
-  let ruleBot = -1, ruleTop = -1;
-  for (let i = rows.length - 1; i >= 0; i--) {
-    if (rows[i].cls.indexOf('rule') < 0) continue;
-    if (ruleBot < 0) { ruleBot = i; } else { ruleTop = i; break; }
-  }
-  const tuiBottom = ruleBot >= 0 && ruleTop >= 0 && (ruleBot - ruleTop) <= 8 &&
-                    (rows.length - 1 - ruleBot) <= 16;
-
-  const skip = new Set();
-  let todoSummaryAt = -1, todoCount = 0;
-  if (tuiBottom) {
-    // 1. STATUS ZONE below the input box (statusline + mode hints): on a phone
-    //    these wrap to 5-6 lines. Render the first 3 as single ellipsis-clamped
-    //    lines and drop the rest. >5 non-blank rows means a menu/dialog is open
-    //    down there — leave that alone.
-    const foot = [];
-    for (let i = ruleBot + 1; i < rows.length; i++) if (rows[i].visible.trim()) foot.push(i);
-    if (foot.length > 0 && foot.length <= 5) {
-      for (let i = ruleBot + 1; i < rows.length; i++) {
-        if (!rows[i].visible.trim()) { skip.add(i); continue; }
-        if (foot.indexOf(i) < 3) rows[i].cls += ' tfoot'; else skip.add(i);
-      }
-    }
-    // 2. TODO LIST: consecutive checkbox rows sitting right above the input box.
-    //    Display-side collapse only — the session itself is never touched.
-    if (todosHidden) {
-      let i = ruleTop - 1;
-      while (i >= 0 && !rows[i].visible.trim()) i--;
-      const end = i;
-      // Optional trailer ("… +6 completed"), then the checkbox rows above it.
-      let t = 0;
-      while (i >= 0 && t < 2 && TODO_TRAILER_RE.test(rows[i].visible)) { i--; t++; }
-      while (i >= 0 && TODO_ROW_RE.test(rows[i].visible)) { todoCount++; i--; }
-      if (todoCount > 0) {
-        for (let k = i + 1; k <= end; k++) skip.add(k);
-        todoSummaryAt = end;
-      }
-    }
-  }
-
-  let html = '';
-  for (let i = 0; i < rows.length; i++) {
-    if (skip.has(i)) {
-      if (i === todoSummaryAt)
-        html += `<div class="tline todo-sum">☐ ${todoCount} todo${todoCount > 1 ? 's' : ''} hidden · hold esc</div>`;
-      continue;
-    }
-    html += `<div class="${rows[i].cls}">${rows[i].inner || '&nbsp;'}</div>`;
-  }
-  return html;
-}
-
-function openTiledView() {
-  document.getElementById('tile-picker').classList.add('open');
-  fetch('/api/status').then(r => r.json()).then(data => {
-    allSessions = data.sessions.filter(s => s.command === 'claude').sort(favStateSort);
-    const saved = JSON.parse(localStorage.getItem('clanker_tiled_sessions') || '[]');
-    const list = document.getElementById('picker-list');
-    list.innerHTML = allSessions.map(s => {
-      const checked = saved.length === 0 || saved.includes(s.session) ? 'checked' : '';
-      return `<label class="picker-item"><input type="checkbox" value="${s.session}" ${checked}>
-        ${favStar(s.session)}
-        <span class="picker-name">${s.session}</span>
-        <span class="picker-badge ${s.state}">${s.state}</span></label>`;
-    }).join('');
-  });
-}
-
-function launchTiledView() {
-  const selected = Array.from(document.querySelectorAll('#picker-list input:checked')).map(c => c.value);
-  localStorage.setItem('clanker_tiled_sessions', JSON.stringify(selected));
-  document.getElementById('tile-picker').classList.remove('open');
-  tiledActive = true;
-  tiledSelectedSessions = new Set(selected);
-  document.getElementById('tiled-overlay').classList.add('open');
-  document.getElementById('tiled-grid').innerHTML = '';
-  tiledLayout = localStorage.getItem('clanker_tile_layout_mode') || 'grid';
-  updateLayoutButtons();
-  fetchTiledPanes();
-  tiledInterval = setInterval(() => { if (!document.hidden) fetchTiledPanes(); }, 2000);
-}
-
-function closeTiledView() {
-  tiledActive = false;
-  document.getElementById('tiled-overlay').classList.remove('open');
-  if (tiledInterval) { clearInterval(tiledInterval); tiledInterval = null; }
-  Object.keys(tiledTerminals).forEach(s => disconnectTile(s));
-  tiledTerminals = {};
-  prevTiledStates = {};
-}
-
-async function fetchTiledPanes() {
-  try {
-    const [panesR, statusR] = await Promise.all([fetch('/api/panes'), fetch('/api/status')]);
-    if (!panesR.ok) return;
-    const panes = await panesR.json();
-    const status = await statusR.json();
-    allSessions = status.sessions.filter(s => s.command === 'claude');
-    renderTiles(panes);
-  } catch(e) {}
-}
-
-function renderTiles(panes) {
-  const grid = document.getElementById('tiled-grid');
-  const filtered = panes.filter(p => tiledSelectedSessions.has(p.session));
-
-  filtered.forEach(p => {
-    let tile = document.getElementById('tile-' + p.session);
-    if (!tile) {
-      tile = document.createElement('div');
-      tile.id = 'tile-' + p.session;
-      tile.className = 'tile';
-      tile.dataset.session = p.session;
-      tile.innerHTML = buildTileHTML(p);
-      grid.appendChild(tile);
-    }
-    // Update badge
-    const badge = tile.querySelector('.tile-badge');
-    if (badge) { badge.className = 'tile-badge ' + p.state; badge.textContent = p.state; }
-    // Flash on waiting transition
-    const prev = prevTiledStates[p.session];
-    if (p.state === 'waiting' && prev === 'working') {
-      tile.classList.add('flash');
-      playChime();
-      if ('Notification' in window && Notification.permission === 'granted')
-        new Notification(p.session + ' needs input', { tag: 'tile-' + p.session, renotify: true });
-    } else if (p.state !== 'waiting') { tile.classList.remove('flash'); }
-    prevTiledStates[p.session] = p.state;
-    // Update monitor
-    if (!tiledTerminals[p.session]) {
-      const pre = tile.querySelector('.tile-monitor');
-      if (pre) pre.textContent = p.content;
-    }
-    const btn = tile.querySelector('.tile-connect');
-    if (btn) btn.textContent = tiledTerminals[p.session] ? 'disconnect' : 'connect';
-    // Update select value
-    const sel = tile.querySelector('.tile-select');
-    if (sel && sel.value !== p.session) sel.value = p.session;
-  });
-
-  // Apply layout after first render
-  if (grid.children.length > 0) applyLayout(tiledLayout);
-  // Keep connected terminals fitted as the grid updates (fit() is a no-op if unchanged).
-  Object.values(tiledTerminals).forEach(t => { try { if (t.fitAddon) t.fitAddon.fit(); } catch (e) {} });
-}
-
-function buildTileHTML(p) {
-  const opts = allSessions.map(s =>
-    `<option value="${s.session}" ${s.session === p.session ? 'selected' : ''}>${s.session} [${s.state}]</option>`
-  ).join('');
-  return `<div class="tile-header">
-      <select class="tile-select" onchange="switchTileSession('${p.session}', this.value, this)" onmousedown="event.stopPropagation()">${opts}</select>
-      <span class="tile-badge ${p.state}">${p.state}</span>
-      <button class="tile-connect" onclick="toggleTileTerminal('${p.session}')">connect</button>
-    </div>
-    <div class="tile-body" id="tile-body-${p.session}">
-      <pre class="tile-monitor">${escapeHtml(p.content)}</pre>
-    </div>`;
-}
-
-// ─── Layouts (tiling WM style) ───
-function setLayout(mode) {
-  tiledLayout = mode;
-  localStorage.setItem('clanker_tile_layout_mode', mode);
-  updateLayoutButtons();
-  applyLayout(mode);
-  // Refit terminals
-  setTimeout(() => Object.values(tiledTerminals).forEach(t => { if (t.fitAddon) t.fitAddon.fit(); }), 100);
-}
-
-function updateLayoutButtons() {
-  document.querySelectorAll('.layout-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.layout === tiledLayout);
-  });
-}
-
-function applyLayout(mode) {
-  const grid = document.getElementById('tiled-grid');
-  const tiles = Array.from(grid.querySelectorAll('.tile'));
-  if (!tiles.length) return;
-  const n = tiles.length;
-  const cw = grid.clientWidth;
-  const ch = grid.clientHeight;
-  const gap = 2;
-
-  // Reset all tile styles
-  tiles.forEach(t => { t.style.cssText = ''; });
-
-  switch(mode) {
-    case 'grid': {
-      const cols = Math.ceil(Math.sqrt(n * (cw / ch)));
-      const rows = Math.ceil(n / cols);
-      grid.style.display = 'grid';
-      grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-      grid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
-      grid.style.gap = gap + 'px';
-      tiles.forEach(t => { t.style.minHeight = '0'; t.style.minWidth = '0'; });
-      break;
-    }
-    case 'master': {
-      grid.style.display = 'grid';
-      grid.style.gap = gap + 'px';
-      if (n === 1) {
-        grid.style.gridTemplateColumns = '1fr';
-        grid.style.gridTemplateRows = '1fr';
-      } else {
-        grid.style.gridTemplateColumns = '3fr 2fr';
-        grid.style.gridTemplateRows = `repeat(${n - 1}, 1fr)`;
-        tiles[0].style.gridRow = `1 / ${n}`;
-      }
-      tiles.forEach(t => { t.style.minHeight = '0'; t.style.minWidth = '0'; });
-      break;
-    }
-    case 'columns': {
-      grid.style.display = 'grid';
-      grid.style.gridTemplateColumns = `repeat(${n}, 1fr)`;
-      grid.style.gridTemplateRows = '1fr';
-      grid.style.gap = gap + 'px';
-      tiles.forEach(t => { t.style.minHeight = '0'; t.style.minWidth = '0'; });
-      break;
-    }
-    case 'rows': {
-      grid.style.display = 'grid';
-      grid.style.gridTemplateColumns = '1fr';
-      grid.style.gridTemplateRows = `repeat(${n}, 1fr)`;
-      grid.style.gap = gap + 'px';
-      tiles.forEach(t => { t.style.minHeight = '0'; t.style.minWidth = '0'; });
-      break;
-    }
-    case 'focus': {
-      grid.style.display = 'grid';
-      grid.style.gap = gap + 'px';
-      if (n === 1) {
-        grid.style.gridTemplateColumns = '1fr';
-        grid.style.gridTemplateRows = '1fr';
-      } else {
-        grid.style.gridTemplateColumns = '1fr';
-        grid.style.gridTemplateRows = `1fr 120px`;
-        tiles[0].style.gridColumn = '1';
-        tiles[0].style.gridRow = '1';
-        // Remaining tiles in a horizontal strip at the bottom
-        const sub = document.createElement('div');
-        sub.className = 'focus-strip';
-        sub.style.cssText = `display:flex;gap:${gap}px;grid-column:1;grid-row:2;overflow-x:auto;`;
-        tiles.slice(1).forEach(t => {
-          t.style.minWidth = '250px';
-          t.style.minHeight = '0';
-          t.style.flex = '1';
-          sub.appendChild(t);
-        });
-        grid.appendChild(sub);
-      }
-      break;
-    }
-  }
-}
-
-function resetTileLayout() {
-  localStorage.removeItem('clanker_tile_layout_mode');
-  tiledLayout = 'grid';
-  updateLayoutButtons();
-  applyLayout('grid');
-  setTimeout(() => Object.values(tiledTerminals).forEach(t => { if (t.fitAddon) t.fitAddon.fit(); }), 100);
-}
-
-// ─── Session Switcher (select dropdown) ───
-function switchTileSession(oldSession, newSession, selectEl) {
-  if (oldSession === newSession) return;
-  disconnectTile(oldSession);
-  const tile = document.getElementById('tile-' + oldSession);
-  if (!tile) return;
-
-  tile.id = 'tile-' + newSession;
-  tile.dataset.session = newSession;
-  const body = tile.querySelector('.tile-body');
-  if (body) { body.id = 'tile-body-' + newSession; body.innerHTML = '<pre class="tile-monitor">Loading...</pre>'; }
-  // Update connect button onclick
-  const btn = tile.querySelector('.tile-connect');
-  if (btn) btn.setAttribute('onclick', "toggleTileTerminal('" + newSession + "')");
-  // Update select onchange
-  if (selectEl) selectEl.setAttribute('onchange', "switchTileSession('" + newSession + "', this.value, this)");
-  tiledSelectedSessions.delete(oldSession);
-  tiledSelectedSessions.add(newSession);
-}
-
-// ─── Terminal Connect/Disconnect ───
-function toggleTileTerminal(session) {
-  tiledTerminals[session] ? disconnectTile(session) : connectTile(session);
-}
-
-function sendKey(ws, key) { ws.send(JSON.stringify({ type: 'key', data: key })); }
-function sendKeys(ws, text) { ws.send(JSON.stringify({ type: 'keys', data: text })); }
-
-function setupKeyboardInput(el, ws, session) {
-  // Hidden textarea for mobile keyboard capture
-  const ta = document.createElement('textarea');
-  ta.className = 'terminal-input-capture';
-  ta.setAttribute('autocomplete', 'off');
-  ta.setAttribute('autocapitalize', 'off');
-  ta.setAttribute('autocorrect', 'off');
-  ta.setAttribute('spellcheck', 'false');
-  el.parentNode.appendChild(ta);
-
-  // Desktop: keydown on the pre element
-  const keyHandler = (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    e.preventDefault();
-    if (e.key === 'Enter') sendKey(ws, 'Enter');
-    else if (e.key === 'Backspace') sendKey(ws, 'BSpace');
-    else if (e.key === 'Tab') sendKey(ws, 'Tab');
-    else if (e.key === 'Escape') {
-      if (e.shiftKey && session) { closeTiledView(); return; }
-      sendKey(ws, 'Escape');
-    }
-    else if (e.key === 'ArrowUp') sendKey(ws, 'Up');
-    else if (e.key === 'ArrowDown') sendKey(ws, 'Down');
-    else if (e.key === 'ArrowLeft') sendKey(ws, 'Left');
-    else if (e.key === 'ArrowRight') sendKey(ws, 'Right');
-    else if (e.key === 'Home') sendKey(ws, 'Home');
-    else if (e.key === 'End') sendKey(ws, 'End');
-    else if (e.key === 'PageUp') sendKey(ws, 'PPage');
-    else if (e.key === 'PageDown') sendKey(ws, 'NPage');
-    else if (e.ctrlKey && e.key === 'c') sendKey(ws, 'C-c');
-    else if (e.ctrlKey && e.key === 'd') sendKey(ws, 'C-d');
-    else if (e.ctrlKey && e.key === 'z') sendKey(ws, 'C-z');
-    else if (e.ctrlKey && e.key === 'l') sendKey(ws, 'C-l');
-    else if (e.ctrlKey && e.key === 'a') sendKey(ws, 'C-a');
-    else if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      sendKeys(ws, e.key);
-    }
-  };
-  el.addEventListener('keydown', keyHandler);
-
-  // Mobile: textarea input event (captures on-screen keyboard)
-  ta.addEventListener('input', () => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const text = ta.value;
-    if (text) { sendKeys(ws, text); ta.value = ''; }
-  });
-  ta.addEventListener('keydown', (e) => {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    if (e.key === 'Enter') { e.preventDefault(); sendKey(ws, 'Enter'); ta.value = ''; }
-    else if (e.key === 'Backspace' && !ta.value) { e.preventDefault(); sendKey(ws, 'BSpace'); }
-  });
-
-  // Tap on terminal → focus hidden textarea (shows mobile keyboard)
-  el.addEventListener('click', () => {
-    if ('ontouchstart' in window) ta.focus();
-    else el.focus();
-  });
-
-  return { keyHandler, textarea: ta };
-}
-
-function connectTile(session) {
-  const body = document.getElementById('tile-body-' + session);
-  if (!body) return;
-  body.innerHTML = '';
-
-  // Real xterm.js terminal per tile, over the PTY bridge (same as the full-screen one).
-  const term = new Terminal({
-    theme: XTERM_THEME, fontFamily: 'JetBrains Mono, ui-monospace, monospace',
-    fontSize: 11, cursorBlink: true, scrollback: 2000, allowProposedApi: true,
-  });
-  const fitAddon = new FitAddon.FitAddon();
-  term.loadAddon(fitAddon);
-  term.open(body);
-  try { fitAddon.fit(); } catch (e) {}
-
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${proto}//${location.host}/ws/terminal/${session}`);
-  ws.binaryType = 'arraybuffer';
-
-  function sendResize() {
-    if (ws.readyState === WebSocket.OPEN)
-      ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-  }
-
-  ws.onopen = () => {
-    const btn = document.querySelector('#tile-' + session + ' .tile-connect');
-    if (btn) btn.textContent = 'disconnect';
-    try { fitAddon.fit(); } catch (e) {}
-    sendResize();
-  };
-  ws.onmessage = (e) => { term.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data)); };
-  ws.onclose = () => {
-    const btn = document.querySelector('#tile-' + session + ' .tile-connect');
-    if (btn) btn.textContent = 'connect';
-  };
-  term.onData(d => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'input', data: d })); });
-  term.onResize(() => sendResize());
-
-  tiledTerminals[session] = { ws, term, fitAddon };
-}
-
-function disconnectTile(session) {
-  const t = tiledTerminals[session];
-  if (!t) return;
-  if (t.ws && t.ws.readyState <= 1) { try { t.ws.close(); } catch (e) {} }
-  if (t.term) { try { t.term.dispose(); } catch (e) {} }
-  delete tiledTerminals[session];
-  const body = document.getElementById('tile-body-' + session);
-  if (body) body.innerHTML = '<pre class="tile-monitor">Disconnected</pre>';
-  const btn = document.querySelector('#tile-' + session + ' .tile-connect');
-  if (btn) btn.textContent = 'connect';
-}
-
-async function connectAllTiles() {
-  for (const tile of document.querySelectorAll('.tile')) {
-    const session = tile.dataset.session;
-    if (session && !tiledTerminals[session]) {
-      connectTile(session);
-      await new Promise(r => setTimeout(r, 600));
-    }
-  }
-}
-
-function disconnectAllTiles() {
-  Object.keys(tiledTerminals).forEach(s => disconnectTile(s));
-}
-
-function playChime() {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain); gain.connect(ctx.destination);
-    osc.frequency.setValueAtTime(880, ctx.currentTime);
-    osc.frequency.setValueAtTime(1100, ctx.currentTime + 0.1);
-    gain.gain.setValueAtTime(0.3, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
-    osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.3);
-  } catch(e) {}
-}
-
-// Inject button
-(function() {
-  const h2 = document.querySelector('[data-label="LIVE"] h2');
-  const btn = 'float:right;font-family:var(--font-mono);font-size:10px;padding:4px 12px;background:var(--bg-surface);color:var(--text-secondary);border:1px solid var(--border);cursor:pointer;text-transform:uppercase;letter-spacing:0.1em';
-  const btnNew = btn + ';background:var(--accent-terracotta);color:var(--accent-cream);border-color:var(--accent-terracotta)';
-  if (h2) h2.innerHTML += ` <button onclick="openNewSession()" style="${btnNew}">+ New Session</button> <button onclick="openTiledView()" style="${btn}">Tiled View</button> <button onclick="openOrch()" style="${btn}">Orchestration</button>`;
-})();
-</script>
-
 <!-- Tiled View Overlay -->
-<style>
-.tiled-overlay { position: fixed; inset: 0; background: var(--bg-void); z-index: 1000; display: none; flex-direction: column; }
-.tiled-overlay.open { display: flex; }
-.tiled-bar {
-  display: flex; align-items: center; gap: 12px;
-  padding: 6px 16px; background: var(--bg-deep);
-  border-bottom: 2px solid var(--accent-terracotta); flex-shrink: 0;
-}
-.tiled-bar h3 { font-family: var(--font-display); font-size: 1.1rem; color: var(--accent-cream); font-weight: 400; }
-.layout-group { display: flex; gap: 2px; margin-left: 12px; }
-.layout-btn {
-  font-family: var(--font-mono); font-size: 9px; padding: 4px 10px;
-  background: var(--bg-panel); color: var(--text-muted);
-  border: 1px solid transparent; cursor: pointer; text-transform: uppercase; letter-spacing: 0.08em;
-}
-.layout-btn:hover { color: var(--text-secondary); border-color: var(--border); }
-.layout-btn.active { background: var(--accent-terracotta); color: var(--bg-void); border-color: var(--accent-terracotta); }
-.tiled-bar-actions { display: flex; gap: 6px; align-items: center; margin-left: auto; }
-.tiled-bar-actions button {
-  font-family: var(--font-mono); font-size: 9px; padding: 4px 10px;
-  background: var(--bg-surface); color: var(--text-secondary);
-  border: 1px solid var(--border); cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em;
-}
-.tiled-bar-actions button:hover { border-color: var(--accent-terracotta); color: var(--accent-cream); }
-.tiled-bar-actions .close-btn { color: var(--text-muted); font-size: 22px; cursor: pointer; margin-left: 8px; border: none; background: none; line-height: 1; }
-.tiled-bar-actions .close-btn:hover { color: var(--accent-red); }
-
-.tiled-grid { flex: 1; display: grid; gap: 2px; overflow: hidden; }
-
-.tile { background: var(--bg-deep); display: flex; flex-direction: column; border: 1px solid var(--border); overflow: hidden; }
-.tile.flash { border-color: var(--accent-olive); animation: tileFlash 1.5s ease-in-out infinite; }
-@keyframes tileFlash {
-  0%, 100% { box-shadow: inset 0 0 0 0 rgba(101, 163, 13, 0); }
-  50% { box-shadow: inset 0 0 30px 0 rgba(101, 163, 13, 0.15); }
-}
-
-.tile-header {
-  display: flex; align-items: center; gap: 6px;
-  padding: 4px 8px; background: var(--bg-panel);
-  border-bottom: 1px solid var(--border); flex-shrink: 0;
-}
-.tile-select {
-  font-family: var(--font-mono); font-size: 11px; font-weight: 500;
-  color: var(--accent-cream); background: var(--bg-surface);
-  border: 1px solid var(--border); padding: 3px 6px; cursor: pointer;
-  max-width: 180px;
-}
-.tile-select:hover { border-color: var(--accent-terracotta); }
-.tile-select:focus { outline: none; border-color: var(--accent-terracotta); }
-.tile-select option { background: var(--bg-panel); color: var(--text-secondary); }
-
-.tile-badge {
-  font-family: var(--font-mono); font-size: 8px; text-transform: uppercase;
-  letter-spacing: 0.1em; padding: 2px 6px; margin-left: auto;
-}
-.tile-badge.working { color: var(--accent-amber); border: 1px solid var(--accent-amber); }
-.tile-badge.waiting { color: var(--bg-void); background: var(--accent-olive); }
-.tile-badge.idle { color: var(--text-muted); border: 1px solid var(--border); }
-.tile-connect {
-  font-family: var(--font-mono); font-size: 8px; padding: 2px 8px;
-  background: var(--bg-surface); color: var(--text-muted);
-  border: 1px solid var(--border); cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em;
-}
-.tile-connect:hover { color: var(--accent-cream); border-color: var(--accent-terracotta); }
-
-.tile-body { flex: 1; overflow: hidden; background: #0C0A09; min-height: 0; position: relative; }
-.tile-terminal {
-  font-family: var(--font-mono); font-size: 11px; line-height: 1.35;
-  color: #FAFAF9; background: #0C0A09; padding: 6px 8px;
-  white-space: pre; overflow-x: auto;
-  overflow-y: auto; height: 100%; margin: 0;
-  outline: none; cursor: text;
-  contain: content; content-visibility: auto;
-  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
-}
-.tile-terminal:focus { box-shadow: inset 0 0 0 1px var(--accent-terracotta); }
-.terminal-input-capture {
-  position: absolute; left: -9999px; top: 0; width: 1px; height: 1px;
-  opacity: 0; font-size: 16px; /* prevent iOS zoom */
-}
-@media (max-width: 768px) {
-  .tile-terminal { white-space: pre-wrap; overflow-wrap: break-word; font-size: 10px; }
-}
-.tile-terminal::-webkit-scrollbar { width: 4px; }
-.tile-terminal::-webkit-scrollbar-track { background: transparent; }
-.tile-terminal::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-.tile-monitor {
-  font-family: var(--font-mono); font-size: 10px; line-height: 1.3;
-  color: var(--text-secondary); padding: 6px 8px;
-  white-space: pre; overflow: auto; height: 100%; margin: 0;
-  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
-}
-.tile-monitor::-webkit-scrollbar { width: 4px; height: 4px; }
-.tile-monitor::-webkit-scrollbar-track { background: transparent; }
-.tile-monitor::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-.tile-body::-webkit-scrollbar { width: 4px; }
-.tile-body::-webkit-scrollbar-track { background: transparent; }
-.tile-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
-.tile-body { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
-.focus-strip { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
-.focus-strip::-webkit-scrollbar { height: 4px; }
-.focus-strip::-webkit-scrollbar-thumb { background: var(--border); }
-
-.tile-picker { position: fixed; inset: 0; background: rgba(12, 10, 9, 0.9); z-index: 1001; display: none; justify-content: center; align-items: center; }
-.tile-picker.open { display: flex; }
-.picker-panel { background: var(--bg-deep); border-top: 3px solid var(--accent-terracotta); padding: 24px; width: 90%; max-width: 400px; }
-.picker-panel h3 { font-family: var(--font-display); color: var(--accent-cream); font-weight: 400; font-size: 1.3rem; margin-bottom: 16px; }
-.picker-item { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid rgba(87, 83, 78, 0.3); cursor: pointer; }
-.picker-item input[type="checkbox"] { accent-color: var(--accent-terracotta); width: 16px; height: 16px; }
-.picker-name { font-family: var(--font-mono); font-size: 13px; color: var(--text-primary); flex: 1; }
-.picker-badge { font-family: var(--font-mono); font-size: 8px; text-transform: uppercase; letter-spacing: 0.1em; padding: 2px 6px; }
-.picker-badge.working { color: var(--accent-amber); }
-.picker-badge.waiting { color: var(--accent-olive); }
-.picker-badge.idle { color: var(--text-muted); }
-.picker-actions { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
-.picker-actions button { font-family: var(--font-mono); font-size: 11px; padding: 8px 16px; border: none; cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em; }
-.picker-actions .btn-primary { background: var(--accent-terracotta); color: var(--accent-cream); }
-.picker-actions .btn-secondary { background: var(--bg-surface); color: var(--text-secondary); border: 1px solid var(--border); }
-</style>
 
 <div class="tile-picker" id="tile-picker">
   <div class="picker-panel">
@@ -3364,25 +1908,6 @@ function playChime() {
   <div class="tiled-grid" id="tiled-grid"></div>
 </div>
 
-<style>
-.orch-overlay { position: fixed; inset: 0; background: rgba(12,10,9,0.97); z-index: 1100; display: none; flex-direction: column; overflow: auto; }
-.orch-overlay.open { display: flex; }
-.orch-bar { display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; background: var(--bg-deep); border-bottom: 2px solid var(--accent-terracotta); position: sticky; top: 0; }
-.orch-bar h3 { font-family: var(--font-display); color: var(--accent-cream); font-weight: 400; font-size: 1.4rem; margin: 0; }
-.orch-body { padding: 18px; max-width: 900px; margin: 0 auto; width: 100%; box-sizing: border-box; }
-.orch-section { margin-bottom: 22px; }
-.orch-section h4 { color: var(--accent-cream); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; margin: 0 0 10px; }
-.orch-toggles { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.orch-toggle { font-family: var(--font-mono); font-size: 11px; padding: 8px 12px; border: 1px solid var(--border); background: var(--bg-surface); color: var(--text-secondary); cursor: pointer; }
-.orch-toggle.on { background: var(--accent-terracotta); color: var(--accent-cream); border-color: var(--accent-terracotta); }
-.orch-toggle.master.on { background: #65A30D; border-color: #65A30D; color: #0C0A09; }
-.orch-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.orch-form input[type=text] { padding: 9px; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-primary); font: inherit; font-size: 14px; }
-.orch-form button { padding: 9px 16px; background: var(--accent-terracotta); color: var(--accent-cream); border: none; cursor: pointer; font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; }
-.orch-num { width: 60px; padding: 6px; background: var(--bg-panel); border: 1px solid var(--border); color: var(--text-primary); font: inherit; }
-.orch-row { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid rgba(87,83,78,0.3); font-family: var(--font-mono); font-size: 12px; }
-.orch-hint { color: var(--text-muted); font-size: 11px; margin-top: 8px; line-height: 1.5; }
-</style>
 <div class="orch-overlay" id="orch-overlay">
   <div class="orch-bar">
     <h3>Orchestration</h3>
@@ -3407,46 +1932,8 @@ function playChime() {
     <div class="orch-section"><h4>Backlog</h4><div id="orch-backlog"></div></div>
   </div>
 </div>
-<script>
-let orchInterval = null;
-const ORCH_TOGGLES = [['enabled','Orchestration',true],['auto_nudge','Auto-nudge',false],['auto_spawn','Auto-spawn',false],['auto_merge','Auto-merge',false]];
-function openOrch() { document.getElementById('orch-overlay').classList.add('open'); orchRefresh(); orchInterval = setInterval(() => { if (!document.hidden) orchRefresh(); }, 4000); }
-function closeOrch() { document.getElementById('orch-overlay').classList.remove('open'); if (orchInterval) { clearInterval(orchInterval); orchInterval = null; } }
-async function orchRefresh() {
-  try { const r = await fetch('/api/orch'); if (!r.ok) return; const d = await r.json();
-    if (!d.available) { document.getElementById('orch-toggles').innerHTML = '<span class="orch-hint">orchestration package unavailable</span>'; return; }
-    renderOrch(d); } catch(e) {}
-}
-function renderOrch(d) {
-  const cfg = d.config || {};
-  document.getElementById('orch-toggles').innerHTML = ORCH_TOGGLES.map(([k,label,master]) => {
-    const on = !!cfg[k];
-    return `<span class="orch-toggle ${master?'master':''} ${on?'on':''}" onclick="orchSet('${k}', ${!on})">${label}: ${on?'ON':'off'}</span>`;
-  }).join('')
-    + ` <span class="orch-toggle">max <input class="orch-num" type="number" min="1" max="32" value="${cfg.max_parallel||4}" onchange="orchSet('max_parallel', parseInt(this.value)||4)"></span>`
-    + ` <span class="orch-toggle">nudge risk≤ <select class="orch-num" style="width:auto" onchange="orchSet('nudge_risk_max', this.value)">${['allow','review','confirm','block'].map(o=>`<option ${cfg.nudge_risk_max===o?'selected':''}>${o}</option>`).join('')}</select></span>`;
-  document.getElementById('orch-hint').textContent = cfg.enabled
-    ? (cfg.auto_nudge ? 'Auto-nudge ON: routine waiting sessions are auto-continued (risk-gated; never on confirm/block actions).' : 'Read-only supervision. Turn on auto-nudge / auto-spawn / auto-merge to let it act.')
-    : 'Orchestration is OFF. Turn it on for read-only supervision; the act-on-sessions toggles stay off until you enable them.';
-  const sessions = (d.sessions||[]).filter(s => ['pending','running','waiting','idle','stale'].includes(s.state));
-  document.getElementById('orch-fleet').innerHTML = sessions.length ? sessions.map(s => `
-    <div class="orch-row"><span class="session-badge ${s.state}" style="font-size:9px;padding:2px 7px">${s.state}</span>
-      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.id.slice(0,8)} · ${s.project||'-'} · ${(s.task||'').slice(0,60)}</span>
-      <button class="orch-toggle" onclick="orchStop('${s.id}')">stop</button></div>`).join('') : '<div class="orch-hint">no active sessions</div>';
-  const bl = d.backlog||[];
-  document.getElementById('orch-backlog').innerHTML = bl.length ? bl.map(b => `<div class="orch-row"><span style="flex:1">${(b.task||'').slice(0,70)}</span><span class="orch-hint">${b.project||''}</span></div>`).join('') : '<div class="orch-hint">empty</div>';
-}
-async function orchSet(key, val) { try { const r = await fetch('/api/orch/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({[key]: val})}); if (r.ok) orchRefresh(); } catch(e) {} }
-async function orchSpawn() {
-  const task = document.getElementById('orch-task').value.trim(); if (!task) return;
-  const project = document.getElementById('orch-project').value.trim();
-  const headless = document.getElementById('orch-headless').checked;
-  try { const r = await fetch('/api/orch/spawn', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({task, project, headless})});
-    const d = await r.json(); if (d.error) alert('Spawn failed: ' + d.error); else { document.getElementById('orch-task').value=''; orchRefresh(); }
-  } catch(e) { alert('spawn error'); }
-}
-async function orchStop(id) { try { await fetch('/api/orch/session/'+id+'/stop', {method:'POST'}); orchRefresh(); } catch(e) {} }
-</script>
+
+<script defer src="/app/live.js"></script>
 '''
 
 
@@ -3461,6 +1948,7 @@ def create_app():
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/status", handle_status)
     app.router.add_get("/api/panes", handle_panes)
+    app.router.add_get("/api/reader/{session}", handle_reader)
     app.router.add_get("/api/orch", handle_orch_state)
     app.router.add_post("/api/orch/config", handle_orch_config)
     app.router.add_post("/api/orch/spawn", handle_orch_spawn)
@@ -3474,6 +1962,10 @@ def create_app():
     # Vendored JS/CSS (xterm, qrcode) served locally — no external CDN dependency,
     # so the page never blocks on a slow/unreachable jsdelivr. Public (auth-exempt).
     app.router.add_static("/vendor/", os.path.join(os.path.dirname(__file__), "vendor"))
+    # The dashboard SPA's own CSS/JS (extracted from the Python HTML strings).
+    # Behind auth like the page itself (not exempted below); the static handler's
+    # Last-Modified/ETag pairs with the /app/ no-cache header so reloads 304 cheaply.
+    app.router.add_static("/app/", os.path.join(os.path.dirname(__file__), "web"))
 
     app.router.add_get("/auth/login", handle_login)
     app.router.add_post("/auth/login", handle_login_submit)

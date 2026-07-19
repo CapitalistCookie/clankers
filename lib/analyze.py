@@ -34,6 +34,12 @@ WORKTREE_BASES = (
     "hftlogger",
 )
 
+# Fixture/test rows must never reach analytics. The suite is data-isolated via
+# tests/conftest.py (CLANKER_DATA → tmpdir, 2026-07-19), but historical pytest
+# runs wrote these into the live store, and any future writer that skips the
+# fixture would too — belt-and-suspenders at read time.
+TEST_PROJECTS = {"test-project", "test-stdin"}
+
 
 def normalize_project(name):
     """Normalize a project name to its canonical registry name.
@@ -81,6 +87,8 @@ def load_sessions(last_days=7, dedup=True):
                     except json.JSONDecodeError:
                         continue
                     s["project"] = normalize_project(s.get("project", "global"))
+                    if s["project"] in TEST_PROJECTS:
+                        continue
                     records.append(s)
         except OSError:
             pass

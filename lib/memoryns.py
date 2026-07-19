@@ -4,7 +4,7 @@ Claude Code derives the auto-memory directory from the session's LAUNCH cwd:
 ~/.claude/projects/<slug(cwd)>/memory/MEMORY.md is injected into the system
 prompt. Repo-rooted sessions (the `clanker work` law) therefore see an EMPTY
 memory unless their namespace is seeded — the global router with every
-cross-project arc lives only under the -home-user namespace.
+cross-project arc lives only under $HOME's own namespace (GLOBAL_MEMORY).
 
 Fix: every project namespace gets a MEMORY.md stub that (a) points hard at the
 global router, (b) carries the project's own must-read arc lines, (c) reminds
@@ -18,10 +18,13 @@ import os
 import re
 
 CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
-GLOBAL_MEMORY = os.path.join(CLAUDE_PROJECTS, "-home-user", "memory")
+# The global namespace slug is derived from $HOME via Claude Code's own slug
+# rule (slashes/dots become dashes) — never hardcode the slugified home path.
+HOME_SLUG = re.sub(r"[/.]", "-", os.path.expanduser("~"))
+GLOBAL_MEMORY = os.path.join(CLAUDE_PROJECTS, HOME_SLUG, "memory")
 ROUTER_LINE = (
     "> GLOBAL ROUTER — cross-project arcs, feedback law, active-project table: "
-    "READ `/home/user/.claude/projects/-home-user/memory/MEMORY.md` when work spans projects "
+    f"READ `{os.path.join(GLOBAL_MEMORY, 'MEMORY.md')}` when work spans projects "
     "or mentions another system. Full inventory: INDEX_ALL.md in the same dir."
 )
 
@@ -124,7 +127,7 @@ def ensure_memory_stub(project_path, project_name=None):
         if os.path.exists(mm):
             txt = open(mm, errors="ignore").read()
             missing = []
-            if "-home-user/memory/MEMORY.md" not in txt:
+            if os.path.join(GLOBAL_MEMORY, "MEMORY.md") not in txt:
                 missing.append(ROUTER_LINE)
             missing += [a for a in arcs if a not in txt]
             if not missing:

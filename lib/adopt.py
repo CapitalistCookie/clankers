@@ -68,7 +68,12 @@ def _print_checks(name, checks):
     return bad
 
 
-def doctor_project(name):
+def project_checks(name, include_secrets=True):
+    """Build the contract check rows for one project: [(label, ok, detail), ...].
+
+    include_secrets=False skips the repo-wide secret grep — it dominates the
+    runtime on large repos, which matters when the fleet loop runs this 40×.
+    """
     reg = Registry()
     path = reg.get_path(name)
     checks = []
@@ -78,7 +83,7 @@ def doctor_project(name):
 
     add("path exists", os.path.isdir(path), path)
     if not os.path.isdir(path):
-        return 1 if _print_checks(name, checks) else 0
+        return checks
 
     add("registered", name in reg.projects, "" if name in reg.projects else "run: clanker adopt " + path)
     is_git = os.path.exists(os.path.join(path, ".git"))
@@ -98,10 +103,11 @@ def doctor_project(name):
     if is_git:
         _, remotes, _ = _sh(["git", "remote"], path)
         add("remote", bool(remotes), remotes.replace("\n", ", ") or "none — DR risk")
-        rc, hits, _ = _sh(["grep", "-rlIE", SECRET_PATTERN,
-                           "--include=*.md", "--include=*.json", "--include=*.sh",
-                           "--exclude-dir=.git", "."], path)
-        add("no plaintext secrets", rc != 0, hits.replace("\n", ", ")[:100])
+        if include_secrets:
+            rc, hits, _ = _sh(["grep", "-rlIE", SECRET_PATTERN,
+                               "--include=*.md", "--include=*.json", "--include=*.sh",
+                               "--exclude-dir=.git", "."], path)
+            add("no plaintext secrets", rc != 0, hits.replace("\n", ", ")[:100])
 
     # Archetype-specific contract — each project TYPE self-improves against different
     # invariants (the loop skeleton is universal; the probes are not). See
@@ -109,7 +115,37 @@ def doctor_project(name):
     for label, ok, detail in _archetype_checks(reg.get_archetype(name), path):
         add(label, ok, detail)
 
-    return 1 if _print_checks(name, checks) else 0
+    return checks
+
+
+def doctor_project(name):
+    return 1 if _print_checks(name, project_checks(name)) else 0
+
+
+def doctor_fleet(include_secrets=False):
+    """Contract check across EVERY registered project — one row each.
+
+    The per-project doctor existed since the overhaul, but there was no
+    fleet-wide view of the very governance it enforces (audit 2026-07-19).
+    Secret grep is off by default here (40 repos × repo-wide grep); run
+    `clanker doctor <name>` for the full per-project table including secrets.
+    """
+    reg = Registry()
+    failing = 0
+    print(f"{'Project':<28} {'Archetype':<12} {'Contract':<10} Failing checks")
+    print("-" * 92)
+    for name in sorted(reg.projects.keys()):
+        checks = project_checks(name, include_secrets=include_secrets)
+        fails = [label for label, ok, _ in checks if not ok]
+        if fails:
+            failing += 1
+        status = "MET" if not fails else f"{len(fails)}/{len(checks)} ✗"
+        print(f"{name:<28} {reg.get_archetype(name) or '?':<12} {status:<10} {', '.join(fails)}")
+    total = len(reg.projects)
+    print("-" * 92)
+    print(f"{total - failing}/{total} projects meet contract"
+          + ("" if not failing else f" — {failing} drifted (fix: clanker doctor <name>)"))
+    return 1 if failing else 0
 
 
 def _archetype_checks(archetype, path):
@@ -173,21 +209,11 @@ def doctor_summary(name):
 
 
 def _register(name, path, archetype):
-    reg_path = os.environ.get("CLANKER_REGISTRY", os.path.expanduser("~/projects/.clanker.yaml"))
-    data = {}
-    if os.path.exists(reg_path):
-        with open(reg_path) as f:
-            data = yaml.safe_load(f) or {}
-    projects = data.setdefault("projects", {})
-    if name in projects:
-        return False
+    from registry import write_entry
     entry = {"archetype": archetype}
     if os.path.realpath(path) != os.path.realpath(os.path.expanduser(f"~/projects/{name}")):
         entry["path"] = path
-    projects[name] = entry
-    with open(reg_path, "w") as f:
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
-    return True
+    return write_entry(name, entry, create_only=True)
 
 
 def adopt(target, archetype=None, new=False):

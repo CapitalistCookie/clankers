@@ -13,6 +13,11 @@ from collections import defaultdict, Counter
 DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
 
 
+def _global_memory_dir():
+    from memoryns import GLOBAL_MEMORY  # $HOME-derived, never a hardcoded slug
+    return GLOBAL_MEMORY
+
+
 def resource_monitor():
     """Check VM resource usage — CPU, RAM, swap, disk I/O."""
     import subprocess
@@ -134,7 +139,7 @@ def harness_version_snapshot():
         "hooks": len(glob.glob(os.path.expanduser("~/.claude/hooks/*.sh")) +
                      glob.glob(os.path.expanduser("~/.claude/hooks/*.py"))),
         "skills": len(glob.glob(os.path.expanduser("~/.claude/skills/*/"))),
-        "memory_files": len(glob.glob(os.path.expanduser("~/.claude/projects/-home-user/memory/*.md"))),
+        "memory_files": len(glob.glob(os.path.join(_global_memory_dir(), "*.md"))),
         "projects": 0,
         "archetypes": 0,
     }
@@ -238,7 +243,7 @@ def export_harness(output_path=None):
             tar.add(skills_dir, "skills")
 
         # Memory
-        memory_dir = os.path.expanduser("~/.claude/projects/-home-user/memory")
+        memory_dir = _global_memory_dir()
         if os.path.isdir(memory_dir):
             tar.add(memory_dir, "memory")
 
