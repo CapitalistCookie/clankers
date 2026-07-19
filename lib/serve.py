@@ -1023,12 +1023,17 @@ async def handle_reader(request):
         return web.json_response({"error": "invalid session name"}, status=400)
     off_raw = request.query.get("offset", "")
     offset = int(off_raw) if off_raw.isdigit() else None
+    before_raw = request.query.get("before", "")
+    before = int(before_raw) if before_raw.isdigit() else None
     import reader as _reader
     path = await asyncio.to_thread(_reader.resolve_transcript, name)
     if not path:
         return web.json_response(
             {"units": [], "offset": 0, "reset": True, "error": "no-transcript"})
-    out = await asyncio.to_thread(_reader.parse_tail, path, offset)
+    if before is not None:
+        out = await asyncio.to_thread(_reader.parse_window, path, before)
+    else:
+        out = await asyncio.to_thread(_reader.parse_tail, path, offset)
     out["session"] = name
     resp = web.json_response(out)
     resp.enable_compression()

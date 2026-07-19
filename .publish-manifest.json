@@ -151,5 +151,5 @@
   "tests/test_webauth.py",
   "tools/archive-transcripts.sh"
  ],
- "source_commit": "5e365e0"
+ "source_commit": "d0c08fe"
 }

@@ -175,12 +175,14 @@ def _parse_line(raw):
 def parse_tail(path, offset=None):
     """Read appended content from `path` starting at byte `offset`.
 
-    Returns {units, offset, size, reset} — reset=True when the caller's offset
-    was unusable (rotation/rewrite/first call) and the tail window was used."""
+    Returns {units, offset, start, size, reset} — reset=True when the caller's
+    offset was unusable (rotation/rewrite/first call) and the tail window was
+    used. `start` = byte offset of the first COMPLETE line in the window (the
+    cursor for backward pagination via parse_window)."""
     try:
         size = os.path.getsize(path)
     except OSError:
-        return {"units": [], "offset": 0, "size": 0, "reset": True}
+        return {"units": [], "offset": 0, "start": 0, "size": 0, "reset": True}
     reset = False
     if offset is None or offset > size:
         reset = True
@@ -191,8 +193,11 @@ def parse_tail(path, offset=None):
     new_offset = offset + len(blob)
     text = blob.decode("utf-8", errors="replace")
     lines = text.split("\n")
+    start = offset
     if reset and offset > 0 and lines:
-        lines = lines[1:]            # first line is a partial record
+        # first line is a partial record; the real window starts after it
+        start = offset + len(lines[0].encode("utf-8", errors="replace")) + 1
+        lines = lines[1:]
     if lines and not text.endswith("\n"):
         # last record still being written — don't consume it
         new_offset -= len(lines[-1].encode("utf-8", errors="replace"))
@@ -204,8 +209,45 @@ def parse_tail(path, offset=None):
             continue
         u = _parse_line(line)
         if u:
-            # fold bare result-error markers into a compact stream
             units.append(u)
     if len(units) > MAX_UNITS:
         units = units[-MAX_UNITS:]
-    return {"units": units, "offset": new_offset, "size": size, "reset": reset}
+    return {"units": units, "offset": new_offset, "start": start,
+            "size": size, "reset": reset}
+
+
+def parse_window(path, before):
+    """Backward pagination: parse the window of complete records ENDING at
+    byte `before` (which must be a line start — the `start` of a previously
+    returned window). Returns {units, start, at_start} where `start` is this
+    window's first-complete-line offset and at_start=True at byte 0.
+
+    Full-session scrollback (operator, 2026-07-19): the tail window shows the
+    recent conversation; scrolling to the top pages back window by window to
+    the session's very first message."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {"units": [], "start": 0, "at_start": True}
+    before = max(0, min(before, size))
+    if before == 0:
+        return {"units": [], "start": 0, "at_start": True}
+    chunk_start = max(0, before - TAIL_BYTES)
+    with open(path, "rb") as f:
+        f.seek(chunk_start)
+        blob = f.read(before - chunk_start)
+    text = blob.decode("utf-8", errors="replace")
+    lines = text.split("\n")
+    start = chunk_start
+    if chunk_start > 0 and lines:
+        start = chunk_start + len(lines[0].encode("utf-8", errors="replace")) + 1
+        lines = lines[1:]
+    units = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        u = _parse_line(line)
+        if u:
+            units.append(u)
+    return {"units": units, "start": start, "at_start": chunk_start == 0}

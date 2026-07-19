@@ -70,6 +70,33 @@ def test_incremental_offset_and_partial_last_line():
         assert out2["units"][0]["text"] == "done"
 
 
+def test_backward_pagination_reaches_session_start(monkeypatch):
+    # Small window so a 30-record transcript spans several pages.
+    monkeypatch.setattr(reader, "TAIL_BYTES", 600)
+    monkeypatch.setattr(reader, "MAX_UNITS", 1000)
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "t.jsonl")
+        with open(p, "w") as f:
+            for i in range(30):
+                _w(f, {"type": "user", "timestamp": f"T{i}",
+                       "message": {"content": f"message number {i:03d}"}})
+        tail = reader.parse_tail(p)
+        assert tail["start"] > 0          # window did not cover the whole file
+        texts = [u["text"] for u in tail["units"]]
+        cursor, pages = tail["start"], 0
+        while True:
+            win = reader.parse_window(p, cursor)
+            texts = [u["text"] for u in win["units"]] + texts
+            pages += 1
+            assert pages < 50, "pagination did not terminate"
+            if win["at_start"]:
+                break
+            cursor = win["start"]
+        # walked back to the very first record, no gaps, no duplicates
+        assert texts == [f"message number {i:03d}" for i in range(30)]
+        assert pages >= 2
+
+
 def test_rotation_resets():
     with tempfile.TemporaryDirectory() as tmp:
         p = os.path.join(tmp, "t.jsonl")
