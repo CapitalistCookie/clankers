@@ -1191,41 +1191,100 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "sysmon_sampl
     SYSMON_SCRIPT = _f.read()
 # Sample takes ~1.3s (1s delta + SSH); cache so rapid client polls don't stack
 # multiple SSH samples on the host.
-_sysmon_cache = Cache(ttl=2.5)
+# Warm caches: a background warmer samples every ~20s so opening the monitor
+# paints INSTANTLY from cache instead of paying SSH handshake + the sampler's
+# 1s rate-delta sleep on-request (~2-3s of 'sluggish', operator 2026-07-19).
+# ControlMaster reuses one SSH connection across all samples.
+_sysmon_cache = Cache(ttl=30)
+_gpu_cache = Cache(ttl=45)
+SYSMON_GPU_SSH = os.environ.get("CLANKER_SYSMON_GPU_SSH", "")  # e.g. root@<gpu-ct>
+
+_SSH_MUX = ["-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/clanker-ssh-%r@%h",
+            "-o", "ControlPersist=120"]
+
+
+def _sysmon_sample_host():
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=8", *_SSH_MUX,
+             "-i", SYSMON_SSH_KEY, SYSMON_SSH_HOST, "python3", "-"],
+            input=SYSMON_SCRIPT, capture_output=True, text=True, timeout=12,
+        )
+    except subprocess.SubprocessError as e:
+        return {"error": f"sample failed: {type(e).__name__}"}
+    if p.returncode != 0:
+        return {"error": (p.stderr or "ssh sample failed").strip()[:200]}
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return {"error": "sampler returned non-JSON"}
+
+
+def _sysmon_sample_gpus():
+    """nvidia-smi on the GPU host (CT with the passed-through card). Read-only."""
+    if not SYSMON_GPU_SSH:
+        return []
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+             "-o", "ConnectTimeout=6", *_SSH_MUX,
+             "-i", SYSMON_SSH_KEY, SYSMON_GPU_SSH,
+             "nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,"
+             "memory.total,temperature.gpu,power.draw,power.limit",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if p.returncode != 0:
+            return []
+        gpus = []
+        for row in p.stdout.strip().splitlines():
+            parts = [c.strip() for c in row.split(",")]
+            if len(parts) < 7:
+                continue
+            def _num(v):
+                try:
+                    return float(v)
+                except ValueError:
+                    return None
+            gpus.append({"name": parts[0], "util": _num(parts[1]) or 0,
+                         "mem_used": _num(parts[2]) or 0, "mem_total": _num(parts[3]) or 0,
+                         "temp": _num(parts[4]), "power": _num(parts[5]),
+                         "plimit": _num(parts[6])})
+        return gpus
+    except subprocess.SubprocessError:
+        return []
+
+
+async def sysmon_warmer(app):
+    """Keep host+GPU snapshots warm off-request (20s cadence)."""
+    if not SYSMON_SSH_HOST:
+        return
+    while True:
+        try:
+            data = await asyncio.to_thread(_sysmon_sample_host)
+            gpus = await asyncio.to_thread(_sysmon_sample_gpus)
+            if gpus:
+                _gpu_cache.set(gpus)
+            if isinstance(data, dict) and not data.get("error"):
+                data["gpus"] = _gpu_cache.get() or []
+                _sysmon_cache.set(data)
+        except Exception as e:
+            log.debug("sysmon warmer error: %s", e)
+        await asyncio.sleep(20)
 
 
 async def handle_sysmon(request):
-    """Return a one-shot system snapshot of the Proxmox host as JSON (read-only).
-
-    Runs lib/sysmon_sampler.py on the host via `ssh … python3 -` (script fed on
-    stdin — a fixed constant, never anything from the request). Cached 2.5s."""
+    """One-shot system snapshot (host + gpus) as JSON — served from the warm
+    cache; a cold miss (just after boot) samples inline."""
     cached = _sysmon_cache.get()
     if cached is not None:
         return web.json_response(cached)
-
-    loop = asyncio.get_event_loop()
-
-    def _sample():
-        try:
-            p = subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
-                 "-o", "ConnectTimeout=8", "-i", SYSMON_SSH_KEY, SYSMON_SSH_HOST,
-                 "python3", "-"],
-                input=SYSMON_SCRIPT, capture_output=True, text=True, timeout=12,
-            )
-        except subprocess.SubprocessError as e:
-            return {"error": f"sample failed: {type(e).__name__}"}
-        if p.returncode != 0:
-            return {"error": (p.stderr or "ssh sample failed").strip()[:200]}
-        try:
-            return json.loads(p.stdout)
-        except json.JSONDecodeError:
-            return {"error": "sampler returned non-JSON"}
-
-    data = await loop.run_in_executor(None, _sample)
+    data = await asyncio.to_thread(_sysmon_sample_host)
     if not isinstance(data, dict) or data.get("error"):
         return web.json_response(
             data if isinstance(data, dict) else {"error": "no data"}, status=502)
+    data["gpus"] = _gpu_cache.get() or []
     _sysmon_cache.set(data)
     return web.json_response(data)
 
@@ -1269,7 +1328,17 @@ async def handle_ws_sysmon(request):
                 break  # ssh/sampler exited (host unreachable, etc.)
             line = line.strip()
             if line:
-                await ws.send_str(line.decode("utf-8", "replace"))
+                # attach the latest GPU snapshot to each streamed host frame
+                out = line.decode("utf-8", "replace")
+                gpus = _gpu_cache.get()
+                if gpus:
+                    try:
+                        frame = json.loads(out)
+                        frame["gpus"] = gpus
+                        out = json.dumps(frame)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                await ws.send_str(out)
                 sent += 1
         if sent == 0 and not ws.closed:
             await ws.send_str(json.dumps({"error": "sampler unreachable"}))
@@ -1794,10 +1863,12 @@ async def start_background(app):
     app["reaper_task"] = asyncio.create_task(session_reaper(app))
     app["orch_task"] = asyncio.create_task(orch_supervise(app))
     app["dashboard_task"] = asyncio.create_task(dashboard_refresher(app))
+    app["sysmon_task"] = asyncio.create_task(sysmon_warmer(app))
 
 
 async def stop_background(app):
-    for key in ("monitor_task", "reaper_task", "orch_task", "dashboard_task"):
+    for key in ("monitor_task", "reaper_task", "orch_task", "dashboard_task",
+                "sysmon_task"):
         task = app.get(key)
         if task:
             task.cancel()
