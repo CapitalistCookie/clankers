@@ -117,6 +117,10 @@ PROGRESS_WORDS = [
 SPINNERS = set("⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯"
                "⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿✳✶✷✸✹✺✻✼⣾⣽⣻⢿⡿⣟⣯⣷")
 
+# SGR escape sequences — stripped before parsing the statusline off a pane tail
+# (capture-pane -p is already plain, but keep this defensive for -e captures).
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Auth: HMAC-signed cookies (session + short-lived TOTP-setup token)
@@ -1013,6 +1017,27 @@ async def handle_status(request):
             if s and "─" not in s and "❯" not in s and "═" not in s:
                 preview_line = s[:120]
                 break
+        # Statusline chips (items 2+4): the pane bottom carries Claude Code's
+        # statusline — "<model> | ctx:NN%/1M | <branch> | … | 5h:NN% ↻ | 7d:NN% …".
+        # Parse it off the preview we already captured (no extra capture-pane).
+        model = ctx = b5h = b7d = None
+        # bottom-up: the statusline is the pane's last line — prefer it over any
+        # coincidental "ctx:" text higher up in the captured conversation.
+        for line in reversed(_SGR_RE.sub("", preview).split("\n")):
+            if "ctx:" not in line:
+                continue
+            m = re.search(r"ctx:(\d+)%", line)
+            if not m:
+                continue
+            ctx = int(m.group(1))
+            model = line.split(" | ", 1)[0].strip() or None
+            m = re.search(r"5h:(\d+)%", line)
+            if m:
+                b5h = int(m.group(1))
+            m = re.search(r"7d:(\d+)%", line)
+            if m:
+                b7d = int(m.group(1))
+            break
         sessions.append({
             "session": p["session"],
             "target": p["target"],
@@ -1022,6 +1047,10 @@ async def handle_status(request):
             "substate": substate,
             "agents": agents,
             "preview": preview_line,
+            "model": model,
+            "ctx": ctx,
+            "b5h": b5h,
+            "b7d": b7d,
             "size": f"{p['width']}x{p['height']}",
         })
 

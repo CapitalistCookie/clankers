@@ -124,6 +124,32 @@ def _tool_detail(block):
     return ""
 
 
+RESULT_TRUNC = 1500
+
+
+def _result_body_text(content):
+    """Stringify one tool_result's content, bounded to RESULT_TRUNC chars.
+
+    content is a plain string or a list of blocks; text blocks contribute their
+    text, anything else (images, etc.) renders as a '[non-text result]' marker so
+    the reader still shows one line per result."""
+    if isinstance(content, str):
+        s = content
+    elif isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text") or "")
+            else:
+                parts.append("[non-text result]")
+        s = "\n".join(parts)
+    elif content is None:
+        s = ""
+    else:
+        s = str(content)
+    return s[:RESULT_TRUNC]
+
+
 def _parse_line(raw):
     """One transcript line -> unit dict or None."""
     try:
@@ -154,12 +180,18 @@ def _parse_line(raw):
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
-            # tool_result carriers are not operator prompts — surface errors only
-            errs = [b for b in content if isinstance(b, dict)
-                    and b.get("type") == "tool_result" and b.get("is_error")]
-            if errs:
-                return {"role": "result", "ts": ts,
-                        "text": "", "errors": len(errs), "tools": []}
+            # tool_result carriers are not operator prompts. Surface EVERY result
+            # (not just errors) as an expandable body: {ok, text}. The reader
+            # collapses each to one ⎿ line and expands the full text on tap.
+            results = [b for b in content if isinstance(b, dict)
+                       and b.get("type") == "tool_result"]
+            if results:
+                bodies = [{"ok": not b.get("is_error"),
+                           "text": _result_body_text(b.get("content"))}
+                          for b in results]
+                errors = sum(1 for b in results if b.get("is_error"))
+                return {"role": "result", "ts": ts, "text": "",
+                        "errors": errors, "bodies": bodies, "tools": []}
             texts = [b.get("text", "") for b in content
                      if isinstance(b, dict) and b.get("type") == "text"]
             text = "\n".join(x for x in texts if x)

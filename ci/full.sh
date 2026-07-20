@@ -27,5 +27,15 @@ for st in "$HOME/.claude/hooks/memory-lint.sh" "$HOME/.claude/hooks/context-gaug
     bash "$st" --selftest || rc=1
   fi
 done
+# Auto-publish the public mirror on a green build of main (item 7). Best-effort:
+# the mirror is downstream of CI, gated by publish's own content checks — a
+# publish failure is logged but must NOT flip rc (CI's gate is fast.sh, not this).
+# PUBLISH_SKIP=1 opts a manual full-run out.
+if [ "$rc" -eq 0 ] && [ "$(git rev-parse --abbrev-ref HEAD)" = "main" ] \
+   && command -v clanker >/dev/null 2>&1 && [ -z "${PUBLISH_SKIP:-}" ]; then
+  echo "[ci/full] auto-publish…"
+  clanker publish --push >> /data/clanker/reports/publish-auto.log 2>&1 \
+    || echo "[ci/full] auto-publish FAILED (see log)"
+fi
 [ "$rc" -eq 0 ] && echo "[ci/full] all green" || echo "[ci/full] FAILURES (rc=$rc)"
 exit "$rc"

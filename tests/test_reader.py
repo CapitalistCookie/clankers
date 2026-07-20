@@ -45,8 +45,38 @@ def test_parse_units_roles_tools_and_noise_filtering():
         assert "auth module" in a["text"] and "| a | b |" in a["text"]
         assert a["tools"] == [{"name": "Bash", "detail": "pytest tests/ -q"}]
         assert out["units"][2]["errors"] == 1
+        # every tool_result now carries an expandable body (ok flag + text)
+        assert out["units"][2]["bodies"] == [{"ok": False, "text": "boom"}]
         assert out["units"][-1]["text"] == "/goal"   # command wrapper unwrapped
         assert out["reset"] is True and out["offset"] == out["size"]
+
+
+def test_tool_result_bodies_expandable():
+    """Every tool_result becomes an expandable body ({ok, text}), not just error
+    carriers: string content is kept verbatim, list content extracts text pieces
+    (non-text blocks -> placeholder), and long output truncates to 1500 chars."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = os.path.join(tmp, "t.jsonl")
+        with open(p, "w") as f:
+            _w(f, {"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "ok output here"}]}})
+            _w(f, {"type": "user", "message": {"content": [
+                {"type": "tool_result", "is_error": True, "content": [
+                    {"type": "text", "text": "line one"},
+                    {"type": "image", "source": {}}]}]}})
+            _w(f, {"type": "user", "message": {"content": [
+                {"type": "tool_result", "content": "x" * 4000}]}})
+        out = reader.parse_tail(p)
+        assert [u["role"] for u in out["units"]] == ["result", "result", "result"]
+        # (1) non-error string result: ok True, full text, errors 0
+        assert out["units"][0]["errors"] == 0
+        assert out["units"][0]["bodies"] == [{"ok": True, "text": "ok output here"}]
+        # (2) error result, list content: text kept, non-text -> placeholder
+        assert out["units"][1]["errors"] == 1
+        assert out["units"][1]["bodies"] == [
+            {"ok": False, "text": "line one\n[non-text result]"}]
+        # (3) long output truncated to 1500 chars
+        assert len(out["units"][2]["bodies"][0]["text"]) == 1500
 
 
 def test_incremental_offset_and_partial_last_line():
