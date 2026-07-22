@@ -13,6 +13,7 @@ Two hooks + one queue:
 | `hooks/subagent-resume-detect.py` | `SubagentStop` (synchronous subagents) | detect a limit signature in the agent transcript → append the task (original prompt + worktree branch + reset-time hint) to the queue |
 | `hooks/agent-resume-surface.sh` | `SessionStart` | surface the pending queue so the parent re-dispatches the killed agents — **context-aware**, staged in one batch |
 | `~/.claude/agent_resume_queue.jsonl` | — | the durable, **shared** queue (one JSON object per line) |
+| `~/.claude/agent_resume_queue.resolved.jsonl` | — | append-only archive: every `--clear` moves entries here (`status=cleared` + `resolved_at`/`resolved_by`) instead of deleting them |
 
 Limit signatures matched: `"error":"rate_limit"`, `apiErrorStatus:429`, `"hit your
 session limit"`, `usage limit`, `Overloaded`, … (see `LIMIT_SIGNS`).
@@ -54,6 +55,14 @@ writer-shared lock) and leaves every other project's untouched:
 ```bash
 bash ~/.claude/hooks/clanker-dist/agent-resume-surface.sh --clear
 ```
+
+Cleared entries are **archived, not deleted**: they append to
+`~/.claude/agent_resume_queue.resolved.jsonl` with `status=cleared`, `resolved_at`,
+`resolved_by` — so a mistaken clear is diagnosable and recoverable. Entries with no
+`cwd` (unscoped) surface in *every* project but are **left in place** by a scoped
+`--clear`; after re-dispatching one, remove it explicitly with `--clear-unscoped`
+(touches only unscoped entries — the clear output prints this reminder when it
+leaves any behind).
 
 **Never** truncate the file (`: > ~/.claude/agent_resume_queue.jsonl`): the queue is
 shared across ~49 sessions, so a global truncate erases every other project's pending

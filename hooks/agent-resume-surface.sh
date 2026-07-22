@@ -29,20 +29,33 @@
 # The under-$HERE prefix match survives ONLY for cwds not inside any git repo
 # (scratch dirs have no scope of their own -> the nearest ancestor session owns
 # them). Non-existent cwds fall back to pure path logic.
+#
+# ARCHIVE-ON-CLEAR (2026-07-22, audit R1): a clear no longer DELETES entries —
+# dropped entries append to <queue>.resolved.jsonl (June convention) with
+# status=cleared + resolved_at + resolved_by, under the same flock. A mistaken
+# clear is now diagnosable in seconds (the 07-17 audit-request loss took five
+# days precisely because the drop left no trace). The archive is written BEFORE
+# the queue rewrite lands: if the append fails, the queue is untouched.
+# UNSCOPED entries (no cwd) still SURFACE in every project, but a scoped
+# --clear leaves them (audit R2 — project A must not delete what project B is
+# also surfacing); remove them explicitly with --clear-unscoped, which touches
+# ONLY unscoped entries.
 set -u
 Q="${CLANKER_RESUME_QUEUE:-$HOME/.claude/agent_resume_queue.jsonl}"
 HERE="${CLAUDE_PROJECT_DIR:-$PWD}"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
-# One shared shown/cleared predicate (mode = count | list | clear) so display and
-# clear can never drift on which entries belong to this project. An entry is OURS
-# iff pending AND: same git root as $HERE (worktree-aware), OR its cwd lives
-# under $HERE while inside NO git repo (scratch reclaim), OR either side is
-# unscoped. Path match is component-wise: /proj/ab is NOT under /proj/a.
+# One shared project-match predicate (mode = count | list | clear |
+# clear-unscoped) so display and clear can never drift on which entries belong
+# to this project. An entry is OURS iff pending AND: same git root as $HERE
+# (worktree-aware), OR its cwd lives under $HERE while inside NO git repo
+# (scratch reclaim), OR either side is unscoped. Path match is component-wise:
+# /proj/ab is NOT under /proj/a. The ONE deliberate display/clear asymmetry is
+# unscoped entries (R2): shown everywhere, cleared only by --clear-unscoped.
 _scan() {  # $1 = mode
-python3 - "$1" "$Q" "$HERE" <<'PY'
-import json, os, subprocess, sys
-mode, q, here = sys.argv[1], sys.argv[2], sys.argv[3]
+python3 - "$1" "$Q" "$HERE" "$SELF" <<'PY'
+import json, os, subprocess, sys, time
+mode, q, here, self_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 _roots = {}
 
 def _root_info(p):
@@ -74,29 +87,48 @@ def _root_info(p):
     _roots[rp] = (root, is_repo)
     return _roots[rp]
 
+def _same_project(cwd, h):
+    """True iff cwd belongs to the project rooted at h: same git root (linked
+    worktrees -> parent repo), or under h while inside NO git repo (scratch
+    reclaim — a cwd inside a DIFFERENT repo belongs to that project even when
+    it lives under h; this is the $HOME-swallow fix, 07-22)."""
+    h = h.rstrip("/")
+    if _root_info(cwd)[0] == _root_info(h)[0]:
+        return True
+    return (cwd == h or cwd.startswith(h + "/")) and not _root_info(cwd)[1]
+
 def mine(e):
+    """Display predicate (count/list)."""
     if e.get("status") != "pending":
         return False
     cwd = e.get("cwd", "") or ""
     if not (here and cwd):
         return True          # unscoped entry or unscoped session: surface everywhere
-    h = here.rstrip("/")
-    if _root_info(cwd)[0] == _root_info(h)[0]:
-        return True          # same project/repo (linked worktrees -> parent repo)
-    # Under-$HERE reclaim, for NON-repo cwds only: a scratch dir has no scope of
-    # its own, so the nearest ancestor session owns it. A cwd inside a different
-    # repo belongs to THAT project even when it lives under $HERE — this is the
-    # $HOME-swallow fix (07-22: a home session was handed, and scoped clear would
-    # have deleted, every project's entries on the box).
-    return (cwd == h or cwd.startswith(h + "/")) and not _root_info(cwd)[1]
+    return _same_project(cwd, here)
+
+def clearable(e):
+    """Clear predicate. Same project-match as display; differs ONLY on
+    unscoped entries (R2): they surface everywhere, but a scoped clear leaves
+    them — project A's clear must not delete an entry project B is also
+    surfacing. --clear-unscoped (or a clear with no scope at all) removes
+    ONLY unscoped entries."""
+    if e.get("status") != "pending":
+        return False
+    cwd = e.get("cwd", "") or ""
+    if mode == "clear-unscoped" or not here:
+        return not cwd
+    if not cwd:
+        return False         # R2: unscoped entries survive scoped clears
+    return _same_project(cwd, here)
 
 try:
     lines = open(q, errors="ignore").read().splitlines()
 except Exception:
     lines = []
 
-if mode == "clear":
-    keep, dropped = [], 0
+if mode in ("clear", "clear-unscoped"):
+    keep, archived, left_unscoped = [], [], 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     for line in lines:
         s = line.strip()
         if not s:
@@ -106,17 +138,39 @@ if mode == "clear":
         except Exception:
             keep.append(s)   # unparseable lines are not ours to destroy
             continue
-        if mine(e):
-            dropped += 1
+        if clearable(e):
+            e["status"] = "cleared"
+            e["resolved_at"] = now
+            e["resolved_by"] = (here or "?") + (
+                " [--clear-unscoped]" if mode == "clear-unscoped" else "")
+            archived.append(e)
         else:
+            if mode == "clear" and e.get("status") == "pending" and not (e.get("cwd") or ""):
+                left_unscoped += 1
             keep.append(s)
     tmp = q + ".tmp"
     with open(tmp, "w") as f:
         f.write("".join(l + "\n" for l in keep))
+    # Archive BEFORE the queue rewrite lands (R1): if this append fails, the
+    # queue is untouched — a retried clear may duplicate archive rows, but a
+    # pending entry can never vanish without a trace again.
+    ar = (q[:-len(".jsonl")] if q.endswith(".jsonl") else q) + ".resolved.jsonl"
+    if archived:
+        with open(ar, "a") as f:
+            for e in archived:
+                f.write(json.dumps(e) + "\n")
     os.replace(tmp, q)
+    dropped = len(archived)
     word = "entry" if dropped == 1 else "entries"
-    print(f"[agent-resume] cleared {dropped} pending {word} for {here}; "
-          f"{len(keep)} line(s) kept (other projects / non-pending)")
+    scope = "(unscoped only)" if mode == "clear-unscoped" else f"for {here}"
+    print(f"[agent-resume] cleared {dropped} pending {word} {scope}; "
+          f"{len(keep)} line(s) kept (other projects / unscoped / non-pending)"
+          + (f"; archived to {os.path.basename(ar)}" if archived else ""))
+    if left_unscoped:
+        w = "entry" if left_unscoped == 1 else "entries"
+        print(f"[agent-resume] {left_unscoped} UNSCOPED pending {w} left in place "
+              f"(surfaces in every project) — if you re-dispatched them too, run:\n"
+              f"  bash {self_path} --clear-unscoped")
     sys.exit(0)
 
 n = 0
@@ -141,11 +195,11 @@ if mode == "count":
 PY
 }
 
-if [ "${1:-}" = "--clear" ]; then
+if [ "${1:-}" = "--clear" ] || [ "${1:-}" = "--clear-unscoped" ]; then
   [ -f "$Q" ] || { echo "[agent-resume] queue absent — nothing to clear"; exit 0; }
   exec 9>>"$Q.lock" 2>/dev/null || exit 0
   flock -w 5 9 || { echo "[agent-resume] clear: queue lock busy — re-run" >&2; exit 1; }
-  _scan clear
+  _scan "${1#--}"
   exit $?
 fi
 
@@ -171,13 +225,24 @@ if [ "${1:-}" = "--selftest" ]; then
   echo "$out" | grep -q "task AB prefix" && bad "prefix collision: /proj/ab shown under /proj/a" || ok
   echo "$out" | grep -q -- "--clear" && ok || bad "banner instructs scoped --clear"
   echo "$out" | grep -q ": > " && bad "banner still instructs global truncate" || ok
+  RQ="${CLANKER_RESUME_QUEUE%.jsonl}.resolved.jsonl"
   CLAUDE_PROJECT_DIR=/proj/a bash "$SELF" --clear >/dev/null || bad "clear exited nonzero"
   grep -q "task B bravo" "$CLANKER_RESUME_QUEUE" && ok || bad "clear dropped other project's entry"
   grep -q "task AB prefix" "$CLANKER_RESUME_QUEUE" && ok || bad "clear dropped prefix-collision neighbor"
   grep -q "task A alpha" "$CLANKER_RESUME_QUEUE" && bad "clear left this project's pending" || ok
-  grep -q "task C no-cwd" "$CLANKER_RESUME_QUEUE" && bad "clear left unscoped pending" || ok
+  grep -q "task C no-cwd" "$CLANKER_RESUME_QUEUE" && ok || bad "R2: scoped clear DELETED the unscoped entry"
   grep -q "finished thing" "$CLANKER_RESUME_QUEUE" && ok || bad "clear dropped a non-pending line"
   grep -q "not json garbage" "$CLANKER_RESUME_QUEUE" && ok || bad "clear dropped an unparseable line"
+  # R1: cleared != deleted — drops land in the resolved archive with metadata
+  grep -q "task A alpha" "$RQ" 2>/dev/null && ok || bad "R1: cleared entry missing from resolved archive"
+  grep -q '"status": "cleared"' "$RQ" 2>/dev/null && ok || bad "R1: archive entry lacks status=cleared"
+  grep -q '"resolved_by": "/proj/a"' "$RQ" 2>/dev/null && ok || bad "R1: archive entry lacks resolved_by"
+  grep -q "task B bravo" "$RQ" 2>/dev/null && bad "R1: archive holds an entry that was NOT cleared" || ok
+  # R2 companion: --clear-unscoped removes ONLY unscoped entries (archived too)
+  CLAUDE_PROJECT_DIR=/proj/zzz bash "$SELF" --clear-unscoped >/dev/null || bad "clear-unscoped exited nonzero"
+  grep -q "task C no-cwd" "$CLANKER_RESUME_QUEUE" && bad "clear-unscoped left the unscoped entry" || ok
+  grep -q "task B bravo" "$CLANKER_RESUME_QUEUE" && ok || bad "clear-unscoped deleted a SCOPED entry"
+  grep -q "task C no-cwd" "$RQ" 2>/dev/null && ok || bad "clear-unscoped did not archive the unscoped entry"
   out2="$(CLAUDE_PROJECT_DIR=/proj/b bash "$SELF")"
   echo "$out2" | grep -q "task B bravo" && ok || bad "other project no longer surfaces its entry"
 
@@ -208,6 +273,8 @@ if [ "${1:-}" = "--selftest" ]; then
   grep -q "task R1 in-repo" "$CLANKER_RESUME_QUEUE" && ok || bad "ancestor clear DELETED a repo's pending entry"
   grep -q "task R1WT" "$CLANKER_RESUME_QUEUE" && ok || bad "ancestor clear DELETED a worktree entry"
   grep -q "task SCR" "$CLANKER_RESUME_QUEUE" && bad "ancestor clear left its own scratch entry" || ok
+  grep -q "task SCR" "$RQ" 2>/dev/null && ok || bad "R1: ancestor's cleared scratch entry not archived"
+  grep -q "task R1 in-repo" "$RQ" 2>/dev/null && bad "R1: archive holds another project's live entry" || ok
 
   total=$((pass+fail))
   if [ "$fail" -eq 0 ]; then echo "selftest: $pass/$total PASS"; exit 0
