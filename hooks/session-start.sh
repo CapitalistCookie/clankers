@@ -27,7 +27,12 @@ PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$CWD}"
 # --- 0. On /clear, extract metrics from the PREVIOUS session ---
 if [ "$SOURCE" = "clear" ]; then
     # /clear was invoked — the session_id and transcript_path are for the NEW session
-    # The OLD session's transcript is the most recently modified .jsonl in this project dir
+    # The OLD session's transcript is the most recently modified .jsonl in this project dir.
+    # KNOWN HEURISTIC (audit L3): with CONCURRENT sessions in one project dir,
+    # "2nd-most-recent transcript" can pick a live sibling's file — its metrics
+    # row is then written early (harmless: SessionEnd re-fires at its real end
+    # and last-write-wins dedup keeps the final row). Accepted; a real fix
+    # needs Claude Code to hand us the predecessor id.
     PROJECT_DIR_FOR_CLEAR="${CLAUDE_PROJECT_DIR:-$CWD}"
     CLAUDE_PROJ_DIR=$(echo "$PROJECT_DIR_FOR_CLEAR" | sed 's|/|-|g')
     OLD_TRANSCRIPT=$(ls -t "$HOME/.claude/projects/$CLAUDE_PROJ_DIR/"*.jsonl 2>/dev/null | head -2 | tail -1 || true)

@@ -213,6 +213,14 @@ def pin(repo_root=None, claude=None):
     json.loads(raw)                        # still valid after substitution
     bak = settings + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
     shutil.copy2(settings, bak)
+    # Keep the newest 3 backups (audit L6: they accumulated forever; the git
+    # snapshots either side of every apply are the real rollback story).
+    baks = sorted(f for f in os.listdir(claude) if f.startswith("settings.json.bak-"))
+    for stale in baks[:-3]:
+        try:
+            os.remove(os.path.join(claude, stale))
+        except OSError:
+            pass
     tmp = settings + ".tmp"
     with open(tmp, "w") as f:
         f.write(raw)

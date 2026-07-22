@@ -87,8 +87,15 @@ def test_pin_rewrites_settings_and_validates(monkeypatch):
         }
         with open(os.path.join(claude, "settings.json"), "w") as f:
             json.dump(settings, f)
+        # pre-plant stale backups: pin must keep only the newest 3 (audit L6)
+        for ts in ("20260101-000001", "20260101-000002", "20260101-000003"):
+            with open(os.path.join(claude, f"settings.json.bak-{ts}"), "w") as f:
+                f.write("{}")
         rc = synccmd.pin(repo, claude)
         assert rc == 0
+        baks = sorted(fn for fn in os.listdir(claude)
+                      if fn.startswith("settings.json.bak-"))
+        assert len(baks) == 3 and "settings.json.bak-20260101-000001" not in baks
         cfg = json.load(open(os.path.join(claude, "settings.json")))
         cmd = cfg["hooks"]["SessionStart"][0]["hooks"][0]["command"]
         assert "clanker-dist/session-start.sh" in cmd and repo not in cmd

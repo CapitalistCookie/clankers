@@ -1,5 +1,5 @@
 {
-  "description": "Clanker harness hooks \u2014 session tracking, alerts, briefings, skill monitoring, prompt analysis, subagent usage-limit auto-resume",
+  "description": "Clanker harness hooks \u2014 session tracking, alerts, briefings, skill monitoring, prompt analysis, subagent usage-limit auto-resume. PARTIAL INSTALL: this plugin manifest carries NO governance chain (no Stop dispatcher, no PreToolUse bash-dispatch, no memory-lint) \u2014 the full gated install is `clanker sync` from the repo.",
   "hooks": {
     "SessionStart": [
       {

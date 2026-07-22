@@ -79,7 +79,7 @@ def _extract_head(repo_root, dest):
     if r.returncode != 0:
         raise RuntimeError(f"git archive failed: {r.stderr.decode()[:200]}")
     with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
-        tf.extractall(dest)
+        tf.extractall(dest, filter="data")   # 3.14 default; explicit now (audit L5)
 
 
 def _manifest_prev(public, repo_root):

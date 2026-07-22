@@ -94,7 +94,8 @@ def load_sessions(last_days=7, dedup=True):
 
     Set dedup=False only to inspect the raw event stream.
     """
-    cutoff = datetime.utcnow() - timedelta(days=last_days)
+    from datetime import timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=last_days)
     cutoff_str = cutoff.strftime("%Y-%m-%d")
     sig = _sessions_signature()
     key = (sig[0], sig[1], last_days, dedup, cutoff_str)

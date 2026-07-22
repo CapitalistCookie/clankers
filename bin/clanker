@@ -99,8 +99,9 @@ def cmd_version(args):
         with open(plugin_json) as f:
             meta = _json.load(f)
         print(f"clanker v{meta['version']}")
-    except:
-        print("clanker v0.2.0")
+    except (OSError, ValueError, KeyError):
+        # plugin.json is the single version source; absent = detached install
+        print("clanker (version unknown — plugin.json missing)")
 
     from analyze import load_sessions
     from alerts import count_alerts
