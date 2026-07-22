@@ -7,6 +7,7 @@ and the only "sync" was luck. This module makes the repo the source of truth:
   repo hooks/          (repo-run set)      --apply--> ~/.claude/hooks/clanker-dist/
   repo hooks/harness/  (vendored generic)  --apply--> ~/.claude/hooks/
   repo hooks/context-gauge.py              --apply--> ~/.claude/hooks/context-gauge.py
+  repo lib/*.py        (hook import root)  --apply--> ~/.claude/hooks/lib/
 
   sync --check   parity table (sha256), exit 1 on any drift   [doctor runs this]
   sync --apply   install repo -> ~/.claude with git snapshots either side,
@@ -72,6 +73,20 @@ def _pairs(repo_root=None, claude=None):
                     or not os.path.isfile(src)):
                 continue
             yield ("harness", src, os.path.join(claude, "hooks", name))
+    # Dist hooks import repo modules via `$HOOK_DIR/../lib` — i.e.
+    # <claude>/hooks/lib when running from clanker-dist. Nothing shipped that
+    # dir, so after --pin (2026-07-19) every lib import in the dist set failed
+    # open: briefings, handoffs, and git-aware project resolution silently
+    # stopped (found 2026-07-22: newest handoff predated the pin). Ship the
+    # whole top level so cross-imports never need dependency-chasing;
+    # subpackages (orch/, ecc/) are CLI/dashboard-side, not hook-side.
+    lib = os.path.join(repo_root, "lib")
+    if os.path.isdir(lib):
+        for name in sorted(os.listdir(lib)):
+            src = os.path.join(lib, name)
+            if not name.endswith(".py") or not os.path.isfile(src):
+                continue
+            yield ("lib", src, os.path.join(claude, "hooks", "lib", name))
 
 
 def check(repo_root=None, claude=None, quiet=False):
@@ -142,7 +157,9 @@ def apply(repo_root=None, claude=None):
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
         os.chmod(dst, 0o755)
-        st = _selftest(dst)
+        # lib files are MODULES, not hooks — a "--selftest" string inside one
+        # is coincidental; executing `python3 <module> --selftest` proves nothing.
+        st = None if label == "lib" else _selftest(dst)
         if st is False:
             failures.append(dst)
             print(f"  INSTALLED  {os.path.basename(dst)}  — SELFTEST FAILED", file=sys.stderr)

@@ -12,6 +12,9 @@ INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || true)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+# SessionEnd's own reason (clear/logout/prompt_input_exit/other) — recorded as
+# end_reason so analytics can tell a /clear from a real exit (audit M4/P6).
+END_REASON=$(echo "$INPUT" | jq -r '.reason // empty' 2>/dev/null || true)
 
 # Bail if no transcript
 [ -z "$TRANSCRIPT" ] && exit 0
@@ -39,12 +42,12 @@ OUTFILE="$SESSIONS_DIR/$(date -u +%Y-%m-%d).jsonl"
 # the dashboard does (git-aware: worktrees collapse, repos outside ~/projects work).
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLANKER_LIB="$HOOK_DIR/../lib"
-export TRANSCRIPT SESSION_ID CWD CLANKER_LIB
+export TRANSCRIPT SESSION_ID CWD CLANKER_LIB HOOK_DIR END_REASON
 
 python3 -u << 'PYEOF' | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null
 import json, sys, os
 from datetime import datetime
-from collections import Counter
+from collections import Counter, deque
 
 transcript_path = os.environ.get("TRANSCRIPT", "")
 session_id = os.environ.get("SESSION_ID", "")
@@ -77,6 +80,8 @@ last_ts = None
 claude_version = None
 model_counter = Counter()
 flags = []
+last_assistant_text = None
+tail_lines = deque(maxlen=40)   # raw tail for failure-signature scan (P6)
 
 # Token tracking
 tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
@@ -91,6 +96,7 @@ has_deploy = False
 try:
     with open(transcript_path) as f:
         for line in f:
+            tail_lines.append(line)
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
@@ -193,6 +199,8 @@ try:
                     for item in msg2.get("content", []):
                         if isinstance(item, dict) and item.get("type") == "text":
                             text_parts.append(item.get("text", ""))
+                    if " ".join(text_parts).strip():
+                        last_assistant_text = " ".join(text_parts).strip()
                     full_text = " ".join(text_parts).lower()
                     arch_keywords = ["architecture", "design decision", "trade-off", "tradeoff",
                                      "decided to", "alternative was"]
@@ -213,6 +221,26 @@ if first_ts and last_ts:
         duration_s = int((t2 - t1).total_seconds())
     except:
         pass
+
+# ── Why did this session end? (P6, audit M4) ──────────────────────────────
+# failure_reason: first limit/API-error signature in the transcript TAIL —
+# the SAME catalog the subagent auto-resume detector matches (imported from
+# it: one source of truth, the two can't drift). Tail-only keeps sessions
+# that merely DISCUSS limits from matching on their own working text; a real
+# kill signature is terminal, so it lives in the last lines.
+failure_reason = None
+try:
+    import importlib.util
+    _sp = importlib.util.spec_from_file_location(
+        "_detect", os.path.join(os.environ.get("HOOK_DIR", ""), "subagent-resume-detect.py"))
+    _dm = importlib.util.module_from_spec(_sp)
+    _sp.loader.exec_module(_dm)
+    _signs = _dm.LIMIT_SIGNS
+except Exception:   # fail-open with the core signatures
+    _signs = ('"error":"rate_limit"', "hit your session limit", "usage limit",
+              "Rate limited", "Overloaded", '"status":429', '"status":529')
+_tail_blob = "".join(tail_lines)
+failure_reason = next((s for s in _signs if s in _tail_blob), None)
 
 # Determine outcome
 outcome = "unknown"
@@ -269,6 +297,9 @@ record = {
     "user_corrections": user_corrections,
     "subagent_count": subagent_count,
     "outcome": outcome,
+    "end_reason": os.environ.get("END_REASON") or None,
+    "failure_reason": failure_reason,
+    "last_assistant_line": " ".join(last_assistant_text.split())[:200] if last_assistant_text else None,
     "flags": flags,
     "tokens": tokens,
     "estimated_cost_usd": estimated_cost,
@@ -277,14 +308,21 @@ record = {
 print(json.dumps(record))
 PYEOF
 
-# Generate handoff
+# Generate handoff — env-passed, no shell interpolation into python (a quote
+# in $CWD used to break the block silently — audit L3). Carries the last
+# assistant line: post-crash briefings need "what was I doing", not just git
+# state (audit §6, folded into P6).
 if [ -n "$CWD" ] && [ -d "$CWD/.git" ]; then
-    python3 -c "
-import sys
-sys.path.insert(0, '$(dirname $(realpath $0))/../lib')
+    LAST_MSG="$(python3 "$HOOK_DIR/harness/last-assistant-msg.py" "$TRANSCRIPT" 2>/dev/null | head -c 400 || true)"
+    export LAST_MSG
+    python3 - <<'HEOF' 2>/dev/null || true
+import os, sys
+sys.path.insert(0, os.environ.get("CLANKER_LIB", ""))
 from handoff import generate_handoff
-generate_handoff('$SESSION_ID', '$(basename $CWD)', '$CWD')
-" 2>/dev/null || true
+cwd = os.environ.get("CWD", "")
+generate_handoff(os.environ.get("SESSION_ID", ""), os.path.basename(cwd), cwd,
+                 last_msg=os.environ.get("LAST_MSG") or None)
+HEOF
 fi
 
 # ── Memory safety net (2026-07-05, memory hardening): autocommit every memory

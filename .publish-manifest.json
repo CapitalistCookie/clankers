@@ -152,11 +152,12 @@
   "tests/test_reader.py",
   "tests/test_resume_queue.py",
   "tests/test_serve_state.py",
+  "tests/test_session_end.py",
   "tests/test_spa_js.py",
   "tests/test_synccmd.py",
   "tests/test_tmux_manager.py",
   "tests/test_webauth.py",
   "tools/archive-transcripts.sh"
  ],
- "source_commit": "c94d258"
+ "source_commit": "f09e41c"
 }

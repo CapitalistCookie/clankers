@@ -28,6 +28,14 @@ def _mk_repo(tmp):
         f.write("#!/bin/bash\nexit 0\n")
     with open(os.path.join(hooks, "harness", "MANIFEST.md"), "w") as f:
         f.write("# manifest — not a hook\n")
+    # lib modules ship to <claude>/hooks/lib (the dist hooks' import root).
+    # modlike.py would EXIT 1 if apply mistook its "--selftest" string for a
+    # real selftest and executed it — proves lib files skip the selftest path.
+    os.makedirs(os.path.join(root, "lib"))
+    with open(os.path.join(root, "lib", "handoff.py"), "w") as f:
+        f.write("def generate_handoff(*a, **kw):\n    return None\n")
+    with open(os.path.join(root, "lib", "modlike.py"), "w") as f:
+        f.write("import sys\nif '--selftest' in sys.argv:\n    sys.exit(1)\nX = 1\n")
     return root
 
 
@@ -39,14 +47,17 @@ def test_check_reports_missing_then_apply_reaches_parity():
         drifted, missing, total = synccmd.check(repo, claude, quiet=True)
         assert not drifted
         assert len(missing) == total  # nothing installed yet
-        assert total == len(synccmd.REPO_RUN) + 2  # + gauge + 1 harness hook
+        assert total == len(synccmd.REPO_RUN) + 4  # + gauge + 1 harness + 2 lib
 
         rc = synccmd.apply(repo, claude)
-        assert rc == 0
+        assert rc == 0  # also proves lib "--selftest" strings are NOT executed
         drifted, missing, _ = synccmd.check(repo, claude, quiet=True)
         assert not drifted and not missing
         # harness hook installed flat; repo-run under clanker-dist; manifest skipped
         assert os.path.exists(os.path.join(claude, "hooks", "generic-gate.sh"))
+        # lib modules land at <claude>/hooks/lib — the exact path the dist
+        # hooks resolve as $HOOK_DIR/../lib (dead 07-19→07-22, audit follow-up)
+        assert os.path.exists(os.path.join(claude, "hooks", "lib", "handoff.py"))
         assert os.path.exists(
             os.path.join(claude, "hooks", "clanker-dist", "session-start.sh"))
         assert not os.path.exists(os.path.join(claude, "hooks", "MANIFEST.md"))
