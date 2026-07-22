@@ -30,13 +30,16 @@ def generate_briefing(project, project_path=None):
                 ["git", "-C", project_path, "status", "--short"],
                 stderr=subprocess.DEVNULL, text=True
             ).strip()
-            unpushed = subprocess.check_output(
-                ["git", "-C", project_path, "rev-list", "--count", "@{upstream}..HEAD"],
-                stderr=subprocess.DEVNULL, text=True
-            ).strip()
+            try:
+                unpushed = subprocess.check_output(
+                    ["git", "-C", project_path, "rev-list", "--count", "@{upstream}..HEAD"],
+                    stderr=subprocess.DEVNULL, text=True
+                ).strip()
+            except subprocess.CalledProcessError:
+                unpushed = "0"  # no upstream configured: don't drop the whole section
 
             git_section = f"Branch: {branch}"
-            if int(unpushed) > 0:
+            if int(unpushed or "0") > 0:
                 git_section += f" ({unpushed} unpushed)"
             if dirty:
                 dirty_count = len(dirty.split("\n"))

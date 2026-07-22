@@ -18,6 +18,7 @@
   "docs/ECC-feature-mining.md",
   "docs/MOBILE-READER.md",
   "docs/PLATFORM_INDEPENDENCE.md",
+  "docs/audit-2026-07-22-harness-governance.md",
   "hooks/agent-resume-surface.sh",
   "hooks/context-gauge.py",
   "hooks/harness/MANIFEST.md",
@@ -129,6 +130,7 @@
   "tests/fixtures/registry.yaml",
   "tests/test_adopt.py",
   "tests/test_all.py",
+  "tests/test_briefing.py",
   "tests/test_cli.py",
   "tests/test_ecc_budget.py",
   "tests/test_ecc_guard.py",
@@ -155,5 +157,5 @@
   "tests/test_webauth.py",
   "tools/archive-transcripts.sh"
  ],
- "source_commit": "0ca3f75"
+ "source_commit": "ff4c3ad"
 }

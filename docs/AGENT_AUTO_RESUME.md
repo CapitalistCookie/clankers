@@ -47,15 +47,27 @@ committed** so it *completes from there* — never restarts from scratch. Pair t
 with **per-step commits** in your subagents (one commit per task / User Story) so a
 limit-kill never loses more than the single in-flight step.
 
-After you've re-dispatched a queued entry, clear it: `: > ~/.claude/agent_resume_queue.jsonl`
-(clear only entries you've handled — the queue is shared).
+After you've re-dispatched **this project's** entries, clear them with the
+project-scoped command — it removes only your project's pending entries (under the
+writer-shared lock) and leaves every other project's untouched:
+
+```bash
+bash ~/.claude/hooks/clanker-dist/agent-resume-surface.sh --clear
+```
+
+**Never** truncate the file (`: > ~/.claude/agent_resume_queue.jsonl`): the queue is
+shared across ~49 sessions, so a global truncate erases every other project's pending
+re-dispatches — the exact bug that silently ate a queued request on 2026-07-17 (fixed
+in `hooks/agent-resume-surface.sh`; the SessionStart banner now prints the `--clear`
+command above).
 
 ## Shared-environment note
 
 Multiple Claude sessions can share this box — and sometimes a repo / working tree /
 the global resume queue. Don't reset or force-push a shared branch, or clobber
 another session's uncommitted files, without coordinating. The queue at
-`~/.claude/agent_resume_queue.jsonl` is shared across sessions.
+`~/.claude/agent_resume_queue.jsonl` is shared across sessions — clear it only with
+the project-scoped `--clear` above, never a global truncate.
 
 ## Paste-ready broadcast for other sessions
 
