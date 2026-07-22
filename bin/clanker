@@ -70,7 +70,15 @@ def cmd_orch(args):
     sys.exit(orch_cli.run(args))
 
 def cmd_propose(args):
-    from propose import generate_proposals, expire_stale
+    from propose import generate_proposals, expire_stale, add_proposal, resolve_proposal
+    if args.add:
+        if not (args.project and args.desc and args.impact):
+            print("propose --add requires --project, --desc and --impact", file=sys.stderr)
+            return 1
+        return 0 if add_proposal(args.project, args.desc, args.impact,
+                                 ptype=args.type) else 1
+    if args.resolve:
+        return resolve_proposal(args.resolve, status=args.status, note=args.note)
     if getattr(args, 'expire_before', None):
         expire_stale(before=args.expire_before, reason=args.reason)
         return
@@ -681,11 +689,23 @@ def main():
     p.add_argument('--json', action='store_true')
     p.set_defaults(func=cmd_analyze)
 
-    p = sub.add_parser('propose', help='Generate proposals (auto-expires pending >30d first)')
+    p = sub.add_parser('propose', help='Generate proposals (auto-expires pending >30d first); --add files one by hand; --resolve closes one')
     p.add_argument('--from-retro', action='store_true')
     p.add_argument('--expire-before', default=None, metavar='YYYY-MM-DD',
                    help='ONLY expire pending proposals older than this date (no generation)')
     p.add_argument('--reason', default=None, help='reason recorded on expired proposals')
+    p.add_argument('--add', action='store_true',
+                   help='file a manual proposal (requires --project, --desc, --impact)')
+    p.add_argument('--project', default=None, help='project the proposal belongs to')
+    p.add_argument('--desc', default=None, help='what should change and why')
+    p.add_argument('--impact', default=None, help='expected impact when implemented')
+    p.add_argument('--type', default='manual', help='proposal type slug (default: manual)')
+    p.add_argument('--resolve', default=None, metavar='ID_OR_SUBSTR',
+                   help='mark a proposal implemented/rejected (exact id, or substring matching one open proposal)')
+    p.add_argument('--status', default='implemented',
+                   choices=['implemented', 'accepted', 'rejected'],
+                   help='status --resolve records (default: implemented)')
+    p.add_argument('--note', default='', help='note appended on --resolve')
     p.set_defaults(func=cmd_propose)
 
     p = sub.add_parser('autonomy', help='Autonomy scoreboard — hands-off %% of sessions, intervention rate, where Claude needs you')

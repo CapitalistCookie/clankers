@@ -1,7 +1,9 @@
-"""Proposal ledger — generate, review, accept/reject."""
+"""Proposal ledger — generate, file manually, review, accept/reject/resolve."""
 
 import json
 import os
+import re
+import sys
 from datetime import datetime
 
 DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
@@ -9,18 +11,25 @@ LEDGER_PATH = os.path.join(DATA_DIR, "proposals/ledger.jsonl")
 
 
 def _read_ledger():
-    """Read all proposals, last-write-wins by ID."""
+    """Read all proposals, last-write-wins by ID. Corrupt lines are counted
+    and reported to stderr, never silently swallowed (audit L7 — a bare
+    except here was silent data loss in the improvement pipeline)."""
     proposals = {}
+    bad = 0
     if os.path.exists(LEDGER_PATH):
         with open(LEDGER_PATH) as f:
             for line in f:
                 line = line.strip()
-                if line:
-                    try:
-                        p = json.loads(line)
-                        proposals[p["id"]] = p
-                    except:
-                        pass
+                if not line:
+                    continue
+                try:
+                    p = json.loads(line)
+                    proposals[p["id"]] = p
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    bad += 1
+    if bad:
+        print(f"propose: WARNING — {bad} corrupt ledger line(s) skipped "
+              f"({LEDGER_PATH})", file=sys.stderr)
     return proposals
 
 
@@ -64,6 +73,74 @@ def expire_stale(days=30, before=None, reason=None):
     if n:
         print(f"expired {n} stale pending proposal(s)")
     return n
+
+
+def add_proposal(project, description, impact, ptype="manual", source="manual"):
+    """File a proposal by hand — schema-faithful to the generated entries
+    (audit L7: the 07-22 audit had to append raw JSON to the ledger to file
+    the very proposals this verb now files). Returns the id, or None on a
+    duplicate."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    slug = re.sub(r"[^a-z0-9]+", "-", (description or "").lower()).strip("-")[:40] or "manual"
+    prop_id = f"prop-{today}-{project}-{slug}"
+    if prop_id in _read_ledger():
+        print(f"propose: {prop_id} already exists — not duplicated", file=sys.stderr)
+        return None
+    _append_ledger({
+        "id": prop_id,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": source,
+        "source_session": None,
+        "project": project,
+        "type": ptype,
+        "description": description,
+        "expected_impact": impact,
+        "status": "pending",
+        "decided_at": None,
+        "decided_by": None,
+        "implemented_at": None,
+        "baseline_metric": None,
+        "actual_metric": None,
+        "notes": "",
+    })
+    print(f"FILED: {prop_id}")
+    return prop_id
+
+
+def resolve_proposal(query, status="implemented", note=""):
+    """Mark a proposal implemented/rejected by exact id, else by a substring
+    that matches exactly ONE non-terminal proposal. Appends the updated row
+    (last-write-wins). Exit-code honest: 0 on success, 1 otherwise."""
+    if status not in ("implemented", "accepted", "rejected"):
+        print(f"propose: invalid --status '{status}'", file=sys.stderr)
+        return 1
+    props = _read_ledger()
+    if query in props:
+        matches = [query]
+    else:
+        matches = [pid for pid, p in props.items()
+                   if query in pid and p.get("status") in ("pending", "accepted")]
+    if not matches:
+        print(f"propose: no open proposal matches '{query}'", file=sys.stderr)
+        return 1
+    if len(matches) > 1:
+        print(f"propose: '{query}' is ambiguous ({len(matches)} matches):",
+              file=sys.stderr)
+        for pid in sorted(matches):
+            print(f"  {pid}", file=sys.stderr)
+        return 1
+    pid = matches[0]
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    update = {**props[pid], "status": status, "decided_at": props[pid].get("decided_at") or now,
+              "decided_by": props[pid].get("decided_by") or "user"}
+    if status == "implemented":
+        update["implemented_at"] = now
+    if note:
+        update["notes"] = (update.get("notes") or "")
+        update["notes"] = (update["notes"] + " | " if update["notes"] else "") + note
+    _append_ledger(update)
+    print(f"{status.upper()}: {pid}")
+    return 0
 
 
 def generate_proposals(from_retro=False):
