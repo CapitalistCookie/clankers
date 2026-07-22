@@ -1,0 +1,11 @@
+# Acknowledged HISTORICAL findings only — never ignore a finding in the working
+# tree (fix the file instead; the publish gate scans HEAD content with --no-git
+# and is not affected by this file). Fingerprint = commit:file:rule:line.
+#
+# 4e6744e (2026-07-19) committed a synthetic gitlab-pat-shaped fixture in
+# test_adopt.py before the fixture was normalized to the allowlisted
+# glpat-A{20} shape (d02ae40 era). The value was invented for the test, never
+# a real credential; purging it would mean rewriting 15 commits of published
+# main history. This single-occurrence ignore kept the gitlab-pat rule LIVE —
+# unlike widening the .gitleaks.toml allowlist regex would have.
+4e6744ea22bb8d5654ca6f7c8f7b3a01482ad309:tests/test_adopt.py:gitlab-pat:53

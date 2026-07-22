@@ -4,9 +4,14 @@ Pure-function tests: pane-tail fixtures modeled on real Claude Code rest
 states (permission dialog, AskUserQuestion options, usage-limit banner,
 API-error banner, plain finished prompt)."""
 
+import asyncio
+import json
 import os
 import sys
 import tempfile
+
+import pytest
+from aiohttp import web
 
 # Same import-time isolation dance as test_webauth.py, for the same reason:
 # importing serve pulls in webauth, which captures CLANKER_DATA into module
@@ -18,8 +23,11 @@ _OLD_DATA = os.environ.get("CLANKER_DATA")
 os.environ["CLANKER_DATA"] = tempfile.mkdtemp(prefix="clk-servestate-test-")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from serve import (  # noqa: E402
+    BUILD_ID,
+    auth_middleware,
     classify_rest_state,
     classify_working_state,
+    handle_healthz,
     _craft_notification,
     _last_activity_line,
 )
@@ -149,3 +157,32 @@ def test_craft_priorities_and_titles():
     t, p, _, body = _craft_notification("eigenstate", PLAIN_PROMPT)
     assert p == "high" and "your turn" in t
     assert "Done" in body  # the content line, not a box-drawing row
+
+
+# ── /healthz: the unauthenticated liveness probe ──
+
+def test_healthz_returns_200_with_build_id():
+    resp = asyncio.run(handle_healthz(None))
+    assert resp.status == 200
+    assert json.loads(resp.body.decode()) == {"ok": True, "build": BUILD_ID}
+
+
+def test_healthz_bypasses_auth_but_nothing_else_does():
+    """auth_middleware must let /healthz through cookie-less, while /api/*
+    still 401s and page paths still redirect — the exemption is exact-match,
+    not a prefix that could widen."""
+    class _Req:
+        def __init__(self, path):
+            self.path = path
+            self.cookies = {}
+
+    async def handler(request):
+        return "reached"
+
+    assert asyncio.run(auth_middleware(_Req("/healthz"), handler)) == "reached"
+    with pytest.raises(web.HTTPUnauthorized):
+        asyncio.run(auth_middleware(_Req("/api/status"), handler))
+    with pytest.raises(web.HTTPFound):
+        asyncio.run(auth_middleware(_Req("/"), handler))
+    with pytest.raises(web.HTTPFound):
+        asyncio.run(auth_middleware(_Req("/healthz2"), handler))

@@ -197,7 +197,8 @@ async def auth_middleware(request, handler):
     """Only a valid signed session cookie grants access. The cookie is issued
     solely by handle_login_submit after a successful username + password + TOTP
     login. No token bypass, no OAuth, no trusted header."""
-    if request.path.startswith("/auth/") or request.path.startswith("/vendor/"):
+    if (request.path == "/healthz" or request.path.startswith("/auth/")
+            or request.path.startswith("/vendor/")):
         return await handler(request)
 
     cookie = request.cookies.get("clanker_session")
@@ -210,6 +211,15 @@ async def auth_middleware(request, handler):
     if request.path.startswith("/ws/") or request.path.startswith("/api/"):
         raise web.HTTPUnauthorized(text="Not authenticated")
     raise web.HTTPFound("/auth/login")
+
+
+async def handle_healthz(request):
+    """GET /healthz — unauthenticated liveness probe. Before this the only
+    unauthenticated response was the login redirect (302), which proves the
+    process accepts sockets but nothing else — the iron-law deploy check
+    (service active + healthz 200 + build advanced) had no real target.
+    Returns the running BUILD_ID so a restart-after-deploy is provable."""
+    return web.json_response({"ok": True, "build": BUILD_ID})
 
 
 # ── Login: username + password + TOTP (RFC 6238) ──
@@ -2108,6 +2118,7 @@ def create_app():
 
     app = web.Application(middlewares=middlewares)
     app.router.add_get("/", handle_index)
+    app.router.add_get("/healthz", handle_healthz)   # unauthenticated (see auth_middleware)
     app.router.add_get("/api/status", handle_status)
     app.router.add_get("/api/panes", handle_panes)
     app.router.add_get("/api/reader/{session}", handle_reader)

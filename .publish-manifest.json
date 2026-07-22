@@ -8,6 +8,7 @@
   ".claude-plugin/plugin.json",
   ".gitignore",
   ".gitleaks.toml",
+  ".gitleaksignore",
   "bin/clanker",
   "ci/fast.sh",
   "ci/full.sh",
@@ -146,6 +147,7 @@
   "tests/test_projects.py",
   "tests/test_publishcmd.py",
   "tests/test_reader.py",
+  "tests/test_resume_queue.py",
   "tests/test_serve_state.py",
   "tests/test_spa_js.py",
   "tests/test_synccmd.py",
@@ -153,5 +155,5 @@
   "tests/test_webauth.py",
   "tools/archive-transcripts.sh"
  ],
- "source_commit": "0a3afcd"
+ "source_commit": "6991911"
 }

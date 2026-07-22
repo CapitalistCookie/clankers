@@ -29,6 +29,7 @@ Usage:
                          --result-file <notif-output> --prompt-file <orig-prompt> \
                          --cwd <agent-cwd> --branch <worktree-branch>
 """
+import fcntl
 import json
 import os
 import re
@@ -117,22 +118,11 @@ def _branch_from_cwd(cwd):
 
 
 def _queue_entry(prompt, branch, cwd, reset, tp, source):
-    # DEDUPE (2026-07-05): the same limit-killed agent can trip this hook repeatedly
-    # (retries, staged re-dispatches that die on the same limit) — before this check
-    # one ISD task stacked NINE identical pending entries. Same (cwd, prompt) already
-    # pending → don't append another copy.
-    try:
-        if QUEUE.exists():
-            key = (cwd or "", (prompt or "")[:8000])
-            for line in QUEUE.read_text(errors="ignore").splitlines():
-                try:
-                    e = json.loads(line)
-                except Exception:
-                    continue
-                if e.get("status") == "pending" and (e.get("cwd", ""), e.get("prompt", "")) == key:
-                    return True  # identical pending entry exists — queued state already correct
-    except Exception:
-        pass  # dedupe is best-effort; never block the queue write
+    """Dedupe-check + append under an exclusive flock on QUEUE.lock — the same
+    lock agent-resume-surface.sh --clear takes for its scoped rewrite. Without
+    it a mass resume (the 2026-07-22 host-OOM killed ~49 sessions at once) can
+    interleave a clear's read-filter-replace with this read-dedupe-append and
+    drop or duplicate entries."""
     entry = {
         "queued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "status": "pending", "reason": "usage/rate limit",
@@ -142,8 +132,29 @@ def _queue_entry(prompt, branch, cwd, reset, tp, source):
     }
     try:
         QUEUE.parent.mkdir(parents=True, exist_ok=True)
-        with QUEUE.open("a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        with open(str(QUEUE) + ".lock", "a") as lk:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX)
+            except Exception:
+                pass  # locking is best-effort (exotic fs) — never block the write
+            # DEDUPE (2026-07-05): the same limit-killed agent can trip this hook
+            # repeatedly (retries, staged re-dispatches that die on the same limit)
+            # — before this check one ISD task stacked NINE identical pending
+            # entries. Same (cwd, prompt) already pending → don't append a copy.
+            try:
+                if QUEUE.exists():
+                    key = (cwd or "", (prompt or "")[:8000])
+                    for line in QUEUE.read_text(errors="ignore").splitlines():
+                        try:
+                            e = json.loads(line)
+                        except Exception:
+                            continue
+                        if e.get("status") == "pending" and (e.get("cwd", ""), e.get("prompt", "")) == key:
+                            return True  # identical pending entry exists — queued state already correct
+            except Exception:
+                pass  # dedupe is best-effort; never block the queue write
+            with QUEUE.open("a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception:
         return False
     return True
