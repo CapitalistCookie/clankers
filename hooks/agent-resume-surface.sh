@@ -19,6 +19,16 @@
 # only THIS project's pending entries (flock'd, atomic rewrite) and the banner
 # instructs exactly that command. Both writers share the same $Q.lock flock —
 # see _queue_entry in subagent-resume-detect.py.
+#
+# ROOT-SCOPED v2.1 (2026-07-22, same day): the prefix rule ALSO let an ANCESTOR
+# session swallow other projects — HERE=$HOME matches every cwd on the box, so
+# the home session was surfaced (and with scoped clear would have DELETED) every
+# project's entries. Ownership is now git-root equality (linked worktrees
+# resolve to the parent repo via --git-common-dir; submodules to their own
+# toplevel) — the same convention as the memory namespace (lib/memoryns.py).
+# The under-$HERE prefix match survives ONLY for cwds not inside any git repo
+# (scratch dirs have no scope of their own -> the nearest ancestor session owns
+# them). Non-existent cwds fall back to pure path logic.
 set -u
 Q="${CLANKER_RESUME_QUEUE:-$HOME/.claude/agent_resume_queue.jsonl}"
 HERE="${CLAUDE_PROJECT_DIR:-$PWD}"
@@ -26,12 +36,43 @@ SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 # One shared shown/cleared predicate (mode = count | list | clear) so display and
 # clear can never drift on which entries belong to this project. An entry is OURS
-# iff pending AND (its cwd equals / lives under $HERE, or either side is unscoped).
-# Path match is component-wise: /proj/ab is NOT under /proj/a.
+# iff pending AND: same git root as $HERE (worktree-aware), OR its cwd lives
+# under $HERE while inside NO git repo (scratch reclaim), OR either side is
+# unscoped. Path match is component-wise: /proj/ab is NOT under /proj/a.
 _scan() {  # $1 = mode
 python3 - "$1" "$Q" "$HERE" <<'PY'
-import json, os, sys
+import json, os, subprocess, sys
 mode, q, here = sys.argv[1], sys.argv[2], sys.argv[3]
+_roots = {}
+
+def _root_info(p):
+    """(scope_root, is_repo) for path p. scope_root = MAIN repo toplevel (linked
+    worktrees resolve to the parent repo via --git-common-dir; submodules to
+    their own toplevel); the realpath itself when p is inside no git repo."""
+    rp = os.path.realpath(p)
+    if rp in _roots:
+        return _roots[rp]
+    root, is_repo = rp, False
+    try:
+        r = subprocess.run(
+            ["git", "-C", rp, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            gd = r.stdout.strip()
+            if not os.path.isabs(gd):
+                gd = os.path.join(rp, gd)
+            gd = os.path.realpath(gd)
+            if os.path.basename(gd) == ".git":
+                root, is_repo = os.path.dirname(gd), True
+            else:  # submodule / detached git-dir: own toplevel
+                t = subprocess.run(["git", "-C", rp, "rev-parse", "--show-toplevel"],
+                                   capture_output=True, text=True, timeout=3)
+                if t.returncode == 0 and t.stdout.strip():
+                    root, is_repo = os.path.realpath(t.stdout.strip()), True
+    except Exception:
+        pass
+    _roots[rp] = (root, is_repo)
+    return _roots[rp]
 
 def mine(e):
     if e.get("status") != "pending":
@@ -40,7 +81,14 @@ def mine(e):
     if not (here and cwd):
         return True          # unscoped entry or unscoped session: surface everywhere
     h = here.rstrip("/")
-    return cwd == h or cwd.startswith(h + "/")
+    if _root_info(cwd)[0] == _root_info(h)[0]:
+        return True          # same project/repo (linked worktrees -> parent repo)
+    # Under-$HERE reclaim, for NON-repo cwds only: a scratch dir has no scope of
+    # its own, so the nearest ancestor session owns it. A cwd inside a different
+    # repo belongs to THAT project even when it lives under $HERE — this is the
+    # $HOME-swallow fix (07-22: a home session was handed, and scoped clear would
+    # have deleted, every project's entries on the box).
+    return (cwd == h or cwd.startswith(h + "/")) and not _root_info(cwd)[1]
 
 try:
     lines = open(q, errors="ignore").read().splitlines()
@@ -132,6 +180,35 @@ if [ "${1:-}" = "--selftest" ]; then
   grep -q "not json garbage" "$CLANKER_RESUME_QUEUE" && ok || bad "clear dropped an unparseable line"
   out2="$(CLAUDE_PROJECT_DIR=/proj/b bash "$SELF")"
   echo "$out2" | grep -q "task B bravo" && ok || bad "other project no longer surfaces its entry"
+
+  # ── v2.1 git-root cases (real dirs): an ANCESTOR session must not swallow
+  # repos under it (the $HOME-swallow incident), must still reclaim non-repo
+  # scratch dirs, and linked worktrees must map to the parent repo's scope.
+  RT="$T/root"; mkdir -p "$RT/scratch/sub"
+  git init -q "$RT/repo1" \
+    && git -C "$RT/repo1" -c user.name=t -c user.email=t@t commit -q --allow-empty -m x \
+    && git -C "$RT/repo1" worktree add -q "$RT/repo1-wt" >/dev/null 2>&1 \
+    || bad "git fixture scaffold failed"
+  {
+    printf '{"status":"pending","cwd":"%s","prompt":"task R1 in-repo","reason":"oom-kill"}\n' "$RT/repo1"
+    printf '{"status":"pending","cwd":"%s","prompt":"task R1WT worktree","reason":"usage/rate limit"}\n' "$RT/repo1-wt"
+    printf '{"status":"pending","cwd":"%s","prompt":"task SCR scratch-under-root"}\n' "$RT/scratch/sub"
+  } > "$CLANKER_RESUME_QUEUE"
+  out3="$(CLAUDE_PROJECT_DIR="$RT" bash "$SELF")"   # ancestor of repo1 AND scratch
+  echo "$out3" | grep -q "task SCR" && ok || bad "ancestor reclaims non-repo scratch subdir"
+  echo "$out3" | grep -q "task R1 in-repo" && bad "HOME-swallow: ancestor surfaced a repo's entry" || ok
+  echo "$out3" | grep -q "task R1WT" && bad "HOME-swallow: ancestor surfaced a worktree entry" || ok
+  out4="$(CLAUDE_PROJECT_DIR="$RT/repo1" bash "$SELF")"
+  echo "$out4" | grep -q "task R1 in-repo" && ok || bad "repo session surfaces its entry"
+  echo "$out4" | grep -q "task R1WT" && ok || bad "repo session surfaces its linked-worktree entry"
+  echo "$out4" | grep -q "task SCR" && bad "repo session leaked ancestor scratch entry" || ok
+  out5="$(CLAUDE_PROJECT_DIR="$RT/repo1-wt" bash "$SELF")"
+  echo "$out5" | grep -q "task R1 in-repo" && ok || bad "worktree session maps to parent repo scope"
+  CLAUDE_PROJECT_DIR="$RT" bash "$SELF" --clear >/dev/null || bad "ancestor clear exited nonzero"
+  grep -q "task R1 in-repo" "$CLANKER_RESUME_QUEUE" && ok || bad "ancestor clear DELETED a repo's pending entry"
+  grep -q "task R1WT" "$CLANKER_RESUME_QUEUE" && ok || bad "ancestor clear DELETED a worktree entry"
+  grep -q "task SCR" "$CLANKER_RESUME_QUEUE" && bad "ancestor clear left its own scratch entry" || ok
+
   total=$((pass+fail))
   if [ "$fail" -eq 0 ]; then echo "selftest: $pass/$total PASS"; exit 0
   else echo "selftest: $pass/$total pass — $fail FAILURE(S)"; exit 1; fi

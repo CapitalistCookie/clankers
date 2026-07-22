@@ -37,7 +37,8 @@ import sys
 import time
 from pathlib import Path
 
-QUEUE = Path(os.path.expanduser("~/.claude/agent_resume_queue.jsonl"))
+QUEUE = Path(os.environ.get("CLANKER_RESUME_QUEUE")
+             or os.path.expanduser("~/.claude/agent_resume_queue.jsonl"))
 # rate-limit / session-limit signatures (transcript JSON + the rendered text)
 LIMIT_SIGNS = ('"error":"rate_limit"', '"apiErrorStatus":429', '"status":429',
                "hit your session limit", "usage limit", "rate_limit_error",
@@ -201,6 +202,16 @@ def main():
     # false "killed subagent" pile-up during heavy multi-agent research waves. Skip any agent whose transcript
     # lives under a workflow run dir.
     if tp and "/subagents/workflows/" in tp:
+        return 0
+    # MAIN-SESSION EXCLUSION (2026-07-22): during the host-OOM mass restart this
+    # hook queued ROOT SESSION prompts as "killed subagents" twice in one morning
+    # (clanker's audit prompt, yonlaptop's rustdesk prompt) — the events carried
+    # the PARENT transcript, whose first substantive user message is the
+    # operator's own request, and the "killed" sessions were in fact resuming
+    # and finishing their work. Real Task-tool subagent transcripts are
+    # agent-*.jsonl (the same convention lib/reader.py resolves sessions by); a
+    # non-agent transcript here is a resume artifact, not a killed subagent.
+    if tp and not os.path.basename(tp).startswith("agent-"):
         return 0
     text = ""
     if tp and os.path.exists(tp):
