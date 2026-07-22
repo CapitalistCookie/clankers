@@ -159,7 +159,8 @@
   "tests/test_synccmd.py",
   "tests/test_tmux_manager.py",
   "tests/test_webauth.py",
-  "tools/archive-transcripts.sh"
+  "tools/archive-transcripts.sh",
+  "tools/hooktax.sh"
  ],
- "source_commit": "8fefec2"
+ "source_commit": "c715c01"
 }

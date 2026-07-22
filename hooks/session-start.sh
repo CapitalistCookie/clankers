@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # SessionStart briefing hook. Fail-OPEN by design: a briefing failure must
 # never break session start, so no `set -e` — every substitution is guarded.
+#
+# PERF (P11, 2026-07-22): everything python runs in ONE interpreter at the end
+# (stub row, archetype, env-file exports, alerts, briefing, final JSON) —
+# the old shape spawned 4+ serial interpreters plus one jq PER alert file.
+# Measured with the hook-tax harness: 338ms → see commit for the after number.
+# Each piece is individually try/except'd inside the block, so per-piece
+# degradation matches the old one-process-per-piece behavior.
 set -uo pipefail
 
 CLANKER_DATA="${CLANKER_DATA:-/data/clanker}"
 CLANKER_REGISTRY="${CLANKER_REGISTRY:-$HOME/projects/.clanker.yaml}"
 # Claude Code's namespace slug for $HOME (slashes/dots become dashes)
 HOME_SLUG="${HOME//[\/.]/-}"
-
-ALERTS_DIR="$CLANKER_DATA/alerts"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Read hook input from stdin
+# Read hook input from stdin — ONE jq pass for all fields (was one per field)
 INPUT=$(cat)
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
+IFS=$'\t' read -r CWD SOURCE SESSION_ID < <(
+    echo "$INPUT" | jq -r '[.cwd // "", .source // "", .session_id // ""] | @tsv' 2>/dev/null
+) || true
+CWD="${CWD:-}"; SOURCE="${SOURCE:-}"; SESSION_ID="${SESSION_ID:-}"
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$CWD}"
 
 # --- 0. On /clear, extract metrics from the PREVIOUS session ---
-SOURCE=$(echo "$INPUT" | jq -r '.source // empty' 2>/dev/null || true)
-
 if [ "$SOURCE" = "clear" ]; then
     # /clear was invoked — the session_id and transcript_path are for the NEW session
     # The OLD session's transcript is the most recently modified .jsonl in this project dir
@@ -32,95 +38,11 @@ if [ "$SOURCE" = "clear" ]; then
         bash "$(dirname "${BASH_SOURCE[0]}")/session-end.sh" < <(
             echo "{\"session_id\":\"$OLD_SESSION_ID\",\"transcript_path\":\"$OLD_TRANSCRIPT\",\"cwd\":\"$CWD\"}"
         ) 2>/dev/null &
+        SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
     fi
 fi
 
-# --- 0b. Heartbeat stub row (P7, audit M4): a long-lived session must EXIST in
-# telemetry before it dies — 07-20/21 had ~49 live sessions and ZERO rows, so
-# cost/error analytics silently excluded the fleet's steady state. SessionEnd's
-# full record supersedes this stub via consumers' last-write-wins dedup
-# (analyze.load_sessions); a stub with no matching final row = still running.
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
-if [ -n "$SESSION_ID" ]; then
-    SESSIONS_DIR="$CLANKER_DATA/raw/sessions"
-    mkdir -p "$SESSIONS_DIR" 2>/dev/null || true
-    OUTFILE="$SESSIONS_DIR/$(date -u +%Y-%m-%d).jsonl"
-    export SESSION_ID CWD SOURCE
-    CLANKER_LIB="$SCRIPT_DIR/../lib" python3 - <<'PY' 2>/dev/null | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null || true
-import json, os, sys, time
-cwd = os.environ.get("CWD", "")
-project = "global"
-try:
-    sys.path.insert(0, os.environ.get("CLANKER_LIB", ""))
-    from projects import resolve_project
-    project = resolve_project(cwd)
-except Exception:
-    _root = os.path.expanduser("~/projects/")
-    if _root in cwd:
-        project = cwd.split(_root)[-1].split("/")[0]
-print(json.dumps({
-    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "session_id": os.environ.get("SESSION_ID", ""),
-    "project": project,
-    "cwd": cwd,
-    "outcome": "open",
-    "source": os.environ.get("SOURCE", "") or None,
-}))
-PY
-fi
-
-# --- 1. Determine project and archetype ---
-PROJECT=""
-ARCHETYPE=""
-if [ -n "$PROJECT_DIR" ] && [ -f "$CLANKER_REGISTRY" ]; then
-    PROJECT=$(basename "$PROJECT_DIR")
-    ARCHETYPE=$(python3 -c "
-import yaml, sys
-try:
-    with open('$CLANKER_REGISTRY') as f:
-        reg = yaml.safe_load(f)
-    p = reg.get('projects', {}).get('$PROJECT', {})
-    print(p.get('archetype', 'unknown'))
-except:
-    print('unknown')
-" 2>/dev/null || true)
-fi
-
-# --- 2. Set env vars for downstream hooks ---
-if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
-    [ -n "$PROJECT" ] && echo "export CLANKER_PROJECT=$PROJECT" >> "$CLAUDE_ENV_FILE"
-    [ -n "$ARCHETYPE" ] && echo "export CLANKER_ARCHETYPE=$ARCHETYPE" >> "$CLAUDE_ENV_FILE"
-fi
-
-# --- 3. Check for active alerts ---
-ALERT_MSG=""
-if [ -d "$ALERTS_DIR" ]; then
-    ALERT_COUNT=$(find "$ALERTS_DIR" -name "*.json" -type f 2>/dev/null | wc -l)
-    if [ "$ALERT_COUNT" -gt 0 ]; then
-        ALERT_MSG="CLANKER ALERTS ($ALERT_COUNT active):\\n"
-        for alert_file in "$ALERTS_DIR"/*.json; do
-            [ -f "$alert_file" ] || continue
-            severity=$(jq -r '.severity // "info"' "$alert_file" 2>/dev/null)
-            message=$(jq -r '.message // "unknown alert"' "$alert_file" 2>/dev/null)
-            ALERT_MSG="${ALERT_MSG}  [${severity}] ${message}\\n"
-        done
-    fi
-fi
-
-# --- 4. Generate project briefing ---
-BRIEFING=""
-if [ -n "$PROJECT" ] && [ "$PROJECT" != "unknown" ] && [ -d "$PROJECT_DIR" ]; then
-    BRIEFING=$(python3 -c "
-import sys
-sys.path.insert(0, '$SCRIPT_DIR/../lib')
-from briefing import generate_briefing
-b = generate_briefing('$PROJECT', '$PROJECT_DIR')
-if b:
-    print(b)
-" 2>/dev/null || true)
-fi
-
-# --- 4b. Run codebase indexer if project has one ---
+# --- 1. Run codebase indexer if project has one (backgrounded) ---
 if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
     if [ -f "$PROJECT_DIR/docs/codebase-index/generate.py" ]; then
         python3 "$PROJECT_DIR/docs/codebase-index/generate.py" \
@@ -132,7 +54,7 @@ if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
     fi
 fi
 
-# --- 4b2. Memory index self-heal (memory hardening 2026-07-05): if MEMORY.md
+# --- 2. Memory index self-heal (memory hardening 2026-07-05): if MEMORY.md
 # changed since INDEX_ALL.md was generated (e.g. a bash-path write slipped past
 # the lint hook, or a file was rm'd), regenerate the inventory and surface the
 # orphan count. Covers BOTH the global router dir and this session's namespace.
@@ -160,7 +82,7 @@ if [ -x "$LINT" ] || [ -f "$LINT" ]; then
     done
 fi
 
-# --- 4c. STATUS.md + recent git log injection (harness overhaul M4, 2026-07-05) ---
+# --- 3. STATUS.md + recent git log injection (harness overhaul M4, 2026-07-05) ---
 # The cold-start contract: a session launched in a repo sees the repo's live state
 # without any pasted handoff. Cheap + bounded (head -30 / log -5).
 STATUS_MSG=""
@@ -174,26 +96,112 @@ $(git -C "$PROJECT_DIR" log --oneline -5 2>/dev/null)"
     fi
 fi
 
-# --- 5. Output ---
-FULL_MSG=""
-[ -n "$ALERT_MSG" ] && FULL_MSG="$ALERT_MSG"
-[ -n "$BRIEFING" ] && FULL_MSG="${FULL_MSG:+${FULL_MSG}\\n}$BRIEFING"
-[ -n "$MEM_NOTE" ] && FULL_MSG="${FULL_MSG:+${FULL_MSG}\\n}$MEM_NOTE"
-[ -n "$STATUS_MSG" ] && FULL_MSG="${FULL_MSG:+${FULL_MSG}\\n}$STATUS_MSG"
-if [ -z "$FULL_MSG" ] && [ -n "$PROJECT" ]; then
-    FULL_MSG="Clanker: project=$PROJECT archetype=$ARCHETYPE"
-fi
+# --- 4. The single python pass: heartbeat stub (P7), archetype, env-file
+# exports, alerts, briefing, assembly, final hook JSON. ---
+export CWD SOURCE SESSION_ID PROJECT_DIR SCRIPT_DIR CLANKER_DATA CLANKER_REGISTRY MEM_NOTE STATUS_MSG
+export CLAUDE_ENV_FILE="${CLAUDE_ENV_FILE:-}"
+python3 - <<'PY' 2>/dev/null || true
+import json, os, sys, time
 
-if [ -n "$FULL_MSG" ]; then
-    ESCAPED=$(printf '%s' "$FULL_MSG" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null | sed 's/^"//;s/"$//')
-    cat <<EOF
-{
-  "hookSpecificOutput": {
-    "hookEventName": "SessionStart",
-    "additionalContext": "$ESCAPED"
-  }
-}
-EOF
-fi
+cwd = os.environ.get("CWD", "")
+session_id = os.environ.get("SESSION_ID", "")
+project_dir = os.environ.get("PROJECT_DIR", "")
+data_dir = os.environ.get("CLANKER_DATA", "/data/clanker")
+registry = os.environ.get("CLANKER_REGISTRY", "")
+sys.path.insert(0, os.path.join(os.environ.get("SCRIPT_DIR", "."), "..", "lib"))
+
+# 4a. Heartbeat stub row (P7, audit M4): a long-lived session must EXIST in
+# telemetry before it dies — 07-20/21 had ~49 live sessions and ZERO rows.
+# SessionEnd's full record supersedes this via consumers' last-write-wins
+# dedup (analyze.load_sessions); a stub with no final row = still running.
+if session_id:
+    try:
+        project = "global"
+        try:
+            from projects import resolve_project
+            project = resolve_project(cwd)
+        except Exception:
+            _root = os.path.expanduser("~/projects/")
+            if _root in cwd:
+                project = cwd.split(_root)[-1].split("/")[0]
+        sdir = os.path.join(data_dir, "raw", "sessions")
+        os.makedirs(sdir, exist_ok=True)
+        out = os.path.join(sdir, time.strftime("%Y-%m-%d", time.gmtime()) + ".jsonl")
+        import fcntl
+        with open(out + ".lock", "a") as lk:          # same lock file session-end flocks
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            with open(out, "a") as f:
+                f.write(json.dumps({
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "session_id": session_id,
+                    "project": project,
+                    "cwd": cwd,
+                    "outcome": "open",
+                    "source": os.environ.get("SOURCE", "") or None,
+                }) + "\n")
+    except Exception:
+        pass
+
+# 4b. Project + archetype from the registry yaml
+project_name, archetype = "", ""
+if project_dir and registry and os.path.isfile(registry):
+    project_name = os.path.basename(project_dir)
+    archetype = "unknown"
+    try:
+        import yaml
+        reg = yaml.safe_load(open(registry)) or {}
+        archetype = (reg.get("projects", {}).get(project_name, {}) or {}).get("archetype", "unknown")
+    except Exception:
+        pass
+
+# 4c. Env vars for downstream hooks
+envf = os.environ.get("CLAUDE_ENV_FILE", "")
+if envf:
+    try:
+        with open(envf, "a") as f:
+            if project_name:
+                f.write(f"export CLANKER_PROJECT={project_name}\n")
+            if archetype:
+                f.write(f"export CLANKER_ARCHETYPE={archetype}\n")
+    except Exception:
+        pass
+
+# 4d. Active alerts (was one jq spawn per alert file)
+alert_msg = ""
+try:
+    adir = os.path.join(data_dir, "alerts")
+    files = sorted(fn for fn in os.listdir(adir) if fn.endswith(".json")) if os.path.isdir(adir) else []
+    if files:
+        lines = [f"CLANKER ALERTS ({len(files)} active):"]
+        for fn in files:
+            try:
+                a = json.load(open(os.path.join(adir, fn)))
+                lines.append(f"  [{a.get('severity') or 'info'}] {a.get('message') or 'unknown alert'}")
+            except Exception:
+                lines.append("  [info] unknown alert")
+        alert_msg = "\n".join(lines)
+except Exception:
+    pass
+
+# 4e. Project briefing
+briefing = ""
+if project_name and project_name != "unknown" and os.path.isdir(project_dir):
+    try:
+        from briefing import generate_briefing
+        briefing = generate_briefing(project_name, project_dir) or ""
+    except Exception:
+        pass
+
+# 4f. Assemble + emit (REAL newlines — the old bash literal "\\n" joins
+# rendered as backslash-n in the injected context)
+parts = [p.strip() for p in (alert_msg, briefing, os.environ.get("MEM_NOTE", ""),
+                             os.environ.get("STATUS_MSG", "")) if p and p.strip()]
+full = "\n".join(parts)
+if not full and project_name:
+    full = f"Clanker: project={project_name} archetype={archetype}"
+if full:
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "SessionStart", "additionalContext": full}}))
+PY
 
 exit 0
