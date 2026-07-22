@@ -16,6 +16,7 @@
   "docs/AGENT_AUTO_RESUME.md",
   "docs/DESIGN.md",
   "docs/ECC-feature-mining.md",
+  "docs/HANDOFF-audit-followup-2026-07-22.md",
   "docs/MOBILE-READER.md",
   "docs/PLATFORM_INDEPENDENCE.md",
   "docs/audit-2026-07-22-harness-governance.md",
@@ -157,5 +158,5 @@
   "tests/test_webauth.py",
   "tools/archive-transcripts.sh"
  ],
- "source_commit": "ff4c3ad"
+ "source_commit": "7df8ae8"
 }
