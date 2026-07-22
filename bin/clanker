@@ -45,7 +45,8 @@ def cmd_sessions(args):
         print(f"{'Date':<12} {'Project':<18} {'Duration':>8} {'Errors':>6} {'Tools':>6}")
         print('-' * 56)
         for s in sessions:
-            dur = f"{min(s.get('duration_s', 0), 28800) // 60}m"
+            dur = ("live" if s.get('outcome') == "open"
+                   else f"{min(s.get('duration_s', 0), 28800) // 60}m")
             errs = s.get('errors', 0)
             tools = sum(s.get('tool_uses', {}).values())
             ts = s.get('timestamp', '')[:10]

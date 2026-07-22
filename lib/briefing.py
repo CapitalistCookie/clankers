@@ -58,7 +58,8 @@ def generate_briefing(project, project_path=None):
         session_lines = []
         for s in recent:
             ts = s.get("timestamp", "")[:16]
-            dur = f"{min(s.get('duration_s', 0), 28800) // 60}m"
+            dur = ("live" if s.get("outcome") == "open"
+                   else f"{min(s.get('duration_s', 0), 28800) // 60}m")
             errs = s.get("errors", 0)
             session_lines.append(f"  {ts} | {dur} | {errs} errors")
         sections.append(("Recent Sessions", "\n".join(session_lines)))

@@ -286,7 +286,11 @@ record = {
     "session_id": session_id,
     "project": project,
     "cwd": cwd,
-    "duration_s": duration_s,
+    # Capped AT WRITE (8h; longer = idle tmux) so no consumer has to remember
+    # the cap; wall_clock_s keeps the raw span for forensics — the 07-22 OOM
+    # rows ran to 19 days, which is real wall clock but not work time (P7).
+    "duration_s": min(duration_s, 28800),
+    "wall_clock_s": duration_s,
     "claude_version": claude_version,
     "model": model,
     "tool_uses": dict(tool_uses),

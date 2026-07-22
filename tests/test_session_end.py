@@ -58,8 +58,8 @@ def _run_hook(tmp_path, session_id, transcript_text, cwd, reason="prompt_input_e
             with open(os.path.join(day_dir, fn)) as f:
                 rows += [json.loads(l) for l in f if l.strip()]
     mine = [x for x in rows if x.get("session_id") == session_id]
-    assert len(mine) == 1, f"expected exactly one record for {session_id}"
-    return mine[0]
+    assert mine, f"no record written for {session_id}"
+    return mine[-1]   # last-write-wins, same as analyze.load_sessions dedup
 
 
 def test_limit_kill_yields_failure_reason_and_last_line(tmp_path):
@@ -77,6 +77,70 @@ def test_clean_session_has_null_failure_reason(tmp_path):
                     reason="clear")
     assert rec["failure_reason"] is None
     assert rec["end_reason"] == "clear"
+
+
+# ── P7: heartbeat stub (SessionStart) + duration cap-at-write ────────────────
+
+START_HOOK = os.path.join(os.path.dirname(HOOK), "session-start.sh")
+
+
+def _read_rows(session_id):
+    day_dir = os.path.join(os.environ["CLANKER_DATA"], "raw", "sessions")
+    rows = []
+    for fn in sorted(os.listdir(day_dir)):
+        if fn.endswith(".jsonl"):
+            with open(os.path.join(day_dir, fn)) as f:
+                rows += [json.loads(l) for l in f if l.strip()]
+    return [x for x in rows if x.get("session_id") == session_id]
+
+
+def test_session_start_writes_open_stub(tmp_path):
+    """A session must EXIST in telemetry the moment it starts (07-20/21: ~49
+    live sessions, zero rows). The stub is minimal and marked outcome=open."""
+    sid = _sid("stub")
+    payload = json.dumps({"session_id": sid, "cwd": str(tmp_path), "source": "startup"})
+    env = {**os.environ, "HOME": str(tmp_path)}
+    r = subprocess.run(["bash", START_HOOK], input=payload, capture_output=True,
+                       text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = _read_rows(sid)
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "open"
+    assert rows[0]["source"] == "startup"
+    assert rows[0]["cwd"] == str(tmp_path)
+    assert "duration_s" not in rows[0]   # stubs carry no final numbers
+
+
+def test_lifecycle_stub_then_final_row(tmp_path):
+    """SessionStart stub + SessionEnd final row for the same id: the final row
+    is appended AFTER the stub, so consumers' last-write-wins dedup
+    (analyze.load_sessions) sees the completed record."""
+    sid = _sid("lifecycle")
+    payload = json.dumps({"session_id": sid, "cwd": str(tmp_path), "source": "startup"})
+    env = {**os.environ, "HOME": str(tmp_path)}
+    subprocess.run(["bash", START_HOOK], input=payload, capture_output=True,
+                   text=True, env=env, timeout=60)
+    _run_hook(tmp_path, sid, _transcript_lines(), cwd=tmp_path)  # asserts 1 final row
+    rows = _read_rows(sid)
+    assert len(rows) == 2
+    assert rows[0]["outcome"] == "open" and rows[-1]["outcome"] != "open"
+
+
+def test_duration_capped_at_write_wall_clock_raw(tmp_path):
+    """19-day OOM rows: duration_s is work-time (capped 8h AT WRITE, audit M4 —
+    'one future consumer will forget'), wall_clock_s keeps the raw span."""
+    lines = [
+        json.dumps({"type": "user", "timestamp": "2026-07-03T05:00:00Z",
+                    "message": {"role": "user", "content": "long-lived session"}}),
+        json.dumps({"type": "assistant", "timestamp": "2026-07-22T05:00:00Z",
+                    "message": {"content": [{"type": "text", "text": "still here"}]}}),
+    ]
+    rec = _run_hook(tmp_path, _sid("cap"), "\n".join(lines) + "\n", cwd=tmp_path)
+    assert rec["duration_s"] == 28800                    # capped
+    assert rec["wall_clock_s"] == 19 * 24 * 3600         # raw span preserved
+    # short session: both equal, uncapped
+    rec2 = _run_hook(tmp_path, _sid("short"), _transcript_lines(), cwd=tmp_path)
+    assert rec2["duration_s"] == rec2["wall_clock_s"] == 600
 
 
 def test_handoff_carries_last_activity_line(tmp_path):

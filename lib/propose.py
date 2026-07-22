@@ -86,6 +86,8 @@ def generate_proposals(from_retro=False):
     existing = _read_ledger()
     by_project = defaultdict(lambda: {"count": 0, "errors": 0, "time": 0})
     for s in sessions:
+        if s.get("outcome") == "open":
+            continue   # P7 heartbeat stub — still running; no final numbers yet
         p = s.get("project", "global")
         by_project[p]["count"] += 1
         by_project[p]["errors"] += s.get("errors", 0)

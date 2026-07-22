@@ -35,6 +35,40 @@ if [ "$SOURCE" = "clear" ]; then
     fi
 fi
 
+# --- 0b. Heartbeat stub row (P7, audit M4): a long-lived session must EXIST in
+# telemetry before it dies — 07-20/21 had ~49 live sessions and ZERO rows, so
+# cost/error analytics silently excluded the fleet's steady state. SessionEnd's
+# full record supersedes this stub via consumers' last-write-wins dedup
+# (analyze.load_sessions); a stub with no matching final row = still running.
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
+if [ -n "$SESSION_ID" ]; then
+    SESSIONS_DIR="$CLANKER_DATA/raw/sessions"
+    mkdir -p "$SESSIONS_DIR" 2>/dev/null || true
+    OUTFILE="$SESSIONS_DIR/$(date -u +%Y-%m-%d).jsonl"
+    export SESSION_ID CWD SOURCE
+    CLANKER_LIB="$SCRIPT_DIR/../lib" python3 - <<'PY' 2>/dev/null | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null || true
+import json, os, sys, time
+cwd = os.environ.get("CWD", "")
+project = "global"
+try:
+    sys.path.insert(0, os.environ.get("CLANKER_LIB", ""))
+    from projects import resolve_project
+    project = resolve_project(cwd)
+except Exception:
+    _root = os.path.expanduser("~/projects/")
+    if _root in cwd:
+        project = cwd.split(_root)[-1].split("/")[0]
+print(json.dumps({
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "session_id": os.environ.get("SESSION_ID", ""),
+    "project": project,
+    "cwd": cwd,
+    "outcome": "open",
+    "source": os.environ.get("SOURCE", "") or None,
+}))
+PY
+fi
+
 # --- 1. Determine project and archetype ---
 PROJECT=""
 ARCHETYPE=""
