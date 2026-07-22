@@ -126,6 +126,71 @@ def test_ensure_boot_entry_upserts_and_preserves_others(startup):
     assert '"alpha:/p/alpha"' in text
 
 
+# ── resurrect (P10): registry∪map merge + relaunch-missing via the boot script ─
+
+@pytest.fixture
+def resurrect_env(startup, tmp_path, monkeypatch):
+    """Registry: one mapped project (stale map path), one registered-but-unmapped
+    project, one ghost path. Boot map: the stale entry + a non-registry manual
+    entry."""
+    proj = tmp_path / "regproj"
+    proj.mkdir()
+    newproj = tmp_path / "newproj"
+    newproj.mkdir()
+    reg = tmp_path / "registry.yaml"
+    reg.write_text("projects:\n"
+                   f"  regproj:\n    archetype: tool\n    path: {proj}\n"
+                   f"  newproj:\n    archetype: tool\n    path: {newproj}\n"
+                   "  ghostproj:\n    archetype: tool\n    path: /nonexistent/ghost\n")
+    monkeypatch.setenv("CLANKER_REGISTRY", str(reg))
+    # Pin discovery roots too: Registry.projects unions the yaml with repos
+    # auto-discovered under CLANKER_PROJECT_ROOTS (default ~/projects), and its
+    # 300s in-process cache means an earlier suite test can hand THIS test the
+    # live box's project list (observed: sync-registry pulled 33 real repos).
+    monkeypatch.setenv("CLANKER_PROJECT_ROOTS", str(tmp_path / "no-discovery"))
+    tmux_manager.write_startup({"regproj": "/stale/old-path", "manual": "/p/manual"})
+    calls.clear()
+    return proj
+
+
+def test_resurrect_refreshes_map_and_relaunches_missing(resurrect_env, startup, monkeypatch):
+    states = [set(), {"regproj", "manual"}]          # before: all dead → after: all alive
+    monkeypatch.setattr(tmux_manager, "_alive_sessions", lambda: states.pop(0))
+    rc = tmux_manager.resurrect()
+    text = startup.read_text()
+    assert rc == 0
+    assert f'"regproj:{resurrect_env}"' in text       # registry refreshed the stale path
+    assert '"regproj:/stale/old-path"' not in text
+    assert '"manual:/p/manual"' in text               # non-registry entry survives
+    assert "newproj" not in text     # default NEVER grows the fleet (07-22 dry-run receipt)
+    assert "ghostproj" not in text
+    assert ["bash", tmux_manager.STARTUP_SCRIPT] in calls   # boot script executed
+
+
+def test_resurrect_sync_registry_adds_unmapped_projects(resurrect_env, startup, monkeypatch):
+    states = [set(), {"regproj", "manual", "newproj"}]
+    monkeypatch.setattr(tmux_manager, "_alive_sessions", lambda: states.pop(0))
+    assert tmux_manager.resurrect(sync_registry=True) == 0
+    text = startup.read_text()
+    assert '"newproj:' in text                        # opt-in union adds it
+    assert "ghostproj" not in text                    # missing path still never mapped
+
+
+def test_resurrect_dry_run_touches_nothing(resurrect_env, startup, monkeypatch):
+    monkeypatch.setattr(tmux_manager, "_alive_sessions", lambda: set())
+    before = startup.read_text()
+    assert tmux_manager.resurrect(dry_run=True) == 0
+    assert startup.read_text() == before
+    assert ["bash", tmux_manager.STARTUP_SCRIPT] not in calls
+
+
+def test_resurrect_nonzero_when_sessions_stay_dead(resurrect_env, monkeypatch, capsys):
+    states = [set(), {"manual"}]                      # regproj never comes back
+    monkeypatch.setattr(tmux_manager, "_alive_sessions", lambda: states.pop(0))
+    assert tmux_manager.resurrect() == 1              # exit-code honesty (law 2)
+    assert "regproj" in capsys.readouterr().err
+
+
 def test_work_registers_boot_entry_end_to_end(tmp_path):
     """`clanker work X --no-attach` must land X in the boot map (M1: sessions
     that aren't in the map die with the box — proven by the 07-22 OOM), and
@@ -145,6 +210,7 @@ def test_work_registers_boot_entry_end_to_end(tmp_path):
                                   '  has-session) exit 1;;\n  *) exit 0;;\nesac\n')
     (fakebin / "tmux").chmod(0o755)
     env = {**os.environ, "HOME": str(tmp_path), "CLANKER_REGISTRY": str(reg),
+           "CLANKER_PROJECT_ROOTS": str(tmp_path),   # no live ~/projects scan
            "PATH": f"{fakebin}:{os.environ['PATH']}"}
 
     r = subprocess.run([os.path.join(repo, "bin", "clanker"), "work", "bootproj",

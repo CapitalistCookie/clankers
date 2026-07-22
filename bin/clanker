@@ -328,6 +328,13 @@ def cmd_work(args):
     print(amsg)
     return 0 if ok else 1
 
+def cmd_resurrect(args):
+    """`clanker resurrect` — post-OOM/reboot fleet recovery: merge the registry
+    into the boot map, then relaunch every mapped session that isn't running
+    (via the boot script itself, so behavior can't drift from systemd's path)."""
+    from tmux_manager import resurrect
+    return resurrect(dry_run=args.dry_run, sync_registry=args.sync_registry)
+
 def cmd_briefing(args):
     from briefing import generate_briefing
     from registry import Registry
@@ -809,6 +816,12 @@ def main():
     p.add_argument('--resume', nargs='?', const=True, default=None, metavar='SESSION_ID',
                    help="resume a past conversation in this repo: bare --resume opens the picker (this repo's sessions only); with an id, resumes it directly")
     p.set_defaults(func=cmd_work)
+
+    p = sub.add_parser('resurrect', help='Fleet recovery: relaunch missing boot-mapped tmux sessions (post-OOM/reboot; watchdog-callable)')
+    p.add_argument('--dry-run', action='store_true', help='report what would change/launch; write and launch nothing')
+    p.add_argument('--sync-registry', action='store_true',
+                   help='also add registered projects missing from the boot map (default: recovery never grows the fleet)')
+    p.set_defaults(func=cmd_resurrect)
 
     p = sub.add_parser('briefing', help='Generate project briefing')
     p.add_argument('project', help='Project name')

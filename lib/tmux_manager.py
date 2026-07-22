@@ -15,6 +15,7 @@ Rewritten 2026-07-05 (fleet-regression postmortem):
 import os
 import re
 import subprocess
+import sys
 
 STARTUP_SCRIPT = os.path.expanduser("~/.tmux-startup.sh")
 
@@ -124,6 +125,74 @@ def add_session(name, project_path=None):
 
     ensure_boot_entry(name, project_path)
     return True
+
+
+def _alive_sessions():
+    """Names of currently-running tmux sessions (empty set when the server is
+    down — which is exactly the resurrect case)."""
+    try:
+        out = subprocess.check_output(["tmux", "list-sessions", "-F", "#{session_name}"],
+                                      stderr=subprocess.DEVNULL, text=True)
+        return set(out.split())
+    except Exception:
+        return set()
+
+
+def resurrect(dry_run=False, sync_registry=False):
+    """One-command fleet recovery (audit P10, born of the 07-22 host-OOM):
+    refresh the boot map, then execute the map script itself, whose per-entry
+    has-session guard relaunches ONLY the missing sessions. That is the exact
+    code path systemd runs at boot, so resurrect can never drift from proven
+    boot behavior. By DEFAULT recovery is map-scoped — the registry only
+    refreshes the paths of names already mapped, it never grows the fleet
+    (the live registry↔fleet naming diverges enough that a blind union would
+    have spawned ~34 unrequested sessions, per the 07-22 dry-run receipt);
+    --sync-registry opts into adding registered projects missing from the
+    map. Watchdog-friendly: exits 0 iff every mapped session is alive after."""
+    from registry import Registry
+    reg = Registry()
+    entries = startup_entries()
+    merged = dict(entries)
+    unmapped = []
+    for name in sorted(reg.projects):
+        if name not in merged and not sync_registry:
+            unmapped.append(name)
+            continue
+        path = os.path.abspath(os.path.expanduser(reg.get_path(name)))
+        if not os.path.isdir(path):
+            print(f"  skip {name}: registry path missing ({path})")
+            continue
+        merged[name] = path
+    changed = sorted(n for n in merged if entries.get(n) != merged[n])
+    kept = sorted(set(entries) - set(reg.projects))
+    alive = _alive_sessions()
+    missing = sorted(n for n in merged if n not in alive)
+    print(f"[resurrect] boot map: {len(merged)} entries — {len(changed)} added/updated "
+          f"from registry ({', '.join(changed) if changed else 'none'}), "
+          f"{len(kept)} non-registry kept")
+    if unmapped:
+        print(f"[resurrect] {len(unmapped)} registered project(s) have no boot entry — "
+              f"left alone (add + launch them with --sync-registry): {', '.join(unmapped)}")
+    print(f"[resurrect] tmux now: {len(merged) - len(missing)} of {len(merged)} mapped "
+          f"sessions alive" + (f"; missing: {', '.join(missing)}" if missing else ""))
+    if dry_run:
+        print("[resurrect] dry-run: nothing written, nothing launched")
+        return 0
+    write_startup(merged)
+    if missing:
+        print(f"[resurrect] relaunching {len(missing)} session(s) via {STARTUP_SCRIPT} …")
+        r = subprocess.run(["bash", STARTUP_SCRIPT], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"[resurrect] startup script exited {r.returncode}: "
+                  f"{(r.stderr or '').strip()[:300]}", file=sys.stderr)
+    after = _alive_sessions()
+    still = sorted(n for n in merged if n not in after)
+    if still:
+        print(f"[resurrect] FAILED to revive {len(still)}/{len(merged)}: "
+              f"{', '.join(still)}", file=sys.stderr)
+        return 1
+    print(f"[resurrect] all {len(merged)} mapped sessions alive")
+    return 0
 
 
 def remove_session(name):
