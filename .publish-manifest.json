@@ -130,6 +130,7 @@
   "tests/conftest.py",
   "tests/fixtures/registry.yaml",
   "tests/test_adopt.py",
+  "tests/test_alerts_escalation.py",
   "tests/test_all.py",
   "tests/test_briefing.py",
   "tests/test_cleanup_memory.py",
@@ -162,5 +163,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "c715c01"
+ "source_commit": "01c03b8"
 }

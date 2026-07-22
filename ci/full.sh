@@ -49,7 +49,7 @@ if [ -d "${CLANKER_DATA:-/data/clanker}" ]; then
     rm -f "$ALERTS/ci-full-red.json"
   else
     mkdir -p "$ALERTS"
-    printf '{"severity":"warning","message":"clanker ci/full RED at %s — failing:%s (auto-publish blocked). Log: .git/ci/run-%s.log"}\n' \
+    printf '{"severity":"warning","project":"clanker","message":"clanker ci/full RED at %s — failing:%s (auto-publish blocked). Log: .git/ci/run-%s.log"}\n' \
       "$(git rev-parse --short HEAD)" "$fail_steps" "$(git rev-parse HEAD)" > "$ALERTS/ci-full-red.json"
   fi
 fi

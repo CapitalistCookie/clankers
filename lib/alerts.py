@@ -17,20 +17,29 @@ def count_alerts():
     return len([f for f in os.listdir(ALERTS_DIR) if f.endswith(".json")])
 
 
-def _create_alert(alert_id, severity, source, message, details=None):
+def _create_alert(alert_id, severity, source, message, details=None, project=None):
     """Create an alert file.
 
     Re-raised alerts keep their original first_seen: the 15-min cron rewrites
     the file on every pass, so without this a chronically-ignored alert is
     indistinguishable from a fresh one (mtime and timestamp always look new).
-    """
+    Escalation state (P12) survives the rewrite the same way, else the
+    ignored-N-days ntfy would re-fire every 15 minutes.
+
+    project (P12): the project this alert belongs to, or None for a global/
+    system alert. Briefings scope on it — a project-tagged alert appears only
+    in that project's briefing."""
     os.makedirs(ALERTS_DIR, exist_ok=True)
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     path = os.path.join(ALERTS_DIR, f"{alert_id}.json")
-    first_seen = now
+    first_seen, carried = now, {}
     try:
         with open(path) as f:
-            first_seen = json.load(f).get("first_seen", first_seen)
+            old = json.load(f)
+        first_seen = old.get("first_seen", first_seen)
+        carried = {k: old[k] for k in
+                   ("escalated_at", "escalation_delivered", "ignored_days")
+                   if k in old}
     except (OSError, json.JSONDecodeError):
         pass
     alert = {
@@ -43,10 +52,68 @@ def _create_alert(alert_id, severity, source, message, details=None):
         "message": message,
         "details": details or {},
         "status": "active",
+        **({"project": project} if project else {}),
+        **carried,
     }
     with open(path, "w") as f:
         json.dump(alert, f, indent=2)
     return alert
+
+
+def _ntfy(title, message, priority="high", tags="warning"):
+    """Best-effort ntfy publish (same env config as the dashboard:
+    CLANKER_NTFY_TOPIC/SERVER/TOKEN). Returns delivered?"""
+    topic = os.environ.get("CLANKER_NTFY_TOPIC", "")
+    if not topic:
+        return False
+    server = os.environ.get("CLANKER_NTFY_SERVER", "https://ntfy.sh")
+    token = os.environ.get("CLANKER_NTFY_TOKEN", "")
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{server.rstrip('/')}/{topic}", data=(message or "").encode(),
+            headers={"Title": title, "Priority": priority, "Tags": tags})
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception:
+        return False
+
+
+def _escalate_ignored(days=3):
+    """P12 (audit §7): a warning ignored N days must get LOUDER, not quieter —
+    the unpushed-commits warning sat active 3 days, visible only inside the
+    alert file. Every cron pass stamps ignored_days on active alerts; when a
+    warning/critical crosses the threshold it earns ONE high-priority ntfy
+    (escalated_at marks it fired; escalation_delivered records whether ntfy
+    was configured/reachable). Returns the ids escalated this pass."""
+    escalated = []
+    if not os.path.isdir(ALERTS_DIR):
+        return escalated
+    now = datetime.utcnow()
+    for fn in sorted(os.listdir(ALERTS_DIR)):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(ALERTS_DIR, fn)
+        try:
+            with open(path) as f:
+                a = json.load(f)
+            first = datetime.fromisoformat(
+                (a.get("first_seen") or "").replace("Z", "+00:00")).replace(tzinfo=None)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        a["ignored_days"] = max(0, (now - first).days)
+        if (a.get("severity") in ("warning", "critical")
+                and a["ignored_days"] >= days and not a.get("escalated_at")):
+            a["escalation_delivered"] = _ntfy(
+                f"ignored {a['ignored_days']}d: {a.get('id', fn)}",
+                a.get("message", ""), priority="high", tags="warning")
+            a["escalated_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            escalated.append(a.get("id", fn))
+        with open(path, "w") as f:
+            json.dump(a, f, indent=2)
+    return escalated
 
 
 def _dismiss_alert(alert_id):
@@ -191,6 +258,9 @@ def handle_alert(action, alert_id=None, message=None, cron=False, json_output=Fa
     """Handle alert subcommands."""
     if action == "check":
         results = _run_health_checks()
+        esc = _escalate_ignored()
+        if esc:
+            results["escalations"] = {"status": "warning", "details": esc}
         if cron:
             # Output as JSONL for cron logging
             record = {
@@ -223,7 +293,12 @@ def handle_alert(action, alert_id=None, message=None, cron=False, json_output=Fa
             if json_output:
                 print(json.dumps(alert))
             else:
-                print(f"  [{alert.get('severity', '?')}] {alert.get('message', '?')}")
+                tag = ""
+                if alert.get("project"):
+                    tag += f" ({alert['project']})"
+                if alert.get("ignored_days"):
+                    tag += f" [ignored {alert['ignored_days']}d]"
+                print(f"  [{alert.get('severity', '?')}]{tag} {alert.get('message', '?')}")
                 print(f"    ID: {alert.get('id')}  Source: {alert.get('source')}  Time: {alert.get('timestamp')}")
 
     elif action == "dismiss":
