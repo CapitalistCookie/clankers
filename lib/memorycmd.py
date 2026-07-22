@@ -75,6 +75,40 @@ def doctor(project=None):
     return r.returncode
 
 
+def orphans_top(n=10):
+    """Top-N orphaned memory files (INDEX_ALL.md §ORPHANS, biggest first) +
+    the total orphan count. The gc has measured this debt weekly since the
+    sharded-router migration and told no one (audit M3); the weekly digest
+    prints this list so triage actually happens (P5d).
+    Returns (total, [(name, kb), ...])."""
+    import re
+    idx = os.path.join(GLOBAL_MEM, "INDEX_ALL.md")
+    names, total, in_orph = [], 0, False
+    try:
+        with open(idx) as f:
+            for line in f:
+                if line.startswith("## ORPHANS"):
+                    in_orph = True
+                    m = re.search(r"—\s*(\d+)", line)
+                    total = int(m.group(1)) if m else 0
+                    continue
+                if in_orph:
+                    if line.startswith("## "):
+                        break
+                    if line.startswith("- "):
+                        names.append(line[2:].strip())
+    except OSError:
+        return 0, []
+    sized = []
+    for nm in names:
+        try:
+            sized.append((nm, os.path.getsize(os.path.join(GLOBAL_MEM, nm)) / 1024))
+        except OSError:
+            sized.append((nm, 0.0))
+    sized.sort(key=lambda t: (-t[1], t[0]))
+    return (total or len(names)), sized[:n]
+
+
 def router_gen():
     """Generate ROUTER-AUTO.md in the global memory dir: a registry snapshot
     (name / archetype / path / memory-namespace presence). Generated content

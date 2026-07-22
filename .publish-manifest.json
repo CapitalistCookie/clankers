@@ -132,6 +132,7 @@
   "tests/test_adopt.py",
   "tests/test_all.py",
   "tests/test_briefing.py",
+  "tests/test_cleanup_memory.py",
   "tests/test_cli.py",
   "tests/test_ecc_budget.py",
   "tests/test_ecc_guard.py",
@@ -159,5 +160,5 @@
   "tests/test_webauth.py",
   "tools/archive-transcripts.sh"
  ],
- "source_commit": "6c238f1"
+ "source_commit": "2337983"
 }

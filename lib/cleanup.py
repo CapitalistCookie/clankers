@@ -87,20 +87,58 @@ def run_gc(dry_run=False):
     results["proposals_pruned"] = pruned
 
     # 5. Memory-router maintenance (sharded-router design 2026-07-19): refresh
-    # the generated registry snapshot and lint-sweep the global memory dir so
+    # the generated registry snapshot and lint-sweep memory namespaces so
     # on-disk violations and orphan counts surface weekly, not never.
+    # 2026-07-22 (audit M3, P5b/c): the sweep now covers REGISTERED PROJECT
+    # namespaces too, and a FAIL raises a real alert instead of a line in cron
+    # stdout that nobody reads — the system was measuring this debt weekly
+    # and telling no one.
     if not dry_run:
         try:
             import subprocess
             import sys as _sys
             _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from memorycmd import router_gen, GLOBAL_MEM
-            router_gen()
+            import memorycmd
+            memorycmd.router_gen()
             lint = os.path.expanduser("~/.claude/hooks/memory-lint.sh")
-            if os.path.exists(lint) and os.path.isdir(GLOBAL_MEM):
-                r = subprocess.run(["bash", lint, "--doctor", GLOBAL_MEM],
-                                   capture_output=True, text=True, timeout=60)
-                results["memory_doctor"] = "pass" if r.returncode == 0 else "FAIL"
+            targets = {"global": memorycmd.GLOBAL_MEM}
+            try:
+                from memoryns import memory_root, ns_dir
+                from registry import Registry
+                reg = Registry()
+                for name in sorted(reg.projects):
+                    path = reg.get_path(name)
+                    mdir = os.path.join(ns_dir(memory_root(path)), "memory")
+                    if os.path.isfile(os.path.join(mdir, "MEMORY.md")):
+                        targets[name] = mdir
+            except Exception:
+                pass          # registry trouble degrades to the global-only sweep
+            failing = {}
+            if os.path.exists(lint):
+                for name, mdir in sorted(targets.items()):
+                    if not os.path.isdir(mdir):
+                        continue
+                    r = subprocess.run(["bash", lint, "--doctor", mdir],
+                                       capture_output=True, text=True, timeout=120)
+                    if r.returncode != 0:
+                        out = (r.stdout or "") + (r.stderr or "")
+                        first = next((l.strip() for l in out.splitlines() if l.strip()), "")
+                        failing[name] = first[:200]
+                results["memory_doctor"] = ("pass" if not failing
+                                            else "FAIL: " + ", ".join(sorted(failing)))
+                results["memory_namespaces_swept"] = len(targets)
+                try:
+                    from alerts import _create_alert, _dismiss_alert
+                    if failing:
+                        _create_alert(
+                            "memory-doctor", "warning", "gc",
+                            f"memory doctor FAILING in {len(failing)} namespace(s): "
+                            f"{', '.join(sorted(failing))} — triage: clanker memory doctor",
+                            details=failing)
+                    else:
+                        _dismiss_alert("memory-doctor")
+                except Exception:
+                    pass
         except Exception as e:
             results["memory_doctor"] = f"error: {e}"
 

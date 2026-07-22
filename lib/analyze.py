@@ -166,14 +166,35 @@ def run_analysis(mode, by="project", last_days=7, json_output=False):
     else:
         sessions = load_sessions(last_days=last_days)
 
-    if not sessions:
+    if sessions:
+        if by == "project":
+            _print_project_report(sessions, mode, json_output)
+        elif by == "tool":
+            _print_tool_report(sessions, json_output)
+    else:
         print("No sessions found.")
-        return
+    if mode == "weekly" and not json_output:
+        _print_memory_debt()
 
-    if by == "project":
-        _print_project_report(sessions, mode, json_output)
-    elif by == "tool":
-        _print_tool_report(sessions, json_output)
+
+def _print_memory_debt():
+    """Weekly-digest section (audit P5d): the gc measures orphan debt weekly —
+    this puts the top offenders where the operator actually looks. Zero
+    orphans → no section (a surface nobody needs is not a surface)."""
+    try:
+        from memorycmd import orphans_top
+        total, top = orphans_top(10)
+    except Exception:
+        return
+    if not total:
+        return
+    print()
+    print("=== Memory debt (global namespace) ===")
+    print(f"Orphans: {total} file(s) unreachable from the router indexes "
+          f"(INDEX_ALL.md §ORPHANS). Top {len(top)} by size:")
+    for name, kb in top:
+        print(f"  {kb:8.1f}KB  {name}")
+    print("Triage: add a pointer line in MEMORY.md / *-POINTERS.md, or delete the file.")
 
 
 def _print_project_report(sessions, mode, json_output):
