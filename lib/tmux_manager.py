@@ -86,6 +86,24 @@ def write_startup(entries):
     os.replace(tmp, STARTUP_SCRIPT)
 
 
+def ensure_boot_entry(name, project_path):
+    """UPSERT name→path in the boot map WITHOUT touching tmux (the session
+    already exists — e.g. `clanker work` just spawned it). Crash-resilience
+    law (2026-07-22 OOM postmortem, audit M1): a session missing from the
+    boot map silently dies with the box, so every registered-project work
+    session registers here, not only those born via `init`/`tmux add`.
+    Returns True when the map was (re)written, False when already current."""
+    project_path = os.path.abspath(os.path.expanduser(project_path))
+    entries = startup_entries()
+    old = entries.get(name)
+    if old == project_path:
+        return False
+    entries[name] = project_path
+    write_startup(entries)
+    print(f"Boot entry: {name} → {project_path}" + (f" (was {old})" if old else ""))
+    return True
+
+
 def add_session(name, project_path=None):
     """Ensure a tmux session exists for a project and UPSERT its boot entry."""
     if not project_path:
@@ -104,11 +122,7 @@ def add_session(name, project_path=None):
         subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], capture_output=True)
         print(f"Created tmux session: {name} → {project_path}")
 
-    entries = startup_entries()
-    old = entries.get(name)
-    entries[name] = project_path
-    write_startup(entries)
-    print(f"Boot entry: {name} → {project_path}" + (f" (was {old})" if old and old != project_path else ""))
+    ensure_boot_entry(name, project_path)
     return True
 
 

@@ -316,6 +316,12 @@ def cmd_work(args):
     print(msg)
     if not sess:
         return 1
+    if not args.no_boot:
+        # Crash-resilience (audit M1, 07-22 OOM): a work session absent from the
+        # boot map dies with the box. Also covers the reattach path — sessions
+        # created before this existed get registered on their next `work`.
+        from tmux_manager import ensure_boot_entry
+        ensure_boot_entry(sess, path)
     if args.no_attach:
         return 0
     ok, amsg = attach(sess)
@@ -797,6 +803,8 @@ def main():
     p.add_argument('project', help='registry project name (clanker registry list)')
     p.add_argument('--shell', action='store_true', help='bare shell instead of claude')
     p.add_argument('--no-attach', action='store_true', help='start detached; do not attach')
+    p.add_argument('--no-boot', action='store_true',
+                   help='do not register this session in the boot map (~/.tmux-startup.sh); default is to register so it survives reboot')
     p.add_argument('--print-path', action='store_true', help='print resolved repo path and exit')
     p.add_argument('--resume', nargs='?', const=True, default=None, metavar='SESSION_ID',
                    help="resume a past conversation in this repo: bare --resume opens the picker (this repo's sessions only); with an id, resumes it directly")

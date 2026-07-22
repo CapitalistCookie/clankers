@@ -104,3 +104,60 @@ def test_write_and_read_roundtrip(startup):
     text = startup.read_text()
     assert text.startswith("#!/bin/bash")
     assert "tmux new-session" in text  # footer boot loop present
+
+
+# ── ensure_boot_entry (P3, audit M1): boot-map upsert with NO tmux calls ─────
+
+def test_ensure_boot_entry_writes_and_is_idempotent(startup):
+    assert tmux_manager.ensure_boot_entry("delta", "/proj/delta") is True
+    assert '"delta:/proj/delta"' in startup.read_text()
+    assert not calls                                    # never touched tmux
+    # unchanged mapping -> no rewrite (returns False, file untouched)
+    before = startup.read_text()
+    assert tmux_manager.ensure_boot_entry("delta", "/proj/delta") is False
+    assert startup.read_text() == before
+
+
+def test_ensure_boot_entry_upserts_and_preserves_others(startup):
+    tmux_manager.write_startup({"alpha": "/p/alpha", "delta": "/p/old"})
+    assert tmux_manager.ensure_boot_entry("delta", "/p/new") is True
+    text = startup.read_text()
+    assert '"delta:/p/new"' in text and '"delta:/p/old"' not in text
+    assert '"alpha:/p/alpha"' in text
+
+
+def test_work_registers_boot_entry_end_to_end(tmp_path):
+    """`clanker work X --no-attach` must land X in the boot map (M1: sessions
+    that aren't in the map die with the box — proven by the 07-22 OOM), and
+    --no-boot must opt out. Hermetic: HOME→tmp (so ~/.tmux-startup.sh is the
+    tmp copy), a fake tmux on PATH (has-session=absent, everything else ok),
+    and a tmp registry with an explicit project path."""
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proj = tmp_path / "bootproj"
+    proj.mkdir()
+    reg = tmp_path / "registry.yaml"
+    reg.write_text("projects:\n  bootproj:\n    archetype: tool\n"
+                   f"    path: {proj}\n")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "tmux").write_text('#!/bin/bash\ncase "$1" in\n'
+                                  '  has-session) exit 1;;\n  *) exit 0;;\nesac\n')
+    (fakebin / "tmux").chmod(0o755)
+    env = {**os.environ, "HOME": str(tmp_path), "CLANKER_REGISTRY": str(reg),
+           "PATH": f"{fakebin}:{os.environ['PATH']}"}
+
+    r = subprocess.run([os.path.join(repo, "bin", "clanker"), "work", "bootproj",
+                        "--shell", "--no-attach"],
+                       capture_output=True, text=True, env=env, timeout=30)
+    boot = tmp_path / ".tmux-startup.sh"
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert boot.exists(), "work did not write the boot map"
+    assert f'"bootproj:{proj}"' in boot.read_text()
+
+    boot.unlink()
+    r = subprocess.run([os.path.join(repo, "bin", "clanker"), "work", "bootproj",
+                        "--shell", "--no-attach", "--no-boot"],
+                       capture_output=True, text=True, env=env, timeout=30)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not boot.exists(), "--no-boot still wrote the boot map"
