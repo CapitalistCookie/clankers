@@ -43,7 +43,12 @@ H="$HOME/.claude/hooks"
 # bodies). Gates run as children of this dispatcher and inherit the exports —
 # GPU_HOST, CHECK_GIT_TARGET_REPOS, CLANKER_DEPLOY_PREFLIGHT, etc. Generic
 # installs without this file simply run with the gates inert-by-default.
-[ -f "$HOME/.claude/harness.env" ] && . "$HOME/.claude/harness.env" 2>/dev/null || true
+# CLANKER_HARNESS_ENV overrides the file path — the parity harness points it at
+# /dev/null so operator values can't clobber fixture env (2026-07-22: sourcing
+# unconditionally broke the git-target parity case ever since harness.env
+# introduced an operator CHECK_GIT_TARGET_REPOS — latent since 07-17).
+HF="${CLANKER_HARNESS_ENV:-$HOME/.claude/harness.env}"
+[ -f "$HF" ] && . "$HF" 2>/dev/null || true
 
 INPUT=$(cat 2>/dev/null || true)
 
