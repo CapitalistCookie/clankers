@@ -35,6 +35,8 @@ WINDOWS = {
     "default": 200_000,
 }
 TAIL_BYTES = 262_144  # read only the last 256 KiB to find the latest usage (fast on huge transcripts)
+SETTINGS = os.path.expanduser("~/.claude/settings.json")
+_configured_window = None
 
 
 def window_for(model: str) -> int:
@@ -46,6 +48,39 @@ def window_for(model: str) -> int:
     if "fable" in m:
         return WINDOWS["fable"]
     return WINDOWS["default"]
+
+
+def configured_window() -> int:
+    """Window implied by the SESSION's configured model (settings.json `model`).
+
+    FALLBACK-SHRINK BUG (2026-07-24, operator-caught): when the session
+    temporarily falls back to another model (e.g. opus), the transcript's
+    per-message `model` is that fallback's id — which matches none of the 1M
+    keys above, so window_for() returned the 200k default and the gauge
+    reported "~2% remaining" to a session that really had ~80% free. It spent a
+    whole investigation nagging the model to wrap up early. The configured
+    model is the session's real ceiling, so it floors the observed value below.
+    Missing/unreadable settings -> 0, i.e. no floor, old behavior."""
+    global _configured_window
+    if _configured_window is None:
+        _configured_window = 0
+        try:
+            with open(SETTINGS) as f:
+                m = (json.load(f) or {}).get("model") or ""
+            if m:
+                w = window_for(m)
+                # Only an explicit 1M signal floors the window — a bare model id
+                # resolving to the 200k default must not masquerade as evidence.
+                _configured_window = w if w > WINDOWS["default"] else 0
+        except Exception:
+            _configured_window = 0
+    return _configured_window
+
+
+def resolve_window(model: str) -> int:
+    """Effective window: never let a transient model fallback shrink it below
+    what this session is configured for."""
+    return max(window_for(model), configured_window())
 
 
 def latest_usage(path):
@@ -190,7 +225,7 @@ def main() -> None:
         return
     if not used:
         return
-    limit = window_for(model or data.get("model") or "opus-4-8[1m]")
+    limit = resolve_window(model or data.get("model") or "opus-4-8[1m]")
     remaining_pct = max(0.0, (limit - used) / limit * 100.0)
 
     used_k = used / 1000.0
