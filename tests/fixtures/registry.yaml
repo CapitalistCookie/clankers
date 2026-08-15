@@ -26,6 +26,11 @@ projects:
   quanta-ai:
     archetype: production
     remote: CapitalistCookie/quanta-ai
+    # Explicit unreachable path: test_contracts_unknown_path asserts a nonzero
+    # exit for a project whose path is absent. Without this the name falls back
+    # to ~/projects/quanta-ai, which EXISTS on the operator box (deprecated V1
+    # tree), so the suite read a live dir and the assert inverted. Repo law 1.
+    path: /nonexistent/clanker-fixture/quanta-ai
   zergrush:
     archetype: frontend
     remote: CapitalistCookie/zergrush
