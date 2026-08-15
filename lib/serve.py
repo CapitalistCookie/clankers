@@ -966,7 +966,8 @@ def _stamp_assets(html):
     bfcache-restored documents doing a late fetch) to refetch the assets.
     Without this, 'did the deploy land on the phone' was unanswerable
     (operator hit exactly that, 2026-07-19)."""
-    for asset in ("app/app.css", "app/app.js", "app/live.js", "app/reader.js"):
+    for asset in ("app/app.css", "app/app.js", "app/livewatch.js",
+                  "app/live.js", "app/reader.js"):
         html = html.replace(f"/{asset}", f"/{asset}?v={BUILD_ID}")
     return html
 
@@ -1164,6 +1165,20 @@ def capture_pane_ansi(target, scrollback=False, scrollback_lines=400):
 MAX_BRIDGES = 16         # concurrent PTY bridges (each = tmux session + PTY + child); enough for a tiled grid
 MAX_VIEWS = 16           # concurrent capture-pane viewers
 _view_count = 0
+
+# Application-level heartbeat for BOTH live sockets (2026-08-15). The capture
+# stream only emits a frame when the pane CHANGES and the PTY stream only when
+# the shell writes, so an idle session and a dead socket were indistinguishable
+# to the browser — which is why a half-open socket could sit "connected" forever
+# with a frozen pane. A periodic control frame makes silence mean exactly one
+# thing, which is what the client's stall watchdog keys on
+# (lib/web/live.js STALL_MS, which must stay > 2x this).
+VIEW_HEARTBEAT_SECS = 10
+# capture_pane_ansi swallows its own errors and returns "", so a pane that moved
+# or was renamed would stream blank forever against the target we resolved once
+# at connect. After this many consecutive empty captures, re-resolve it (and end
+# the stream honestly if the session is gone).
+VIEW_EMPTY_RECHECK = 25
 # Only these exact tmux key tokens may be sent on the non-literal "key" path. Anything
 # else (especially a value starting with "-", e.g. "-X") would be argument-injected
 # into `tmux send-keys` as a flag.
@@ -1486,21 +1501,76 @@ async def handle_view(request):
         # ~20 fps while the pane is actively changing (scrolling / generating) so
         # motion is smooth, backing off to ~5 fps once it's been still — light on
         # CPU + battery when idle.
-        nonlocal last_content
+        #
+        # Failure discipline (2026-08-15): a capture failure is TRANSIENT — log it
+        # and keep streaming. Only a send failure is fatal, and it ends the stream
+        # LOUDLY (log + close the socket) so the client gets an onclose to act on.
+        # The previous `except Exception: break` killed output permanently on any
+        # error while the input loop stayed alive and nothing was ever logged.
+        nonlocal last_content, target
         loop = asyncio.get_event_loop()
         idle = 0
+        empties = 0
+        gone_rounds = 0
+        last_hb = time.monotonic()
+        ended = None
         while not ws.closed:
             try:
                 content = await loop.run_in_executor(None, capture_pane_ansi, target, False)
+            except Exception as e:
+                log.warning("View capture failed for %s: %s", session_name, e)
+                content = ""
+            if content:
+                empties = 0
+                gone_rounds = 0
+            else:
+                empties += 1
+                if empties >= VIEW_EMPTY_RECHECK:
+                    empties = 0
+                    try:
+                        panes = {p["session"]: p["target"]
+                                 for p in await loop.run_in_executor(None, list_panes)}
+                    except Exception:
+                        panes = {}
+                    if session_name in panes:
+                        gone_rounds = 0
+                        if panes[session_name] != target:
+                            log.info("View target moved for %s: %s -> %s",
+                                     session_name, target, panes[session_name])
+                            target = panes[session_name]
+                    else:
+                        # Absent can mean "session ended" OR "tmux momentarily
+                        # unavailable" (list_panes returns [] for both). Require
+                        # two consecutive rounds before ending the stream, so a
+                        # hiccup costs a blank frame instead of the connection.
+                        gone_rounds += 1
+                        if gone_rounds >= 2:
+                            ended = "session gone"
+                            break
+            try:
+                now = time.monotonic()
                 if content != last_content:
                     last_content = content
                     await ws.send_str(json.dumps({"type": "content", "data": content}))
+                    last_hb = now
                     idle = 0
                 else:
                     idle += 1
-                await asyncio.sleep(0.05 if idle < 10 else 0.2)
-            except Exception:
+                    if now - last_hb >= VIEW_HEARTBEAT_SECS:
+                        await ws.send_str(json.dumps({"type": "hb"}))
+                        last_hb = now
+            except Exception as e:
+                ended = f"send failed: {e}"
                 break
+            await asyncio.sleep(0.05 if idle < 10 else 0.2)
+        # Never die silently: without a close frame the browser keeps showing a
+        # frozen pane on a socket it believes is healthy.
+        if ended and not ws.closed:
+            log.info("View stream ended for %s (%s) — closing", session_name, ended)
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
     read_task = asyncio.create_task(capture_reader())
 
@@ -1526,6 +1596,10 @@ async def handle_view(request):
                                 ["tmux", "send-keys", "-t", target, "--", key],
                                 capture_output=True, timeout=2,
                             )
+                    elif data.get("type") == "ping":
+                        # Client keepalive — answer it, so the browser can prove
+                        # the round trip even while the pane is idle.
+                        await ws.send_str(json.dumps({"type": "pong"}))
                 except (json.JSONDecodeError, KeyError):
                     pass
     except Exception as e:
@@ -1570,16 +1644,40 @@ async def handle_terminal(request):
         return ws
 
     async def pty_reader():
+        # Same failure discipline as capture_reader (2026-08-15): end loudly with
+        # a close frame instead of silently breaking, and heartbeat an idle shell
+        # so the client can tell "quiet" from "dead".
         loop = asyncio.get_event_loop()
+        last_hb = time.monotonic()
+        ended = None
         while not ws.closed:
             try:
                 data = await loop.run_in_executor(None, bridge.read)
+            except Exception as e:
+                ended = f"pty read failed: {e}"
+                break
+            try:
+                now = time.monotonic()
                 if data:
                     await ws.send_bytes(data)
+                    last_hb = now
                 else:
+                    if now - last_hb >= VIEW_HEARTBEAT_SECS:
+                        # TEXT frame = control. PTY payload is always BINARY, so
+                        # the client can separate liveness from terminal bytes
+                        # (lib/web/live.js connectPty drops text frames).
+                        await ws.send_str(json.dumps({"type": "hb"}))
+                        last_hb = now
                     await asyncio.sleep(0.02)
-            except Exception:
+            except Exception as e:
+                ended = f"send failed: {e}"
                 break
+        if ended and not ws.closed:
+            log.info("Terminal stream ended for %s (%s) — closing", session_name, ended)
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
     read_task = asyncio.create_task(pty_reader())
 
@@ -1596,6 +1694,8 @@ async def handle_terminal(request):
                         bridge.resize(cols, rows)
                     elif data.get("type") == "input":
                         bridge.write(data["data"].encode("utf-8"))
+                    elif data.get("type") == "ping":
+                        await ws.send_str(json.dumps({"type": "pong"}))
                 except (json.JSONDecodeError, KeyError, ValueError, struct.error):
                     bridge.write(msg.data.encode("utf-8"))
     except Exception as e:
@@ -1984,6 +2084,9 @@ def _live_features_html():
      the mobile reader/view paths never pull them. -->
 <script defer src="/vendor/marked.min.js"></script>
 <script defer src="/vendor/purify.min.js"></script>
+<!-- livewatch first: live.js's paint latch + stall watchdog come from it (defer
+     preserves document order, so it is defined before live.js runs). -->
+<script defer src="/app/livewatch.js"></script>
 <script defer src="/app/reader.js"></script>
 <!-- Pretext available at https://esm.sh/@chenglou/pretext@0.0.4 — will be used when we move to Canvas renderer -->
 
