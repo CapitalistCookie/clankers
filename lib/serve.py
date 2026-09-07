@@ -630,6 +630,7 @@ def list_panes():
             "#{session_name}", "#{window_index}", "#{pane_index}",
             "#{pane_title}", "#{pane_current_command}",
             "#{pane_width}", "#{pane_height}", "#{session_attached}",
+            "#{pane_id}", "#{pane_pid}",
         ])
         out = subprocess.check_output(
             ["tmux", "list-panes", "-a", "-F", fmt],
@@ -640,9 +641,9 @@ def list_panes():
             if not line:
                 continue
             parts = line.split("\t")
-            if len(parts) < 8:
+            if len(parts) < 10:
                 continue
-            session, win, pane, title, cmd, w, h, attached = parts
+            session, win, pane, title, cmd, w, h, attached, pane_id, pane_pid = parts[:10]
             if session.startswith("web-"):
                 continue
             panes.append({
@@ -655,6 +656,8 @@ def list_panes():
                 "width": int(w),
                 "height": int(h),
                 "attached": int(attached) > 0,
+                "pane_id": pane_id,                     # "%58" — the registry's key
+                "pane_pid": int(pane_pid) if pane_pid.isdigit() else None,
             })
         return panes
     except Exception as e:
@@ -674,31 +677,173 @@ def capture_pane_tail(target, lines=5):
         return ""
 
 
-def _title_is_working(title):
-    """True iff the pane title leads with Claude Code's animated working spinner.
+# ─── Claude Code session registry: the session-state source ───
+# Claude Code (≥2.1.139, the store behind `claude agents` / ListAgents) keeps one
+# JSON record per live REPL process in ~/.claude/sessions/<pid>.json:
+#   {"pid", "procStart", "sessionId", "cwd", "tmux": "<session>:@<win>.%<pane>",
+#    "status": "busy"|"shell"|"idle"|"waiting", "waitingFor": "<reason>", ...}
+# The REPL rewrites it on every status change (atomic, ~40ms after the event).
+# Claude writes it itself: no hook, no tokens, no dependence on how the TUI
+# paints. It replaced the pane-title spinner heuristic, which Claude Code 2.1.236
+# made static under tmux ("tengu_static_title_under_mux") — every session then
+# read as at-rest forever and the notifier was silent for a week (2026-09-07).
+REGISTRY_STATUS_TO_STATE = {
+    "busy": "working",      # generating / running tools / delegated to agents
+    "shell": "working",     # idle prompt but a background `!` shell still runs
+    "idle": "waiting",      # at rest, ready for you
+    "waiting": "waiting",   # a dialog holds it (permission / question / elicitation)
+}
+_TMUX_REF_RX = re.compile(r"^(.+):@(\d+)\.%(\d+)$")
+REGISTRY_LOSS_GRACE_SECS = 120        # fleet-wide absence must persist this long
+REGISTRY_LOSS_REALERT_SECS = 6 * 3600
 
-    Claude renders an ANIMATED braille spinner (U+2800–U+28FF, frames like ⠐⠂⠄⡀)
-    as the title's first glyph ONLY while actively generating; a finished session
-    waiting for input shows a STATIC star (✳ U+2733) instead. Verified against the
-    live fleet (2026-06-10): every working session cycled braille frames, every
-    at-rest session showed ✳. The braille range is the whole signal — no body
-    scraping (Claude uses ✳/✻ as static decoration in pane CONTENT, which is why
-    the old content heuristic misclassified every session as 'working')."""
-    t = (title or "").lstrip()
-    return bool(t) and 0x2800 <= ord(t[0]) <= 0x28FF
+
+def _sessions_dir():
+    """Registry directory, resolved at call time (Law 9: no import-time capture)."""
+    override = os.environ.get("CLANKER_CLAUDE_SESSIONS_DIR")
+    if override:
+        return override
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(cfg, "sessions")
 
 
-def detect_session_state(pane):
-    """Detect a session's state from its tmux pane.
+def _proc_start(pid):
+    """Kernel start time of pid (clock ticks since boot; /proc/<pid>/stat field
+    22), or None when it is not running. Compared with the record's procStart so
+    a reused pid never vouches for a dead session."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        return stat[stat.rindex(")") + 2:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _proc_children(pid):
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def read_session_registry(sessions_dir=None):
+    """The LIVE registry records (dead or reused pids dropped), each annotated
+    with `pane_id` ("%58") and `tmux_session` parsed from its tmux ref. Never
+    raises; an unreadable/missing directory is an empty fleet."""
+    d = sessions_dir or _sessions_dir()
+    live = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return live
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, name)) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or not isinstance(rec.get("pid"), int):
+            continue
+        start = _proc_start(rec["pid"])
+        if start is None or str(rec.get("procStart", "")) != start:
+            continue
+        m = _TMUX_REF_RX.match(rec.get("tmux") or "")
+        rec["pane_id"] = f"%{m.group(3)}" if m else None
+        rec["tmux_session"] = m.group(1) if m else None
+        live.append(rec)
+    return live
+
+
+def registry_record(pane, registry):
+    """The registry record for a tmux pane: by pane id first, then by process
+    tree (the pane's shell or its direct child is the REPL) for a record whose
+    tmux ref is missing. None when the pane has no live record."""
+    pane_id = pane.get("pane_id")
+    if pane_id:
+        for rec in registry:
+            if rec.get("pane_id") == pane_id:
+                return rec
+    ppid = pane.get("pane_pid")
+    if ppid:
+        candidates = {ppid, *_proc_children(ppid)}
+        for rec in registry:
+            if rec.get("pid") in candidates:
+                return rec
+    return None
+
+
+def detect_session_state(pane, registry=None):
+    """A session's state from Claude Code's own registry record.
 
     Returns 'working' | 'waiting' | 'idle':
-      - non-claude pane (a bash shell, etc.)            -> idle
-      - claude pane with the animated braille spinner   -> working
-      - claude pane at rest (static star / no spinner)  -> waiting (ready for you)
+      - non-claude pane (a bash shell, etc.)          -> idle
+      - record status busy / shell                     -> working
+      - record status idle / waiting (needs you)       -> waiting
+      - claude pane with NO live record                -> waiting (at rest, so it
+        never produces a working->waiting edge; `_registry_watch` alerts when
+        the WHOLE fleet lacks records — one record-less pane is normal, e.g.
+        `claude agents` or a -p run)
     """
     if pane.get("command") != "claude":
         return "idle"
-    return "working" if _title_is_working(pane.get("title", "")) else "waiting"
+    if registry is None:
+        registry = read_session_registry()
+    rec = registry_record(pane, registry)
+    if rec is None:
+        return "waiting"
+    return REGISTRY_STATUS_TO_STATE.get(rec.get("status"), "waiting")
+
+
+def registry_coverage(panes, registry):
+    """(covered, total): claude panes that have a live registry record."""
+    claude = [p for p in panes if p.get("command") == "claude"]
+    covered = sum(1 for p in claude if registry_record(p, registry) is not None)
+    return covered, len(claude)
+
+
+def _raise_alert(**kw):
+    try:
+        import alerts
+        alerts._create_alert(kw["alert_id"], kw["severity"], kw["source"],
+                             kw["message"], details=kw.get("details"))
+    except Exception as e:
+        log.warning("could not raise clanker alert %s: %s", kw.get("alert_id"), e)
+
+
+def _registry_watch(panes, registry, now, watch, alert=None):
+    """Fail LOUD when the state source disappears. If >=3 claude panes exist and
+    NONE has a live record for REGISTRY_LOSS_GRACE_SECS, raise one clanker alert
+    (re-raised every REGISTRY_LOSS_REALERT_SECS while it persists). `watch` is
+    the caller's mutable {"lost_since": None, "alerted_at": None}. Returns
+    (covered, total).
+    Total absence means Claude Code moved or renamed the registry — the class of
+    change that blinded the notifier silently in 2026-09."""
+    covered, total = registry_coverage(panes, registry)
+    if total < 3 or covered > 0:
+        watch["lost_since"] = None
+        return covered, total
+    if watch["lost_since"] is None:
+        watch["lost_since"] = now
+        return covered, total
+    if now - watch["lost_since"] < REGISTRY_LOSS_GRACE_SECS:
+        return covered, total
+    if (watch["alerted_at"] is not None
+            and now - watch["alerted_at"] < REGISTRY_LOSS_REALERT_SECS):
+        return covered, total
+    watch["alerted_at"] = now
+    msg = (f"Claude Code session registry has no live record for any of the {total} "
+           f"claude panes ({_sessions_dir()}) — ntfy session pings are BLIND. "
+           f"Did a Claude Code update move or rename the registry?")
+    log.warning(msg)
+    (alert or _raise_alert)(
+        alert_id="session-state-source-lost", severity="critical",
+        source="dashboard", message=msg,
+        details={"sessions_dir": _sessions_dir(), "claude_panes": total,
+                 "lost_since": watch["lost_since"]})
+    return covered, total
 
 
 def classify_rest_state(tail):
@@ -785,11 +930,16 @@ def _last_activity_line(tail):
     return ""
 
 
-def _craft_notification(sid, tail):
+def _craft_notification(sid, tail, waiting_for=None):
     """Build (title, priority, tags, body) for a stable at-rest session's ping,
     by rest-substate — a blocking dialog outranks a finished turn outranks a
-    limit banner (nothing to do until reset)."""
+    limit banner (nothing to do until reset). `waiting_for` is Claude's own
+    reason when its registry record says status 'waiting' (a permission /
+    question / elicitation dialog holds the session): authoritative, so it
+    upgrades a plain-looking tail to a decision ping."""
     sub, detail = classify_rest_state(tail)
+    if waiting_for and sub == "waiting":
+        sub, detail = "decision", f"waiting for: {waiting_for}"
     if sub == "decision":
         return (f"{sid}: decision needed", "max", "warning",
                 detail or "Claude is waiting on an approval/choice dialog")
@@ -1007,11 +1157,13 @@ async def handle_status(request):
         return resp
 
     panes = list_panes()
+    registry = read_session_registry()
     sessions = []
     for p in panes:
         if p["command"] != "claude":
             continue
-        state = detect_session_state(p)
+        rec = registry_record(p, registry)
+        state = detect_session_state(p, registry)
         # 12 lines: enough to see a dialog/banner/agent-tree for substates,
         # not just the 3-line preview.
         preview = capture_pane_tail(p["target"], lines=12)
@@ -1019,6 +1171,8 @@ async def handle_status(request):
         agents = 0
         if state == "waiting":
             substate, _ = classify_rest_state(preview)
+            if substate == "waiting" and rec and rec.get("status") == "waiting":
+                substate = "decision"   # Claude itself says a dialog holds it
         elif state == "working":
             wsub, agents, _ = classify_working_state(preview)
             substate = "" if wsub == "working" else wsub
@@ -1056,6 +1210,9 @@ async def handle_status(request):
             "command": p["command"],
             "state": state,
             "substate": substate,
+            # False = claude pane with no live registry record: no REPL is
+            # running there (startup/trust dialog, `claude agents`, a -p run).
+            "registered": rec is not None,
             "agents": agents,
             "preview": preview_line,
             "model": model,
@@ -1118,11 +1275,12 @@ async def handle_panes(request):
         return resp
 
     panes = list_panes()
+    registry = read_session_registry()
     result = []
     for p in panes:
         if p["session"].startswith("web-") or p["command"] != "claude":
             continue
-        state = detect_session_state(p)
+        state = detect_session_state(p, registry)
         # Only pay the 40-line capture for panes the client is actually showing.
         content = (capture_pane_tail(p["target"], lines=40)
                    if sel is None or p["session"] in sel else "")
@@ -1239,10 +1397,13 @@ async def handle_session_new(request):
         if chk.returncode == 0:
             return {"error": "session already exists"}
         home = os.path.expanduser("~")
-        r = subprocess.run(
-            ["tmux", "new-session", "-d", "-s", name, "-c", home, "-x", "120", "-y", "40"],
-            capture_output=True, text=True, timeout=10,
-        )
+        # Via newsession so the pane gets the LOGIN shell even on a server born
+        # from a bare environment (2026-09-03: the cron keepalive restarted the
+        # server with SHELL=/bin/sh and every new window came up as dash).
+        from newsession import tmux_new_session, login_shell
+        r, healed = tmux_new_session(name, home, cols=120, rows=40, timeout=10)
+        if healed:
+            log.info("healed tmux default-shell %s -> %s", healed, login_shell())
         if r.returncode != 0:
             return {"error": (r.stderr or "tmux new-session failed").strip()[:200]}
         if not bare_shell:
@@ -1754,6 +1915,9 @@ async def _post_ntfy(http, title, priority, tags, body, now, muted_until):
 async def monitor_sessions(app):
     """Poll Claude sessions and ntfy on every state worth the operator's attention.
 
+    State source (2026-09-07): Claude Code's own session registry
+    (`read_session_registry`), not the pane title — see REGISTRY_STATUS_TO_STATE.
+
     Signals (exhaustive-states pass, 2026-07-19):
       - working→waiting settle, classified: decision (max prio, the question) /
         limit (the reset line) / error / finished (last ⏺ activity line)
@@ -1776,6 +1940,8 @@ async def monitor_sessions(app):
     muted_until = 0.0      # quota backoff: no publish attempts before this ts
     agents_pinged = set()  # sessions already pinged for their current fan-out
     fanout_check = {}      # sid -> ts of last fan-out capture_pane_tail (S2: throttle to 1/30s)
+    reg_watch = {"lost_since": None, "alerted_at": None}  # state-source loss watchdog
+    announced = False
     # Subagent limit-kill watcher: the SubagentStop hook appends to this queue;
     # start at the current size so historical entries never burst on restart.
     queue_path = os.path.expanduser("~/.claude/agent_resume_queue.jsonl")
@@ -1788,6 +1954,13 @@ async def monitor_sessions(app):
                 panes = [p for p in list_panes() if p["command"] == "claude"]
                 live = {p["session"] for p in panes}
                 now = time.time()
+                registry = read_session_registry()
+                covered, total = _registry_watch(panes, registry, now, reg_watch)
+                if not announced:
+                    announced = True
+                    log.info("session-state source: %d/%d claude panes have a live "
+                             "Claude Code registry record (%s)",
+                             covered, total, _sessions_dir())
 
                 # Drop bookkeeping for sessions that disappeared. A session that
                 # vanishes while last observed WORKING likely crashed / was
@@ -1854,7 +2027,7 @@ async def monitor_sessions(app):
 
                 for p in panes:
                     sid = p["session"]
-                    state = detect_session_state(p)
+                    state = detect_session_state(p, registry)
                     was = prev_state.get(sid)
                     prev_state[sid] = state
 
@@ -1911,7 +2084,11 @@ async def monitor_sessions(app):
                     # banner above the prompt is visible to the classifier —
                     # the ping now says WHAT the session is waiting on.
                     tail = capture_pane_tail(p["target"], lines=15)
-                    title, priority, tags, body = _craft_notification(sid, tail)
+                    rec = registry_record(p, registry) or {}
+                    title, priority, tags, body = _craft_notification(
+                        sid, tail,
+                        waiting_for=(rec.get("waitingFor")
+                                     if rec.get("status") == "waiting" else None))
                     delivered, muted_until = await _post_ntfy(
                         http, title, priority, tags, body, now, muted_until)
                     if delivered:

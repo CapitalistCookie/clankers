@@ -7,6 +7,7 @@ and launches Claude with the sandbox disabled and permission prompts skipped
 `new` created. Works from anywhere; nothing here is project-specific.
 """
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -31,6 +32,62 @@ def launch_cmd(cwd, resume=None):
     elif resume:
         cmd += f" --resume {shlex.quote(str(resume))}"
     return cmd
+
+
+def _usable_shell(path):
+    return bool(path) and os.path.isabs(path) and os.access(path, os.X_OK)
+
+
+def login_shell():
+    """The user's login shell — passwd first (what tmux itself picks from a sane
+    environment), then $SHELL, then /bin/sh."""
+    candidates = []
+    try:
+        candidates.append(pwd.getpwuid(os.getuid()).pw_shell)
+    except (KeyError, OSError):
+        pass
+    candidates.append(os.environ.get("SHELL"))
+    for c in candidates:
+        if _usable_shell(c):
+            return c
+    return "/bin/sh"
+
+
+def ensure_default_shell(shell=None, timeout=5):
+    """Make the running tmux server hand out the login shell. tmux copies $SHELL
+    into its global `default-shell` ONCE, at server start, and every later
+    window inherits it — so a server (re)born from cron (SHELL=/bin/sh, bare
+    PATH; the */3 keepalive did exactly that on 2026-09-03) spawned login dash
+    fleet-wide: `clanker new` landed at a bare `$` with `claude: not found`,
+    because dash never reads .bashrc, where PATH gains the claude install, and
+    the operator's workaround was `su user` to get a bash back. Returns the
+    wrong value it replaced, else None (no server / already right / set failed)."""
+    shell = shell or login_shell()
+    p = subprocess.run(["tmux", "show-options", "-gv", "default-shell"],
+                       capture_output=True, text=True, timeout=timeout)
+    if p.returncode != 0:
+        return None                      # no server: nothing to heal yet
+    current = (p.stdout or "").strip()
+    if not current or current == shell:
+        return None
+    r = subprocess.run(["tmux", "set-option", "-g", "default-shell", shell],
+                       capture_output=True, text=True, timeout=timeout)
+    return current if r.returncode == 0 else None
+
+
+def tmux_new_session(name, cwd, cols=220, rows=50, timeout=10):
+    """`tmux new-session -d` that lands in the login shell whichever way the
+    server came to be: a running server has its default-shell healed first,
+    and a server this call starts inherits SHELL pinned to the login shell (a
+    clanker run from a polluted pane must not breed a polluted server).
+    Returns (CompletedProcess, healed_from_or_None)."""
+    shell = login_shell()
+    healed = ensure_default_shell(shell, timeout=timeout)
+    env = {**os.environ, "SHELL": shell}
+    r = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", cwd,
+                        "-x", str(cols), "-y", str(rows)],
+                       capture_output=True, text=True, timeout=timeout, env=env)
+    return r, healed
 
 
 def _slug(name):
@@ -126,8 +183,7 @@ def spawn(name=None, cwd=None, shell=False, resume=None):
         return base, (f"session '{base}' already exists — attach with: clanker open {base}")
     name = base if requested else _unique_name(base)
 
-    r = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", cwd,
-                        "-x", "220", "-y", "50"], capture_output=True, text=True)
+    r, healed = tmux_new_session(name, cwd)
     if r.returncode != 0:
         return None, "tmux new-session failed: " + (r.stderr or "").strip()[:200]
 
@@ -141,8 +197,12 @@ def spawn(name=None, cwd=None, shell=False, resume=None):
 
     _record_last(name)
     what = "shell" if shell else "claude (sandbox off, permissions skipped)"
-    return name, (f"started {what} session '{name}' in {cwd}\n"
-                  f"open it with:  clanker open {name}    (or: clanker open)")
+    msg = (f"started {what} session '{name}' in {cwd}\n"
+           f"open it with:  clanker open {name}    (or: clanker open)")
+    if healed:
+        msg += (f"\nhealed tmux: default-shell was {healed} (server born in a bare "
+                f"env, e.g. cron) — now {login_shell()} for every new window")
+    return name, msg
 
 
 def attach(name=None):

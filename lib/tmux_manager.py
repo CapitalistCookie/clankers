@@ -10,6 +10,8 @@ Rewritten 2026-07-05 (fleet-regression postmortem):
     names, so stale legacy paths survived every rebuild — root cause #1 of the
     2026-07-05 regression).
   - startup_entries()/write_startup() expose the mapping for fleet tooling.
+  - 2026-09-03: session creation goes through newsession.tmux_new_session(),
+    which guarantees the LOGIN shell (a cron-born server handed out dash).
 """
 
 import os
@@ -116,12 +118,13 @@ def add_session(name, project_path=None):
     if exists:
         print(f"Tmux session '{name}' already exists — leaving as-is, registering for boot")
     else:
-        subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", project_path,
-                        "-x", "220", "-y", "50"], capture_output=True)
+        from newsession import tmux_new_session
+        _r, healed = tmux_new_session(name, project_path)   # login shell guaranteed
         subprocess.run(["tmux", "send-keys", "-t", name, "-l", "--",
                         _launch_cmd(project_path)], capture_output=True)
         subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], capture_output=True)
-        print(f"Created tmux session: {name} → {project_path}")
+        print(f"Created tmux session: {name} → {project_path}"
+              + (f" (healed tmux default-shell: was {healed})" if healed else ""))
 
     ensure_boot_entry(name, project_path)
     return True

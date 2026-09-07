@@ -33,4 +33,9 @@ def _isolated_clanker_data():
         ):
             os.makedirs(os.path.join(d, sub), exist_ok=True)
         os.environ["CLANKER_DATA"] = d
+        # 2026-09-07: the dashboard reads Claude Code's session registry
+        # (~/.claude/sessions) for session state — pin it to an empty dir so no
+        # test ever reads the live fleet's records.
+        os.makedirs(os.path.join(d, "claude-sessions"), exist_ok=True)
+        os.environ["CLANKER_CLAUDE_SESSIONS_DIR"] = os.path.join(d, "claude-sessions")
         yield d

@@ -113,6 +113,14 @@ def run_gc(dry_run=False):
                         targets[name] = mdir
             except Exception:
                 pass          # registry trouble degrades to the global-only sweep
+            # Several registry entries can resolve to the SAME namespace dir
+            # (toxicflow / -es / -nq all live under the yon repo, so all three
+            # map to the one yon/memory namespace dir). Without this, one violation is
+            # linted N times and reported as N failing namespaces.
+            by_dir = {}
+            for _name, _mdir in sorted(targets.items()):
+                by_dir.setdefault(os.path.realpath(_mdir), _name)
+            targets = {_name: _dir for _dir, _name in by_dir.items()}
             failing = {}
             if os.path.exists(lint):
                 for name, mdir in sorted(targets.items()):
@@ -121,7 +129,11 @@ def run_gc(dry_run=False):
                     r = subprocess.run(["bash", lint, "--doctor", mdir],
                                        capture_output=True, text=True, timeout=120)
                     if r.returncode != 0:
-                        out = (r.stdout or "") + (r.stderr or "")
+                        # memory-lint prints VIOLATIONS to stderr and bookkeeping
+                        # ("orphans=N") to stdout. Reading stdout first made every
+                        # alert say "orphans=0" and hid the real reason, which is
+                        # why the standing memory-doctor alert sat ignored 13 days.
+                        out = (r.stderr or "") + "\n" + (r.stdout or "")
                         first = next((l.strip() for l in out.splitlines() if l.strip()), "")
                         failing[name] = first[:200]
                 results["memory_doctor"] = ("pass" if not failing
@@ -141,5 +153,40 @@ def run_gc(dry_run=False):
                     pass
         except Exception as e:
             results["memory_doctor"] = f"error: {e}"
+
+        # --- orphaned scheduled work -------------------------------------
+        # The removal GATE (onboard.remove_project) prevents NEW orphans, but
+        # cron installed outside clanker, or a project retired before the gate
+        # existed, still needs finding. yon's nightly CI ran 48 days past the
+        # repo's last commit because nothing ever looked.
+        try:
+            import schedules
+            from registry import Registry
+            try:
+                reg = Registry()
+                known = [p for p in (reg.get_path(n) for n in reg.projects) if p]
+            except Exception:
+                known = []
+            active = [i for i in schedules.scan() if i["active"]]
+            rogue = schedules.unowned(active, known_paths=known)
+            results["schedules_orphaned"] = len(rogue)
+            try:
+                from alerts import _create_alert, _dismiss_alert
+                if rogue:
+                    repos = sorted({p for i in rogue for p in i["paths"]})
+                    _create_alert(
+                        "schedules-orphaned", "warning", "gc",
+                        f"{len(rogue)} active scheduled item(s) owned by "
+                        f"{len(repos)} unregistered repo(s): {', '.join(repos[:3])}"
+                        f"{' …' if len(repos) > 3 else ''} — triage: "
+                        f"clanker schedules audit",
+                        details={p: sum(1 for i in rogue if p in i["paths"])
+                                 for p in repos})
+                else:
+                    _dismiss_alert("schedules-orphaned")
+            except Exception:
+                pass
+        except Exception as e:
+            results["schedules_orphaned"] = f"error: {e}"
 
     return results

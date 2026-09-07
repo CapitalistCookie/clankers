@@ -20,6 +20,7 @@
   "docs/MOBILE-READER.md",
   "docs/PLATFORM_INDEPENDENCE.md",
   "docs/audit-2026-07-22-harness-governance.md",
+  "docs/audit-2026-09-03-harness-governance.md",
   "hooks/agent-resume-surface.sh",
   "hooks/context-gauge.py",
   "hooks/harness/MANIFEST.md",
@@ -43,6 +44,7 @@
   "hooks/harness/scope-calibration.sh",
   "hooks/harness/ssh-tunnel-port-guard.py",
   "hooks/harness/stop-dispatch.sh",
+  "hooks/harness/task-payload-gate.py",
   "hooks/harness/tests/test_context_gauge.sh",
   "hooks/hooks.json",
   "hooks/prompt-check.sh",
@@ -100,6 +102,7 @@
   "lib/redact.py",
   "lib/registry.py",
   "lib/regression.py",
+  "lib/schedules.py",
   "lib/serve.py",
   "lib/serve_user.py",
   "lib/synccmd.py",
@@ -156,9 +159,11 @@
   "tests/test_publishcmd.py",
   "tests/test_reader.py",
   "tests/test_resume_queue.py",
+  "tests/test_schedules.py",
   "tests/test_serve_state.py",
   "tests/test_serve_ws.py",
   "tests/test_session_end.py",
+  "tests/test_session_registry.py",
   "tests/test_spa_js.py",
   "tests/test_synccmd.py",
   "tests/test_tmux_manager.py",
@@ -166,5 +171,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "e81cca0"
+ "source_commit": "0f9830a"
 }

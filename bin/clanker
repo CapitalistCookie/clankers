@@ -220,6 +220,20 @@ def cmd_doctor(args):
     except Exception:
         print("✗ Hook sync check errored")
 
+    # Session-state source (2026-09-07): the dashboard's ntfy pings read Claude
+    # Code's own session registry (~/.claude/sessions/<pid>.json). Every claude
+    # pane lacking a live record = the notifier is blind — say so here.
+    try:
+        from serve import list_panes as _panes, read_session_registry as _reg, registry_coverage as _cov
+        covered, total = _cov(_panes(), _reg())
+        ok = total == 0 or covered > 0
+        print(f"{'✓' if ok else '✗'} Session-state source: {covered}/{total} claude panes have a live Claude Code registry record")
+        if not ok:
+            issues.append("session-state-source")
+    except Exception as e:
+        print(f"✗ Session-state source check errored: {e}")
+        issues.append("session-state-source")
+
     # Check cron jobs
     import subprocess
     try:
@@ -280,8 +294,83 @@ def cmd_init(args):
 def cmd_remove(args):
     from onboard import remove_project
     from audit import log_change
-    remove_project(args.name)
+    ok = remove_project(args.name, force_schedules=getattr(args, 'force_schedules', False))
+    if not ok:
+        return 1          # gate refused (exit-code honesty, repo law 2)
     log_change("project-removed", args.name)
+    return 0
+
+
+def cmd_schedules(args):
+    """Inventory scheduled work on this machine and plan its decommission."""
+    import schedules
+    from registry import Registry
+    items = schedules.scan()
+    active = [i for i in items if i["active"]]
+
+    if args.action == 'scan':
+        if args.project:
+            reg = Registry()
+            path = reg.get_path(args.project) or os.path.expanduser(f"~/projects/{args.project}")
+            items = schedules.for_project(items, path)
+            active = [i for i in items if i["active"]]
+            print(f"scheduled work referencing {path}: {len(active)} active "
+                  f"({len(items) - len(active)} already disabled)")
+        else:
+            print(f"scheduled items: {len(active)} active "
+                  f"({len(items) - len(active)} already disabled)")
+        for i in items:
+            flag = ' ' if i["active"] else '~'
+            where = i["path"] or i["unit"]
+            print(f" {flag}[{i['source']:8s}] {where}:{i['line_no']}  {i['line'][:88]}")
+        return 0
+
+    if args.action == 'audit':
+        try:
+            reg = Registry()
+            known = [reg.get_path(n) for n in reg.projects]
+        except Exception:
+            known = []
+        known = [k for k in known if k]
+        rogue = schedules.unowned(active, known_paths=known)
+        print(f"ORPHANED scheduled work — active, under a home root, owned by NO "
+              f"registered project: {len(rogue)}")
+        for i in rogue:
+            where = i["path"] or i["unit"]
+            print(f"  [{i['source']:8s}] {where}:{i['line_no']}")
+            print(f"      paths: {', '.join(i['paths'])}")
+            print(f"      {i['line'][:100]}")
+        if rogue:
+            print("\nThese are the yon class: the project is gone, the machine "
+                  "kept its work. Disposition each one (some may still feed live "
+                  "research even though the repo is dead).")
+        return 0
+
+    if args.action == 'plan-disable':
+        # --path is required for ORPHANS: a retired repo is no longer in the
+        # registry, so name lookup cannot reach it — and orphans are the whole
+        # point of this verb (yon was unregistered while its cron still ran).
+        if args.path:
+            path = os.path.abspath(os.path.expanduser(args.path))
+        elif args.project:
+            reg = Registry()
+            path = reg.get_path(args.project) or os.path.expanduser(f"~/projects/{args.project}")
+        else:
+            print("plan-disable requires --project or --path", file=sys.stderr)
+            return 1
+        mine = [i for i in schedules.for_project(items, path) if i["active"]]
+        if not mine:
+            print(f"no active scheduled work references {path}")
+            return 0
+        cmds, needs_sudo = schedules.plan(mine, reason=args.reason)
+        print(f"# {len(mine)} active item(s) reference {path}")
+        print("# nothing is deleted: cron.d files are renamed, crontab lines commented")
+        for c in cmds:
+            print(c)
+        if needs_sudo:
+            print("# (root-owned; run these yourself — clanker never sudoes)")
+        return 0
+    return 1
 
 def cmd_tmux(args):
     from tmux_manager import list_sessions, add_session, remove_session
@@ -809,7 +898,22 @@ def main():
 
     p = sub.add_parser('remove', help='Remove project from clanker (keeps repo)')
     p.add_argument('name', help='Project name')
+    p.add_argument('--force-schedules', action='store_true',
+                   help='Proceed even though the project still owns active cron/timers '
+                        '(only after dispositioning each one)')
     p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser('schedules',
+                       help='Inventory/plan decommission of cron + systemd work')
+    p.add_argument('action', choices=['scan', 'audit', 'plan-disable'],
+                   help="scan: list items; audit: find orphaned work whose project "
+                        "is gone; plan-disable: emit disable commands for a project")
+    p.add_argument('--project', help='Limit to one registered project')
+    p.add_argument('--path', help='Limit to a repo PATH (use for orphans — a '
+                                  'retired repo is no longer in the registry)')
+    p.add_argument('--reason', default='dead-project',
+                   help='Suffix reason used in .disabled-<reason>-<date>')
+    p.set_defaults(func=cmd_schedules)
 
     p = sub.add_parser('tmux', help='Tmux session management')
     p.add_argument('action', choices=['list', 'add', 'remove'])

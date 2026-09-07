@@ -22,8 +22,10 @@ calls = []
 
 
 class FakeProc:
-    def __init__(self, rc=0):
+    def __init__(self, rc=0, out=""):
         self.returncode = rc
+        self.stdout = out
+        self.stderr = ""
 
 
 def _fake_run(argv, **kw):
@@ -69,6 +71,28 @@ def test_add_session_existing_registers_boot_without_creating(startup, monkeypat
     tmux_manager.add_session("beta", "/proj/beta")
     assert '"beta:/proj/beta"' in startup.read_text()   # still registered for boot
     assert not any("new-session" in c for c in calls)    # but not recreated
+
+
+def test_add_session_heals_default_shell_before_creating(startup, monkeypatch):
+    """2026-09-03: a server born from cron hands out /bin/sh; add_session must
+    reset default-shell to the login shell BEFORE the window is spawned."""
+    import newsession
+    monkeypatch.setattr(newsession, "login_shell", lambda: "/bin/bash")
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        if "has-session" in argv:
+            return FakeProc(1)
+        if "show-options" in argv:
+            return FakeProc(0, "/bin/sh\n")
+        return FakeProc(0)
+    monkeypatch.setattr(tmux_manager.subprocess, "run", run)
+
+    tmux_manager.add_session("delta", "/proj/delta")
+    heal = ["tmux", "set-option", "-g", "default-shell", "/bin/bash"]
+    created = next(c for c in calls if "new-session" in c)
+    assert heal in calls and calls.index(heal) < calls.index(created)
+    assert '"delta:/proj/delta"' in startup.read_text()
 
 
 def test_add_session_defaults_path_to_projects_dir(startup):

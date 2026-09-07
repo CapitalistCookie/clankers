@@ -396,10 +396,58 @@ Tools: {", ".join(stack["tools"]) or "none detected"}
     return True
 
 
-def remove_project(name):
-    """Remove a project from clanker (registry, settings, tmux). Does NOT delete the repo."""
-    project_path = os.path.expanduser(f"~/projects/{name}")
+def remove_project(name, force_schedules=False):
+    """Remove a project from clanker (registry, settings, tmux). Does NOT delete the repo.
+
+    DECOMMISSION GATE (2026-08-12): refuses while the project still owns ACTIVE
+    scheduled work on this machine. Before this gate, removal cleaned clanker's
+    bookkeeping and left the box running the project's cron forever — the yon
+    repo's nightly CI burned 16 cores every 06:00 for 48 days after its last
+    commit because retiring it never looked at /etc/cron.d. Override with
+    force_schedules=True once each item is dispositioned.
+    """
+    # Resolve the real path from the registry; ~/projects/<name> is only the
+    # default layout (yon lived at ~/yon, which is how its cron went unnoticed).
+    from registry import Registry
+    try:
+        project_path = Registry().get_path(name) or os.path.expanduser(f"~/projects/{name}")
+    except Exception:
+        project_path = os.path.expanduser(f"~/projects/{name}")
+    project_path = os.path.normpath(project_path)
     removed = []
+
+    # 0. GATE: scheduled work must be dispositioned first.
+    if not force_schedules:
+        try:
+            import schedules
+            owned = [i for i in schedules.for_project(schedules.scan(), project_path)
+                     if i["active"]]
+            scan_ok = True
+        except Exception as e:                      # noqa: BLE001
+            owned, scan_ok = [], False
+            scan_err = e
+        if not scan_ok:
+            print(f"remove: could not inventory scheduled work ({scan_err}). "
+                  f"This gate fails CLOSED — re-run with --force-schedules once "
+                  f"you have checked /etc/cron.d, `crontab -l` and systemd timers "
+                  f"for anything referencing {project_path}.")
+            return False
+        if owned:
+            cmds, needs_sudo = schedules.plan(owned, reason=f"removed-{name}")
+            print(f"remove: '{name}' still owns {len(owned)} ACTIVE scheduled item(s) "
+                  f"referencing {project_path}. Retiring it now would leave them "
+                  f"running forever (this is exactly what happened to yon).\n")
+            for i in owned:
+                where = i["path"] or i["unit"]
+                print(f"  [{i['source']}] {where}:{i['line_no']}  {i['line'][:96]}")
+            print("\nDisable them first (nothing is deleted — files are renamed, "
+                  "lines commented):")
+            for c in cmds:
+                print(f"  {c}")
+            if needs_sudo:
+                print("\n(root-owned; clanker never runs sudo for you)")
+            print(f"\nThen re-run:  clanker remove {name} --force-schedules")
+            return False
 
     # 1. Remove from registry — via the single mutator (registry.remove_entry)
     from registry import remove_entry
