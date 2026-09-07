@@ -380,6 +380,15 @@ def cmd_tmux(args):
         add_session(args.name, args.path)
     elif args.action == 'remove':
         remove_session(args.name)
+    elif args.action == 'accept-trust':
+        # Answer Claude's workspace-trust dialog (YES) in the named pane, or in
+        # every boot-mapped pane — the boot script calls this after launching.
+        from newsession import accept_trust_prompts
+        from tmux_manager import startup_entries
+        names = [args.name] if args.name else sorted(startup_entries())
+        done = accept_trust_prompts(names, timeout=args.timeout)
+        print(f"accept-trust: answered {len(done)} of {len(names)} pane(s)"
+              + (f": {', '.join(done)}" if done else ""))
 
 def cmd_new(args):
     from newsession import spawn
@@ -916,9 +925,11 @@ def main():
     p.set_defaults(func=cmd_schedules)
 
     p = sub.add_parser('tmux', help='Tmux session management')
-    p.add_argument('action', choices=['list', 'add', 'remove'])
+    p.add_argument('action', choices=['list', 'add', 'remove', 'accept-trust'])
     p.add_argument('name', nargs='?', help='Session/project name')
     p.add_argument('--path', help='Project path (for add)')
+    p.add_argument('--timeout', type=float, default=120.0,
+                   help='accept-trust: seconds to keep watching the pane(s) (default 120)')
     p.set_defaults(func=cmd_tmux)
 
     p = sub.add_parser('scratch', aliases=['new'],

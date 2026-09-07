@@ -48,6 +48,14 @@ for entry in "${sessions[@]}"; do
         tmux send-keys -t "$name" Enter
     fi
 done
+
+# 2026-09-07: Claude Code shows its workspace-trust dialog on launch — even with
+# --dangerously-skip-permissions, and never remembered for $HOME — so after the
+# 09-06 reboot 37 of 63 mapped sessions sat at "❯ No, exit" for a day, with no
+# session behind them. This map IS the operator's trust declaration for these
+# repos: answer YES in every mapped pane that shows the dialog (cursor-aware;
+# a bare Enter would EXIT). Runs until every REPL is registered or 120 s.
+python3 "{CLANKER}" tmux accept-trust --timeout 120 >/dev/null 2>&1 || true
 """
 
 
@@ -82,9 +90,11 @@ def startup_entries():
 def write_startup(entries):
     """Regenerate the whole startup script from {name: path} (sorted)."""
     body = "".join(f'    "{n}:{p}"\n' for n, p in sorted(entries.items()))
+    clanker = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "bin", "clanker")
     tmp = STARTUP_SCRIPT + ".tmp"
     with open(tmp, "w") as f:
-        f.write(_HEADER + body + _FOOTER)
+        f.write(_HEADER + body + _FOOTER.replace("{CLANKER}", clanker))
     os.chmod(tmp, 0o755)
     os.replace(tmp, STARTUP_SCRIPT)
 

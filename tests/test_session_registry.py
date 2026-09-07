@@ -160,3 +160,33 @@ def test_registry_loss_needs_a_real_fleet(registry_dir):
         serve._registry_watch([_pane(1), _pane(2)], [], now, watch, alert=lambda **kw: sent.append(kw))
         now += serve.REGISTRY_LOSS_GRACE_SECS
     assert sent == [] and watch["lost_since"] is None
+
+
+def test_unknown_status_is_working_never_waiting(registry_dir):
+    """A Claude Code vocabulary change must not silence the notifier again."""
+    _write(registry_dir, 4242, status="streaming")
+    assert serve.detect_session_state(_pane(4242), serve.read_session_registry()) == "working"
+
+
+def test_vocabulary_drift_alerts_once_per_window(registry_dir):
+    _write(registry_dir, 4242, status="streaming")
+    _write(registry_dir, 4343, status="busy")
+    reg = serve.read_session_registry()
+    sent = []
+    alert = lambda **kw: sent.append(kw)  # noqa: E731
+    watch = {"alerted_at": None}
+    assert serve._vocab_watch(reg, 1000.0, watch, alert=alert) == ["streaming"]
+    assert len(sent) == 1 and sent[0]["alert_id"] == "session-state-vocabulary-drift"
+    assert "streaming" in sent[0]["message"]
+    serve._vocab_watch(reg, 1060.0, watch, alert=alert)
+    assert len(sent) == 1                                          # throttled
+    serve._vocab_watch(reg, 1000.0 + serve.REGISTRY_LOSS_REALERT_SECS + 1, watch, alert=alert)
+    assert len(sent) == 2                                          # re-raised later
+    assert serve._vocab_watch([{"status": "idle"}], 9000.0, watch, alert=alert) == []
+
+
+def test_is_trust_dialog():
+    assert serve.is_trust_dialog("❯ No, exit\n  Yes, I trust this folder")
+    assert serve.is_trust_dialog("Quick safety check: Is this a project you created")
+    assert not serve.is_trust_dialog("⏺ Done.\n❯ ")
+    assert not serve.is_trust_dialog("")

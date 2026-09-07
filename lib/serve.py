@@ -114,8 +114,6 @@ PROGRESS_WORDS = [
     "tokens)", "context)", "Cooked for",
 ]
 # Spinner characters Claude Code uses in terminal titles and content
-SPINNERS = set("⠐⠑⠒⠓⠔⠕⠖⠗⠘⠙⠚⠛⠜⠝⠞⠟⠠⠡⠢⠣⠤⠥⠦⠧⠨⠩⠪⠫⠬⠭⠮⠯"
-               "⠰⠱⠲⠳⠴⠵⠶⠷⠸⠹⠺⠻⠼⠽⠾⠿✳✶✷✸✹✺✻✼⣾⣽⣻⢿⡿⣟⣯⣷")
 
 # SGR escape sequences — stripped before parsing the statusline off a pane tail
 # (capture-pane -p is already plain, but keep this defensive for -e captures).
@@ -693,6 +691,13 @@ REGISTRY_STATUS_TO_STATE = {
     "idle": "waiting",      # at rest, ready for you
     "waiting": "waiting",   # a dialog holds it (permission / question / elicitation)
 }
+# A status value outside this map (a Claude Code vocabulary change) is treated
+# as WORKING, never as at-rest: at-rest would swallow the working->waiting edge
+# and silence the notifier again; working still pings when the session settles.
+# `_vocab_watch` raises an alert naming the unknown value(s).
+UNKNOWN_STATUS_STATE = "working"
+TRUST_DIALOG_RX = re.compile(r"trust this folder|quick safety check|trust the files", re.I)
+PARKED_AGGREGATE_SECS = 45           # collect a boot wave of parked panes into one ping
 _TMUX_REF_RX = re.compile(r"^(.+):@(\d+)\.%(\d+)$")
 REGISTRY_LOSS_GRACE_SECS = 120        # fleet-wide absence must persist this long
 REGISTRY_LOSS_REALERT_SECS = 6 * 3600
@@ -794,7 +799,37 @@ def detect_session_state(pane, registry=None):
     rec = registry_record(pane, registry)
     if rec is None:
         return "waiting"
-    return REGISTRY_STATUS_TO_STATE.get(rec.get("status"), "waiting")
+    return REGISTRY_STATUS_TO_STATE.get(rec.get("status"), UNKNOWN_STATUS_STATE)
+
+
+def is_trust_dialog(tail):
+    """True when a pane shows Claude's workspace-trust dialog: no REPL is running
+    behind it, and nothing will until a human (or `clanker tmux accept-trust`)
+    answers it. 2026-09-06: 37 of 63 fleet panes sat there for a day, unseen."""
+    return bool(TRUST_DIALOG_RX.search(tail or ""))
+
+
+def _vocab_watch(registry, now, watch, alert=None):
+    """Unknown registry status values (a Claude Code vocabulary change) are mapped
+    to UNKNOWN_STATUS_STATE by detect_session_state; this makes the drift LOUD:
+    one clanker alert per REGISTRY_LOSS_REALERT_SECS naming the values. Returns
+    the sorted unknown values (empty when the vocabulary is fully known)."""
+    unknown = sorted({str(r.get("status")) for r in registry
+                      if r.get("status") not in REGISTRY_STATUS_TO_STATE})
+    if not unknown:
+        return unknown
+    if (watch.get("alerted_at") is not None
+            and now - watch["alerted_at"] < REGISTRY_LOSS_REALERT_SECS):
+        return unknown
+    watch["alerted_at"] = now
+    msg = (f"Claude Code session registry uses status value(s) this dashboard does "
+           f"not know: {', '.join(unknown)} — treated as WORKING; extend "
+           f"REGISTRY_STATUS_TO_STATE in lib/serve.py")
+    log.warning(msg)
+    (alert or _raise_alert)(
+        alert_id="session-state-vocabulary-drift", severity="warning",
+        source="dashboard", message=msg, details={"unknown": unknown})
+    return unknown
 
 
 def registry_coverage(panes, registry):
@@ -866,6 +901,11 @@ def classify_rest_state(tail):
                 return l[:140]
         return ""
 
+    if TRUST_DIALOG_RX.search(text):
+        return "decision", ("parked at Claude's workspace-trust dialog — no session "
+                            "running; answer Yes in the pane or run: "
+                            "clanker tmux accept-trust")
+
     dec_rx = r"do you want|always allow|allow once|don'?t ask again"
     has_options = (re.search(r"(?m)^\s*❯?\s*1\.\s", text)
                    and re.search(r"(?m)^\s*2\.\s", text))
@@ -915,17 +955,33 @@ def classify_working_state(tail):
     return "working", 0, _last_activity_line(tail)
 
 
+_ACTION_MARKERS = ("⏺", "●")     # ⏺ (older builds) / ● (2.1.2xx) lead every action/summary line
+_CHROME_RX = re.compile(
+    r"^[⏵⏸]"                      # permission-mode line: "⏵⏵ bypass permissions on …"
+    r"|\bctx:\d+%"                # the statusline chips: "Fable 5.1 | ctx:90%/1M | …"
+    r"|^\S+@\S+:[~/]"             # "user@host:~/path" prompt echo under the input box
+    r"|shift\+tab|for agents|esc to interrupt"
+    r"|^[─│╭╰╮╯═\s]+$")
+
+
+def _is_chrome(s):
+    """Lines that are UI furniture, never content: box drawing, the input box,
+    the statusline and mode hints (the 2026-09-07 ping body was
+    '⏵⏵ bypass permissions on …' because these were treated as content)."""
+    return (not s) or "─" in s or "❯" in s or "│" in s or bool(_CHROME_RX.search(s))
+
+
 def _last_activity_line(tail):
-    """The most recent line that says WHAT is happening: prefer Claude's ⏺
+    """The most recent line that says WHAT is happening: prefer Claude's ⏺/●
     action/summary lines, fall back to the last non-chrome content line."""
     lines = (tail or "").split("\n")
     for line in reversed(lines):
         s = line.strip()
-        if s.startswith("⏺"):
+        if s.startswith(_ACTION_MARKERS):
             return s[:140]
     for line in reversed(lines):
         s = line.strip()
-        if s and "─" not in s and "❯" not in s and "│" not in s:
+        if not _is_chrome(s):
             return s[:140]
     return ""
 
@@ -1941,6 +1997,10 @@ async def monitor_sessions(app):
     agents_pinged = set()  # sessions already pinged for their current fan-out
     fanout_check = {}      # sid -> ts of last fan-out capture_pane_tail (S2: throttle to 1/30s)
     reg_watch = {"lost_since": None, "alerted_at": None}  # state-source loss watchdog
+    vocab_watch = {"alerted_at": None}                    # unknown status values
+    parked = set()         # claude panes showing the workspace-trust dialog (no REPL)
+    parked_check = {}      # sid -> ts of last parked check (throttle: 1/30s per pane)
+    parked_pending = {}    # sid -> ts first seen parked, awaiting the aggregate ping
     announced = False
     # Subagent limit-kill watcher: the SubagentStop hook appends to this queue;
     # start at the current size so historical entries never burst on restart.
@@ -1956,6 +2016,7 @@ async def monitor_sessions(app):
                 now = time.time()
                 registry = read_session_registry()
                 covered, total = _registry_watch(panes, registry, now, reg_watch)
+                _vocab_watch(registry, now, vocab_watch)
                 if not announced:
                     announced = True
                     log.info("session-state source: %d/%d claude panes have a live "
@@ -1975,6 +2036,9 @@ async def monitor_sessions(app):
                     last_ping.pop(sid, None)
                     notified.discard(sid)
                     fanout_check.pop(sid, None)
+                    parked.discard(sid)
+                    parked_check.pop(sid, None)
+                    parked_pending.pop(sid, None)
                 if crashed and NTFY_TOPIC and now >= muted_until:
                     names = ", ".join(sorted(crashed)[:6])
                     title = (f"{crashed[0]} vanished mid-work" if len(crashed) == 1
@@ -2030,6 +2094,27 @@ async def monitor_sessions(app):
                     state = detect_session_state(p, registry)
                     was = prev_state.get(sid)
                     prev_state[sid] = state
+
+                    # A claude pane with NO registry record has no REPL behind
+                    # it. If it shows the workspace-trust dialog it is parked —
+                    # nothing will ever happen there (2026-09-06: 37 of 63 fleet
+                    # panes, for a day, unseen). Checked at most every 30 s per
+                    # pane; panes already parked when the monitor starts are
+                    # seeded silently, ones that park later earn ONE aggregate
+                    # ping per PARKED_AGGREGATE_SECS window.
+                    if registry_record(p, registry) is None:
+                        if now - parked_check.get(sid, 0.0) >= 30:
+                            parked_check[sid] = now
+                            if is_trust_dialog(capture_pane_tail(p["target"], lines=20)):
+                                if sid not in parked:
+                                    parked.add(sid)
+                                    if was is not None:
+                                        parked_pending[sid] = now
+                            else:
+                                parked.discard(sid)
+                    elif sid in parked:
+                        parked.discard(sid)
+                        parked_pending.pop(sid, None)
 
                     if state != "waiting":
                         # working/idle ends the episode: reset so the NEXT genuine
@@ -2093,6 +2178,18 @@ async def monitor_sessions(app):
                         http, title, priority, tags, body, now, muted_until)
                     if delivered:
                         last_ping[sid] = now
+
+                if (parked_pending and NTFY_TOPIC and now >= muted_until
+                        and now - min(parked_pending.values()) >= PARKED_AGGREGATE_SECS):
+                    names = sorted(parked_pending)
+                    parked_pending.clear()
+                    title = (f"{names[0]} parked at Claude's trust dialog" if len(names) == 1
+                             else f"{len(names)} sessions parked at Claude's trust dialog")
+                    _, muted_until = await _post_ntfy(
+                        http, title, "high", "lock",
+                        "no Claude running there — answer Yes in the pane, or run: "
+                        f"clanker tmux accept-trust  ({', '.join(names[:8])}"
+                        f"{', …' if len(names) > 8 else ''})", now, muted_until)
             except Exception as e:
                 log.debug("Monitor error: %s", e)
 

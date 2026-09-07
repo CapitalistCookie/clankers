@@ -186,3 +186,37 @@ def test_healthz_bypasses_auth_but_nothing_else_does():
         asyncio.run(auth_middleware(_Req("/"), handler))
     with pytest.raises(web.HTTPFound):
         asyncio.run(auth_middleware(_Req("/healthz2"), handler))
+
+
+# ── 2026-09-07: parked panes + ping bodies ──
+TRUST_DIALOG = """\
+ Accessing workspace:
+ /home/dev/projects/x
+ Quick safety check: Is this a project you created or one you trust? (Like your own code)
+ Claude Code'll be able to read, edit, and execute files here.
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel"""
+
+STATUSLINE_TAIL = """\
+● done
+╭──────────────────────────────────────────────╮
+│ ❯                                            │
+╰──────────────────────────────────────────────╯
+     dev@box:~/projects/x
+     Fable 5.1 | ctx:12%/1M | main | 5h:3% ↻2h
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"""
+
+
+def test_trust_dialog_is_a_decision_that_names_the_fix():
+    sub, detail = classify_rest_state(TRUST_DIALOG)
+    assert sub == "decision" and "trust" in detail and "accept-trust" in detail
+
+
+def test_last_activity_uses_the_2_1_marker_and_skips_statusline_chrome():
+    assert _last_activity_line(STATUSLINE_TAIL) == "● done"
+    # no marker at all: the last CONTENT line wins, never the chrome (the
+    # 2026-09-07 ping body was the "⏵⏵ bypass permissions on …" hint)
+    tail = STATUSLINE_TAIL.replace("● done", "the fix is committed")
+    assert _last_activity_line(tail) == "the fix is committed"
+    assert _craft_notification("s", tail)[3] == "the fix is committed"

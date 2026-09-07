@@ -273,3 +273,75 @@ def test_real_tmux_server_born_from_bare_env_is_healed(tmp_path, monkeypatch):
             tmux("kill-server")
         shutil.rmtree(sockdir, ignore_errors=True)
     assert tmux("has-session", "-t", "probe").returncode != 0   # private server gone
+
+
+# ── 2026-09-07: the workspace-trust dialog (2.1.263 highlights "No, exit" first) ──
+DIALOG_NO_FIRST = ("Quick safety check: Is this a project you created or one you trust?\n"
+                   " ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm")
+DIALOG_YES_ON = ("Quick safety check: Is this a project you created or one you trust?\n"
+                 "   No, exit\n ❯ Yes, I trust this folder\n Enter to confirm")
+DIALOG_OLD = "Do you trust the files in this folder?\n ❯ Yes, proceed\n   No, exit"
+
+
+def test_trust_cursor_reads_the_layout():
+    assert newsession._trust_cursor("$ ") is None
+    assert newsession._trust_cursor(DIALOG_NO_FIRST) == "down"
+    assert newsession._trust_cursor(DIALOG_YES_ON) == "yes"
+    assert newsession._trust_cursor(DIALOG_OLD) == "yes"
+    assert newsession._trust_cursor("Quick safety check\n   (rendering)") == "unknown"
+
+
+def test_accept_trust_moves_cursor_to_yes_before_enter(monkeypatch):
+    monkeypatch.setattr(newsession.time, "sleep", lambda s: None)
+    state = {"screen": DIALOG_NO_FIRST}
+    keys = []
+
+    def run(argv, **kw):
+        if "capture-pane" in argv:
+            return FakeProc(0, state["screen"])
+        if "send-keys" in argv:
+            keys.append(argv[-1])
+            if argv[-1] == "Down":
+                state["screen"] = DIALOG_YES_ON
+            if argv[-1] == "Enter":
+                state["screen"] = "❯ "
+        return FakeProc(0)
+    monkeypatch.setattr(newsession.subprocess, "run", run)
+    assert newsession.accept_trust_prompt("s", timeout=5) is True
+    assert keys == ["Down", "Enter"]
+
+
+def test_accept_trust_never_confirms_while_cursor_is_on_no(monkeypatch):
+    """Mutation check for the old behaviour (a bare Enter = 'No, exit')."""
+    monkeypatch.setattr(newsession.time, "sleep", lambda s: None)
+    keys = []
+
+    def run(argv, **kw):
+        if "capture-pane" in argv:
+            return FakeProc(0, DIALOG_NO_FIRST)      # the cursor never moves
+        if "send-keys" in argv:
+            keys.append(argv[-1])
+        return FakeProc(0)
+    monkeypatch.setattr(newsession.subprocess, "run", run)
+    assert newsession.accept_trust_prompt("s", timeout=0.4) is False
+    assert "Enter" not in keys and "Down" in keys
+
+
+def test_accept_trust_prompts_skips_registered_and_missing_panes(monkeypatch, tmp_path):
+    monkeypatch.setattr(newsession.time, "sleep", lambda s: None)
+    monkeypatch.setenv("CLANKER_CLAUDE_SESSIONS_DIR", str(tmp_path))
+    (tmp_path / "1.json").write_text('{"pid": 1, "tmux": "up:@1.%1", "status": "idle"}')
+    screens = {"parked": DIALOG_YES_ON}
+    keys = []
+
+    def run(argv, **kw):
+        name = argv[argv.index("-t") + 1] if "-t" in argv else None
+        if "capture-pane" in argv:
+            return FakeProc(0, screens[name]) if name in screens else FakeProc(1)
+        if "send-keys" in argv:
+            keys.append((name, argv[-1]))
+            screens["parked"] = "❯ "
+        return FakeProc(0)
+    monkeypatch.setattr(newsession.subprocess, "run", run)
+    assert newsession.accept_trust_prompts(["up", "parked", "gone"], timeout=5) == ["parked"]
+    assert keys == [("parked", "Enter")]

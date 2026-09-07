@@ -6,6 +6,7 @@ and launches Claude with the sandbox disabled and permission prompts skipped
 [name]` (aliases: `attach`, `test`) attaches to it — defaulting to the most recent one
 `new` created. Works from anywhere; nothing here is project-specific.
 """
+import json
 import os
 import pwd
 import re
@@ -147,19 +148,111 @@ def _wait_shell_prompt(name, timeout=3.0):
     return False
 
 
-def _accept_trust_prompt(name, tries=14, interval=0.5):
-    """Best-effort: poll the pane for Claude's 'trust this folder?' dialog and accept
-    it (Enter selects the pre-highlighted Yes), so the session lands ready."""
-    for _ in range(tries):
+TRUST_DIALOG_RX = re.compile(r"trust this folder|trust the files|quick safety check", re.I)
+
+
+def _trust_cursor(text):
+    """Where the workspace-trust dialog's ❯ cursor sits relative to its Yes line:
+    'yes' (on it), 'down' / 'up' (Yes is below / above the cursor), 'unknown'
+    (dialog visible, layout unreadable), or None (no dialog on screen).
+    Claude Code 2.1.263 lists `❯ No, exit` FIRST and `Yes, I trust this folder`
+    second — a bare Enter EXITS the session (older builds pre-highlighted Yes).
+    Enter is therefore only ever sent while the cursor is on Yes."""
+    if not text or not TRUST_DIALOG_RX.search(text):
+        return None
+    lines = text.split("\n")
+    cursor = next((i for i, ln in enumerate(lines) if "❯" in ln), None)
+    yes = next((i for i, ln in enumerate(lines) if re.search(r"\byes\b", ln, re.I)), None)
+    if cursor is None or yes is None:
+        return "unknown"
+    if cursor == yes:
+        return "yes"
+    return "down" if yes > cursor else "up"
+
+
+def _answer_trust(name, where):
+    """One keystroke toward Yes; True when the dialog was confirmed."""
+    if where == "yes":
+        subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], capture_output=True)
+        return True
+    if where in ("down", "up"):
+        subprocess.run(["tmux", "send-keys", "-t", name, "Down" if where == "down" else "Up"],
+                       capture_output=True)
+    return False
+
+
+def accept_trust_prompt(name, timeout=7.0, interval=0.5):
+    """Answer Claude's workspace-trust dialog with YES in pane `name` (best
+    effort — the dialog may never appear). Returns True iff it was answered."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         p = subprocess.run(["tmux", "capture-pane", "-p", "-t", name],
                            capture_output=True, text=True)
         if p.returncode != 0:
-            return
-        low = p.stdout.lower()
-        if "trust this folder" in low or "trust the files" in low:
-            subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], capture_output=True)
-            return
-        time.sleep(interval)
+            return False
+        where = _trust_cursor(p.stdout)
+        if _answer_trust(name, where):
+            return True
+        time.sleep(0.3 if where in ("down", "up") else interval)
+    return False
+
+
+def _sessions_dir():
+    override = os.environ.get("CLANKER_CLAUDE_SESSIONS_DIR")
+    if override:
+        return override
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(cfg, "sessions")
+
+
+def _repl_registered(name):
+    """True when a live Claude REPL already claims tmux session `name` in Claude
+    Code's session registry (~/.claude/sessions/<pid>.json, `tmux` field) — it
+    got past every startup dialog, so there is nothing left to answer."""
+    try:
+        for fn in os.listdir(_sessions_dir()):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(_sessions_dir(), fn)) as f:
+                    rec = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if (rec.get("tmux") or "").startswith(name + ":"):
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def accept_trust_prompts(names, timeout=120.0, interval=2.0):
+    """Boot-path variant (`clanker tmux accept-trust`): watch MANY panes for up
+    to `timeout` s — a fleet launched at boot takes a while to reach the dialog
+    — and answer each once. Panes whose REPL is already registered, or that no
+    longer exist, are dropped. Returns the names answered.
+    Why: after the 2026-09-06 reboot 37 of 63 mapped sessions sat at
+    `❯ No, exit` for a day (Claude shows the dialog even with
+    --dangerously-skip-permissions and never remembers it for $HOME). The boot
+    map is the operator's trust declaration for exactly these repos."""
+    pending = list(dict.fromkeys(names))
+    answered = []
+    deadline = time.time() + timeout
+    while pending and time.time() < deadline:
+        for name in list(pending):
+            if _repl_registered(name):
+                pending.remove(name)
+                continue
+            p = subprocess.run(["tmux", "capture-pane", "-p", "-t", name],
+                               capture_output=True, text=True)
+            if p.returncode != 0:
+                pending.remove(name)
+                continue
+            if _answer_trust(name, _trust_cursor(p.stdout)):
+                answered.append(name)
+                pending.remove(name)
+        if pending:
+            time.sleep(interval)
+    return answered
 
 
 def spawn(name=None, cwd=None, shell=False, resume=None):
@@ -193,7 +286,7 @@ def spawn(name=None, cwd=None, shell=False, resume=None):
         subprocess.run(["tmux", "send-keys", "-t", name, "-l", "--", launch_cmd(cwd, resume=resume)],
                        capture_output=True)
         subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], capture_output=True)
-        _accept_trust_prompt(name)
+        accept_trust_prompt(name)
 
     _record_last(name)
     what = "shell" if shell else "claude (sandbox off, permissions skipped)"
