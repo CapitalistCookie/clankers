@@ -655,6 +655,16 @@ th[data-col]:hover { color: var(--accent-cream); }
   border-radius: 6px; touch-action: manipulation;
 }
 .compose-bar button:hover { background: #a33a0a; color: var(--accent-cream); }
+/* Delivery verdict for a composed message. Hidden while nothing is in doubt:
+   it appears for "sending…" and stays, red, when a send did not land. */
+.compose-note {
+  display: none; padding: 2px 10px 6px; font-size: 12px; line-height: 1.4;
+  background: var(--bg-deep); color: var(--text-secondary); flex-shrink: 0;
+}
+.compose-note.show { display: block; }
+.compose-bar.pending textarea { opacity: .65; }
+.compose-bar.err textarea { border-color: #c0392b; }
+.compose-bar.err ~ .compose-note { color: #e06c5a; font-weight: 600; }
 .mobile-input {
   display: none; gap: 4px; padding: 4px 6px; flex-wrap: nowrap; align-items: center;
   background: var(--bg-deep); border-top: 1px solid var(--border); flex-shrink: 0;

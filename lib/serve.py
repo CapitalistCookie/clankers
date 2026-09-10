@@ -1401,6 +1401,70 @@ _ALLOWED_KEYS = frozenset({
     "Home", "End", "PPage", "NPage", "IC", "DC",
     "C-c", "C-d", "C-z", "C-l", "C-a", "C-e", "C-u", "C-k", "C-w", "C-r", "C-p", "C-n",
 })
+# One send-keys burst may block this long before we call it lost. Deliberately
+# short: the client is waiting on an ack, and a slow answer is worse than an
+# honest failure it can retry.
+VIEW_INPUT_TIMEOUT = 2
+# Largest literal burst accepted on the "keys" path. A compose-bar message is
+# bytes; anything past this is a malformed/hostile client, not a keystroke.
+VIEW_MAX_KEYS = 64 * 1024
+
+
+async def loop_run(fn, *args):
+    """Run one blocking call off the event loop.
+
+    The capture path always did this; the INPUT path called subprocess.run
+    inline, so every keystroke froze the whole server for the duration of a
+    tmux round trip (~5ms measured) and a 2s timeout froze it for two seconds.
+    """
+    return await asyncio.get_event_loop().run_in_executor(None, fn, *args)
+
+
+def _pane_in_mode(target):
+    """True when the pane sits in a tmux mode (copy-mode et al). Unknown -> False."""
+    try:
+        r = subprocess.run(["tmux", "display", "-p", "-t", target, "#{pane_in_mode}"],
+                           capture_output=True, text=True, timeout=VIEW_INPUT_TIMEOUT)
+        return r.returncode == 0 and r.stdout.strip() == "1"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _tmux_input(target, argv, heal_mode=True):
+    """Deliver ONE input burst to a pane. Returns (ok, err) — never raises.
+
+    Blocking on purpose; every caller runs it off the event loop. It exists
+    because the old inline `subprocess.run(..., capture_output=True)` made a
+    LOST keystroke indistinguishable from a delivered one, in three ways:
+
+      1. the exit status was discarded, so a failing send-keys looked identical
+         to a working one;
+      2. a pane sitting in tmux COPY-MODE routes send-keys into the copy-mode
+         key table — the application never sees the keys, while capture-pane
+         keeps returning content. That is exactly the "updates keep streaming
+         but nothing I type arrives" shape (2026-09-10, hyperliquid pane).
+         Cancel the mode first, and say so in the log;
+      3. subprocess.TimeoutExpired escaped the per-frame handler and killed the
+         whole socket's input loop.
+    """
+    healed = False
+    try:
+        if heal_mode and _pane_in_mode(target):
+            # -X cancel is the documented way out of any pane mode. Its own
+            # failure is not fatal: the send below is still worth attempting.
+            subprocess.run(["tmux", "send-keys", "-X", "-t", target, "cancel"],
+                           capture_output=True, timeout=VIEW_INPUT_TIMEOUT)
+            healed = True
+            log.info("View input: pane %s was in copy-mode — cancelled before send", target)
+        r = subprocess.run(["tmux", "send-keys", "-t", target, *argv],
+                           capture_output=True, text=True, timeout=VIEW_INPUT_TIMEOUT)
+        if r.returncode != 0:
+            return False, (r.stderr or "").strip()[:200] or f"rc={r.returncode}"
+        return True, "healed copy-mode" if healed else ""
+    except subprocess.TimeoutExpired:
+        return False, f"tmux send-keys timed out after {VIEW_INPUT_TIMEOUT}s"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"{type(e).__name__}: {e}"[:200]
 
 
 def _ws_origin_ok(request):
@@ -1691,7 +1755,6 @@ async def handle_view(request):
     if _view_count >= MAX_VIEWS:
         await ws.close(message=b"Too many active viewers")
         return ws
-    _view_count += 1
 
     target = valid_sessions[session_name]
     log.info("View opened: %s (capture-pane mode)", session_name)
@@ -1706,10 +1769,19 @@ async def handle_view(request):
         is_tui = _alt.stdout.strip() == "1"
     except (OSError, subprocess.SubprocessError):
         is_tui = False
+    # `ack: True` advertises the verified-input protocol (below) so a client can
+    # tell a server that confirms delivery from one that cannot. Old clients
+    # ignore the field; a new client against an old server sees it absent and
+    # falls back to fire-and-forget instead of red-flagging every send.
     try:
-        await ws.send_str(json.dumps({"type": "meta", "tui": is_tui}))
+        await ws.send_str(json.dumps({"type": "meta", "tui": is_tui, "ack": True}))
     except Exception:
         pass
+
+    # Counted only once the socket is genuinely in service, and released in the
+    # finally below. Incrementing before the frames above could leak a slot on a
+    # send failure, and MAX_VIEWS leaked slots lock every viewer out until restart.
+    _view_count += 1
 
     last_content = ""
 
@@ -1791,34 +1863,96 @@ async def handle_view(request):
 
     read_task = asyncio.create_task(capture_reader())
 
+    async def reply(frame):
+        """Best-effort control frame back to the client. A dead socket ends the
+        stream on its own (capture_reader); never let it break the input loop."""
+        try:
+            await ws.send_str(json.dumps(frame))
+            return True
+        except Exception:
+            return False
+
+    def _seq_of(data):
+        """The client's optional delivery receipt id. Absent -> fire-and-forget
+        (wheel/scroll telemetry, and any older client)."""
+        seq = data.get("seq")
+        return seq if isinstance(seq, int) else None
+
+    async def deliver(argv, seq, label):
+        """Run one send-keys off the event loop, then tell the client the TRUTH
+        about it. Verification lives INSIDE the action, not in a watcher of it."""
+        ok, err = await loop_run(_tmux_input, target, argv)
+        if not ok:
+            log.warning("View input FAILED for %s (%s): %s", session_name, label, err)
+        elif err:
+            log.info("View input for %s (%s): %s", session_name, label, err)
+        if seq is not None:
+            frame = {"type": "ack", "seq": seq, "ok": ok}
+            if not ok:
+                frame["err"] = err or "send-keys failed"
+            await reply(frame)
+        return ok
+
     try:
         async for msg in ws:
-            if msg.type == web.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    if data.get("type") == "keys":
-                        # Literal text. -l makes it literal; -- ends option parsing so
-                        # text starting with '-' can never be read as a flag.
-                        keys = data.get("data", "")
-                        if isinstance(keys, str) and keys:
-                            subprocess.run(
-                                ["tmux", "send-keys", "-t", target, "-l", "--", keys],
-                                capture_output=True, timeout=2,
-                            )
-                    elif data.get("type") == "key":
-                        # Named key — MUST be on the allowlist (else it's flag injection).
-                        key = data.get("data", "")
-                        if key in _ALLOWED_KEYS:
-                            subprocess.run(
-                                ["tmux", "send-keys", "-t", target, "--", key],
-                                capture_output=True, timeout=2,
-                            )
-                    elif data.get("type") == "ping":
-                        # Client keepalive — answer it, so the browser can prove
-                        # the round trip even while the pane is idle.
-                        await ws.send_str(json.dumps({"type": "pong"}))
-                except (json.JSONDecodeError, KeyError):
-                    pass
+            if msg.type != web.WSMsgType.TEXT:
+                continue
+            # One malformed or unlucky frame must never take the socket down
+            # with it: before 2026-09-10 a TimeoutExpired out of send-keys
+            # escaped this loop and silently ended every later keystroke.
+            # `seq` is hoisted so that even an UNEXPECTED failure answers the
+            # client — a tracked frame that is never answered is the exact
+            # silence this whole protocol exists to abolish.
+            seq = None
+            try:
+                data = json.loads(msg.data)
+                if not isinstance(data, dict):
+                    continue
+                kind = data.get("type")
+                seq = _seq_of(data)
+                if kind == "keys":
+                    # Literal text. -l makes it literal; -- ends option parsing so
+                    # text starting with '-' can never be read as a flag.
+                    keys = data.get("data", "")
+                    if not isinstance(keys, str) or not keys:
+                        if seq is not None:
+                            await reply({"type": "ack", "seq": seq, "ok": False,
+                                         "err": "empty or non-string keys"})
+                    elif len(keys) > VIEW_MAX_KEYS:
+                        log.warning("View input rejected for %s: %d bytes over cap",
+                                    session_name, len(keys))
+                        if seq is not None:
+                            await reply({"type": "ack", "seq": seq, "ok": False,
+                                         "err": "burst too large"})
+                    else:
+                        await deliver(["-l", "--", keys], seq, "keys")
+                elif kind == "key":
+                    # Named key — MUST be on the allowlist (else it's flag injection).
+                    key = data.get("data", "")
+                    if key in _ALLOWED_KEYS:
+                        await deliver(["--", key], seq, f"key:{key}")
+                    else:
+                        log.warning("View input rejected for %s: key %r not allowed",
+                                    session_name, key)
+                        if seq is not None:
+                            await reply({"type": "ack", "seq": seq, "ok": False,
+                                         "err": "key not allowed"})
+                elif kind == "ping":
+                    # Client keepalive — answer it, so the browser can prove
+                    # the round trip even while the pane is idle. Echoing seq
+                    # turns the keepalive into an UPLINK proof: silence here
+                    # means our frames are not arriving, which a downstream-only
+                    # liveness check can never see.
+                    pong = {"type": "pong"}
+                    if seq is not None:
+                        pong["seq"] = seq
+                    await reply(pong)
+            except Exception as e:
+                log.warning("View input frame dropped for %s: %s: %s",
+                            session_name, type(e).__name__, e)
+                if seq is not None:
+                    await reply({"type": "ack", "seq": seq, "ok": False,
+                                 "err": f"{type(e).__name__}: {e}"[:200]})
     except Exception as e:
         log.warning("View WebSocket error for %s: %s", session_name, e)
     finally:
@@ -2396,6 +2530,9 @@ def _live_features_html():
     <textarea id="compose-input" rows="1" placeholder="Message — Enter sends, Shift+Enter = newline" enterkeyhint="send" autocomplete="on" autocapitalize="sentences" spellcheck="true"></textarea>
     <button class="compose-send" id="compose-send" title="Send">➤</button>
   </div>
+  <!-- Delivery verdict for the last composed message. A send that did not reach
+       the pane says so here instead of looking exactly like one that did. -->
+  <div class="compose-note" id="compose-note"></div>
   <div class="mobile-input">
     <button class="signal" id="key-esc" title="Escape · hold: hide/show todos">esc</button>
     <button class="signal" onclick="sendNamed('Tab')" title="Tab">tab</button>

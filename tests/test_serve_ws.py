@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 from aiohttp import web, WSMsgType
@@ -219,3 +220,323 @@ def test_heartbeat_threshold_is_under_the_client_stall_window():
     stall_ms = int(m.group(1))
     assert serve.VIEW_HEARTBEAT_SECS * 1000 * 2 < stall_ms, (
         f"heartbeat {serve.VIEW_HEARTBEAT_SECS}s too slow for STALL_MS={stall_ms}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Verified input (2026-09-10) — the CLIENT -> SERVER direction.
+#
+# Regression cover for "the terminal streams updates but nothing I type
+# arrives": on 2026-09-10 three consecutive healthy sockets on the hyperliquid
+# pane carried 148 seconds of the operator's typing into a void, and the box
+# logged NOTHING about it — send-keys ran with capture_output=True and its exit
+# status thrown away, so a lost keystroke and a delivered one were the same
+# event. These tests pin the four properties that make that undiagnosable
+# failure impossible: the outcome is checked, reported, survivable, and the one
+# tmux state that silently eats input is healed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _stub_tmux(monkeypatch, in_mode="0", send_rc=0, send_stderr="", raises=None):
+    """Replace subprocess.run under serve with a recorder. capture_pane_ansi
+    uses check_output, so the content stream is unaffected."""
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        if "display" in argv:
+            return _FakeProc(0, in_mode, "")
+        if "-X" in argv:                      # copy-mode cancel
+            return _FakeProc(0, "", "")
+        if raises is not None:
+            raise raises
+        return _FakeProc(send_rc, "", send_stderr)
+
+    monkeypatch.setattr(serve.subprocess, "run", fake_run)
+    return calls
+
+
+def _sends(calls):
+    return [c for c in calls if "send-keys" in c and "-X" not in c]
+
+
+def test_meta_advertises_the_ack_protocol(monkeypatch):
+    """A client must be able to TELL whether this server confirms delivery —
+    assuming receipts against an older server would fail every send on timeout."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+
+    async def scenario(ws):
+        meta, frames = await _collect(ws, lambda f: f.get("type") == "meta")
+        assert meta, frames
+        assert meta.get("ack") is True, f"ack support not advertised: {meta}"
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_input_is_delivered_and_acked(monkeypatch):
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    calls = _stub_tmux(monkeypatch)
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "keys", "data": "hello", "seq": 7}))
+        ack, frames = await _collect(ws, lambda f: f.get("type") == "ack")
+        assert ack, f"input was never acknowledged: {frames}"
+        assert ack["seq"] == 7 and ack["ok"] is True, ack
+        sends = _sends(calls)
+        assert sends and sends[-1] == ["tmux", "send-keys", "-t", TARGET, "-l", "--", "hello"], sends
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_failed_send_is_nacked_never_swallowed(monkeypatch):
+    """THE core regression: send-keys' exit status used to be discarded, so a
+    failure looked exactly like a success and the operator saw nothing."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    _stub_tmux(monkeypatch, send_rc=1, send_stderr="can't find pane")
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "keys", "data": "hello", "seq": 1}))
+        ack, frames = await _collect(ws, lambda f: f.get("type") == "ack")
+        assert ack, f"a FAILED send went unreported: {frames}"
+        assert ack["ok"] is False, ack
+        assert "can't find pane" in ack.get("err", ""), ack
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_copy_mode_is_cancelled_before_input(monkeypatch):
+    """A pane in tmux copy-mode routes send-keys into the copy-mode key table:
+    the application never sees the keys, while capture-pane keeps returning
+    content. That is precisely the "updates stream, input vanishes" shape, and
+    it is invisible from the exit status (send-keys succeeds). Heal it first."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    calls = _stub_tmux(monkeypatch, in_mode="1")
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "keys", "data": "hi", "seq": 3}))
+        ack, frames = await _collect(ws, lambda f: f.get("type") == "ack")
+        assert ack and ack["ok"] is True, f"{ack} {frames}"
+        cancels = [c for c in calls if "-X" in c]
+        assert cancels, f"pane was in copy-mode and was NOT cancelled: {calls}"
+        assert cancels[0] == ["tmux", "send-keys", "-X", "-t", TARGET, "cancel"], cancels
+        # order matters: cancel must precede the payload, or it lands in the mode
+        assert calls.index(cancels[0]) < calls.index(_sends(calls)[-1])
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_healthy_pane_is_not_cancelled(monkeypatch):
+    """Healing must be surgical: a pane that is NOT in a mode must never be sent
+    an -X cancel (it would interrupt whatever the app is doing)."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    calls = _stub_tmux(monkeypatch, in_mode="0")
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "keys", "data": "hi", "seq": 4}))
+        ack, _ = await _collect(ws, lambda f: f.get("type") == "ack")
+        assert ack and ack["ok"] is True
+        assert not [c for c in calls if "-X" in c], f"spurious cancel: {calls}"
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_send_timeout_is_nacked_and_the_socket_keeps_working(monkeypatch):
+    """A subprocess.TimeoutExpired out of send-keys used to escape the per-frame
+    handler and end the whole input loop — every LATER keystroke on that socket
+    was then dropped, with the content stream still running. One bad frame must
+    cost one frame."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    state = {"boom": True}
+    real = serve._tmux_input
+
+    def flaky(target, argv, heal_mode=True):
+        if state["boom"]:
+            state["boom"] = False
+            raise subprocess_TimeoutExpired
+        return real(target, argv, heal_mode=heal_mode)
+
+    subprocess_TimeoutExpired = __import__("subprocess").TimeoutExpired("tmux", 2)
+    monkeypatch.setattr(serve, "_tmux_input", flaky)
+    _stub_tmux(monkeypatch)
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "keys", "data": "first", "seq": 1}))
+        a1, frames = await _collect(ws, lambda f: f.get("type") == "ack" and f.get("seq") == 1)
+        assert a1 and a1["ok"] is False, f"timeout not reported: {a1} {frames}"
+        # ...and the socket is still in service for the NEXT keystroke
+        await ws.send_str(json.dumps({"type": "keys", "data": "second", "seq": 2}))
+        a2, frames = await _collect(ws, lambda f: f.get("type") == "ack" and f.get("seq") == 2)
+        assert a2 and a2["ok"] is True, f"input loop died on one bad frame: {a2} {frames}"
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_disallowed_key_is_nacked_and_never_executed(monkeypatch):
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    calls = _stub_tmux(monkeypatch)
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "key", "data": "-X", "seq": 5}))
+        ack, frames = await _collect(ws, lambda f: f.get("type") == "ack")
+        assert ack and ack["ok"] is False, f"{ack} {frames}"
+        assert "not allowed" in ack.get("err", ""), ack
+        assert not _sends(calls), f"rejected key still reached tmux: {calls}"
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_oversized_burst_is_rejected(monkeypatch):
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    calls = _stub_tmux(monkeypatch)
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "keys",
+                                      "data": "z" * (serve.VIEW_MAX_KEYS + 1), "seq": 6}))
+        ack, _ = await _collect(ws, lambda f: f.get("type") == "ack")
+        assert ack and ack["ok"] is False and "too large" in ack.get("err", ""), ack
+        assert not _sends(calls), calls
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_keepalive_echoes_the_seq(monkeypatch):
+    """An idle pane emits content nobody sent, so only the pong's seq can prove
+    that OUR frames are still reaching the server."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "ping", "seq": 42}))
+        pong, frames = await _collect(ws, lambda f: f.get("type") == "pong")
+        assert pong and pong.get("seq") == 42, f"{pong} {frames}"
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_untracked_input_still_delivered_without_an_ack(monkeypatch):
+    """Back-compat both ways: an older client sends no seq, and the high-rate
+    wheel path deliberately does not either. Those must still be delivered —
+    and must NOT produce ack frames an old client would not understand."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    calls = _stub_tmux(monkeypatch)
+
+    async def scenario(ws):
+        await ws.send_str(json.dumps({"type": "keys", "data": "legacy"}))
+        await ws.send_str(json.dumps({"type": "ping"}))
+        pong, frames = await _collect(ws, lambda f: f.get("type") == "pong")
+        assert pong and "seq" not in pong, pong
+        assert not [f for f in frames if f.get("type") == "ack"], frames
+        sends = _sends(calls)
+        assert sends and sends[-1][-1] == "legacy", sends
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_input_does_not_block_the_content_stream(monkeypatch):
+    """send-keys used to run inline on the event loop, so every keystroke froze
+    the whole server for a tmux round trip and a hung one froze it for seconds.
+    A slow send must not stop the frames."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    counter = {"n": 0}
+
+    def capture(target, scrollback=False, **kw):
+        counter["n"] += 1
+        return f"frame {counter['n']}\n"        # changes every poll
+
+    monkeypatch.setattr(serve, "capture_pane_ansi", capture)
+
+    def slow(target, argv, heal_mode=True):
+        time.sleep(1.0)                          # blocking, like the real tmux call
+        return True, ""
+
+    monkeypatch.setattr(serve, "_tmux_input", slow)
+
+    async def scenario(ws):
+        await _collect(ws, lambda f: f.get("type") == "content")
+        await ws.send_str(json.dumps({"type": "keys", "data": "slow", "seq": 1}))
+        seen = 0
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 6
+        while loop.time() < deadline:
+            msg = await ws.receive(timeout=max(0.05, deadline - loop.time()))
+            if msg.type is not WSMsgType.TEXT:
+                break
+            f = json.loads(msg.data)
+            if f.get("type") == "content":
+                seen += 1
+            if f.get("type") == "ack":
+                break
+        assert seen >= 3, (
+            f"only {seen} content frames arrived during a 1s send — "
+            "the input path is blocking the event loop again")
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+
+
+def test_ack_timeout_contract_between_client_and_server():
+    """Contract: the client gives up on a round trip after ACK_TIMEOUT_MS. That
+    must comfortably exceed the server's own send-keys timeout, or a send that
+    the server is still honestly working on gets reported as lost."""
+    web_dir = os.path.join(os.path.dirname(__file__), "..", "lib", "web")
+    with open(os.path.join(web_dir, "live.js")) as f:
+        js = f.read()
+    import re
+    m = re.search(r"const ACK_TIMEOUT_MS = (\d+)", js)
+    assert m, "ACK_TIMEOUT_MS not found in live.js"
+    ack_ms = int(m.group(1))
+    assert ack_ms > serve.VIEW_INPUT_TIMEOUT * 1000 * 2, (
+        f"ACK_TIMEOUT_MS={ack_ms} too tight for VIEW_INPUT_TIMEOUT="
+        f"{serve.VIEW_INPUT_TIMEOUT}s")
+    # ...and the client must actually read the capability the server advertises.
+    assert "msg.ack" in js, "live.js does not read the server's ack capability"
+
+
+def test_view_slot_is_released_on_every_exit(monkeypatch):
+    """MAX_VIEWS leaked slots lock every viewer out until a restart, so the
+    counter must balance across normal closes AND early rejections."""
+    monkeypatch.setattr(serve, "list_panes", lambda: _panes())
+    monkeypatch.setattr(serve, "capture_pane_ansi",
+                        lambda target, scrollback=False, **kw: "x\n")
+    before = serve._view_count
+
+    async def scenario(ws):
+        await _collect(ws, lambda f: f.get("type") == "content")
+        assert serve._view_count == before + 1, "viewer was never counted"
+        return True
+
+    assert _run(scenario, monkeypatch, hb=30) is True
+    assert serve._view_count == before, (
+        f"view slot leaked: {serve._view_count} != {before}")

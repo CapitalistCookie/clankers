@@ -146,6 +146,7 @@
   "tests/test_ecc_risk.py",
   "tests/test_ecc_trend.py",
   "tests/test_handoff.py",
+  "tests/test_live_js.py",
   "tests/test_livewatch_js.py",
   "tests/test_newsession.py",
   "tests/test_onboard.py",
@@ -171,5 +172,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "358c429"
+ "source_commit": "251d62f"
 }

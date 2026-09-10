@@ -186,3 +186,103 @@ def test_stall_watchdog_hidden_tab_grace_then_verdict():
     check('a recovered stream is not reconnected', live.stalled() === false);
     """)
     assert out["total"] == 4
+
+
+# ── UplinkTracker — the CLIENT -> SERVER direction (2026-09-10) ──────────────
+# Regression cover for "the session streams updates but nothing I type arrives".
+# The stall watchdog above cannot see that failure: it counts ANY inbound frame
+# as proof of life, and a pane that is printing sends content forever. Only an
+# echo of something WE sent proves the uplink still carries our frames.
+
+def test_uplink_settles_a_round_trip():
+    out = _run_js("""
+    const up = W.createUplinkTracker({ now, timeoutMs: 6000, deadAfter: 2 });
+    const a = up.track({ kind: 'compose', text: 'hello' });
+    check('seqs start at 1', a === 1);
+    check('one round trip outstanding', up.pending() === 1);
+    advance(50);
+    const entry = up.settle(a);
+    check('settle returns what was tracked', entry && entry.meta.text === 'hello');
+    check('nothing outstanding after the echo', up.pending() === 0);
+    check('a settled round trip is not a loss', up.dead() === false);
+    advance(60000);
+    check('a settled entry can never expire later', up.sweep().length === 0);
+    """)
+    assert out["total"] == 6
+
+
+def test_uplink_lost_send_is_reported_once_with_its_payload():
+    """THE regression test: a send that is never echoed must come back to the
+    caller — with the text — instead of being silently forgotten. That payload
+    is what puts the operator's message back in the compose box."""
+    out = _run_js("""
+    const up = W.createUplinkTracker({ now, timeoutMs: 6000, deadAfter: 2 });
+    up.track({ kind: 'compose', text: 'the message that vanished' });
+    advance(3000);
+    check('not judged while plausibly in flight', up.sweep().length === 0);
+    advance(3500);                       // now past timeoutMs
+    const lost = up.sweep();
+    check('the lost send surfaces', lost.length === 1);
+    check('it carries the text back', lost[0].meta.text === 'the message that vanished');
+    check('reported ONCE, not every sweep', up.sweep().length === 0);
+    check('and it counted as a loss', up.lost() === 1);
+    """)
+    assert out["total"] == 5
+
+
+def test_uplink_declares_death_only_after_repeated_loss():
+    out = _run_js("""
+    const up = W.createUplinkTracker({ now, timeoutMs: 1000, deadAfter: 2 });
+    up.track({ kind: 'ping' }); advance(1500); up.sweep();
+    check('one lost round trip is not a verdict', up.dead() === false);
+    up.track({ kind: 'ping' }); advance(1500); up.sweep();
+    check('two in a row is', up.dead() === true);
+    """)
+    assert out["total"] == 2
+
+
+def test_uplink_recovery_clears_the_loss_streak():
+    """A slow path that comes back must not stay condemned — otherwise every
+    later send reconnects the socket forever."""
+    out = _run_js("""
+    const up = W.createUplinkTracker({ now, timeoutMs: 1000, deadAfter: 2 });
+    up.track({ kind: 'ping' }); advance(1500); up.sweep();
+    check('one loss recorded', up.lost() === 1);
+    const s = up.track({ kind: 'ping' }); up.settle(s);
+    check('a successful echo clears the streak', up.lost() === 0);
+    check('and the verdict with it', up.dead() === false);
+    """)
+    assert out["total"] == 3
+
+
+def test_uplink_late_echo_is_not_a_fresh_success():
+    """A seq we already gave up on must not settle as if it worked — the caller
+    has already restored that message, and acking it twice would be a lie."""
+    out = _run_js("""
+    const up = W.createUplinkTracker({ now, timeoutMs: 1000, deadAfter: 5 });
+    const s = up.track({ kind: 'compose', text: 'x' });
+    advance(1500);
+    check('given up on', up.sweep().length === 1);
+    check('the late echo settles nothing', up.settle(s) === null);
+    check('and does not clear the loss streak', up.lost() === 1);
+    check('an unknown seq is also nothing', up.settle(9999) === null);
+    """)
+    assert out["total"] == 4
+
+
+def test_uplink_teardown_drains_without_condemning_the_next_socket():
+    """closeTerminal fires a burst of page-downs and then closes. Those can
+    never be echoed, so they must be handed back as failures — but a deliberate
+    teardown is not evidence that the NEXT socket's uplink is dead."""
+    out = _run_js("""
+    const up = W.createUplinkTracker({ now, timeoutMs: 6000, deadAfter: 2 });
+    up.track({ kind: 'key' }); up.track({ kind: 'key' }); up.track({ kind: 'key' });
+    const drained = up.sweep(true);
+    check('everything in flight is handed back', drained.length === 3);
+    check('nothing left outstanding', up.pending() === 0);
+    check('a teardown is not a loss streak', up.lost() === 0);
+    check('so no death verdict', up.dead() === false);
+    up.reset();
+    check('reset is clean', up.pending() === 0 && up.lost() === 0);
+    """)
+    assert out["total"] == 5
