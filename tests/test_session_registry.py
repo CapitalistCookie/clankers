@@ -221,21 +221,21 @@ def test_claude_exe_is_a_claude_pane(monkeypatch):
 
 def test_background_jobs_are_listed_although_they_own_no_pane(registry_dir):
     _write(registry_dir, 4242, status="busy", tmux=None, kind="bg",
-           jobId="82d531ea", cwd="/data/blqc/blqc-build",
-           name="BLQC Program T-000 day-0 verifications")
+           jobId="4f2ab19c", cwd="/srv/project",
+           name="Program T-000 day-0 verifications")
     _write(registry_dir, 4343, status="idle")            # an ordinary pane session
     reg = serve.read_session_registry()
 
     bg = serve.paneless_sessions(reg, matched_pids={4343})
     assert len(bg) == 1
     s = bg[0]
-    assert s["session"] == "BLQC Program T-000 day-0 verifications"
+    assert s["session"] == "Program T-000 day-0 verifications"
     assert s["state"] == "working" and s["registered"] is True
     assert s["command"] == "claude"        # the client lists claude sessions only
     assert s["target"] is None             # no pane: the card opens no terminal
     assert s["bg"] is True
-    assert "claude attach 82d531ea" in s["preview"]
-    assert "/data/blqc/blqc-build" in s["preview"]
+    assert "claude attach 4f2ab19c" in s["preview"]
+    assert "/srv/project" in s["preview"]
     # a pane already accounts for it -> not listed twice
     assert serve.paneless_sessions(reg, matched_pids={4242, 4343}) == []
 

@@ -358,16 +358,16 @@ def test_a_pane_less_session_is_listed_but_opens_no_terminal():
     sandbox.renderLiveSessions([
       { session: 'orch-MS-9', command: 'claude', state: 'waiting', preview: 'a',
         target: 'blqc-build:1.1' },
-      { session: 'BLQC Program T-000 day-0 verifications', command: 'claude',
-        state: 'working', preview: 'claude attach 82d531ea', target: null, bg: true },
+      { session: 'Program T-000 day-0 verifications', command: 'claude',
+        state: 'working', preview: 'claude attach 4f2ab19c', target: null, bg: true },
     ]);
     const html = el('live-sessions').innerHTML;
     check('the pane session is listed', html.includes('orch-MS-9'));
-    check('the bg session is listed too', html.includes('BLQC Program T-000'));
+    check('the bg session is listed too', html.includes('Program T-000'));
     check('the pane session opens its terminal',
           html.includes("openTerminal('orch-MS-9')"));
     check('the bg session has no terminal click',
-          !html.includes("openTerminal('BLQC"));
+          !html.includes("openTerminal('Program"));
     check('and says why instead', html.includes('bg job'));
 
     // The waiting badge's shortcut is a pane-only path: it must skip a waiting
