@@ -621,6 +621,17 @@ _status_cache = Cache(ttl=4)
 # Tmux helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Claude Code's executable is `claude.exe` (the npm package ships bin/claude.exe
+# and links bin/claude -> it), so a pane whose REPL was exec'd through the
+# resolved path reports `claude.exe` as pane_current_command while one started
+# through the link reports `claude`. Every "is this a Claude pane" test — here,
+# in the notifier, and in lib/web/live.js — compares against "claude", so the
+# .exe form was silently invisible (the BLQC pane went missing for days,
+# 2026-09-22) and a launcher change would take the WHOLE fleet with it.
+# Normalize once, at the only place panes are read.
+CLAUDE_PANE_COMMANDS = frozenset({"claude", "claude.exe"})
+
+
 def list_panes():
     """List all tmux panes with metadata."""
     try:
@@ -644,6 +655,8 @@ def list_panes():
             session, win, pane, title, cmd, w, h, attached, pane_id, pane_pid = parts[:10]
             if session.startswith("web-"):
                 continue
+            if cmd in CLAUDE_PANE_COMMANDS:
+                cmd = "claude"
             panes.append({
                 "session": session,
                 "window": int(win),
@@ -778,6 +791,61 @@ def registry_record(pane, registry):
             if rec.get("pid") in candidates:
                 return rec
     return None
+
+
+_LABEL_RX = re.compile(r"[^\w .:@/#+-]+")
+
+
+def _safe_label(text, limit=60):
+    """A registry name, safe to use as a dashboard label. A tmux session name
+    comes from a tight charset, but a background job's name is free text (Claude
+    Code writes it, or the operator does) and the SPA interpolates a session
+    name into HTML and into an inline onclick — so quotes, angle brackets and
+    backslashes are stripped HERE, at the source, not trusted at each call."""
+    return _LABEL_RX.sub(" ", text or "").strip()[:limit]
+
+
+def paneless_sessions(registry, matched_pids):
+    """The live sessions that own no tmux pane, shaped as /api/status entries.
+
+    A `claude` background job (registry `kind: "bg"`) carries no tmux ref at
+    all: it is a real session — named, with a cwd and a status, reached with
+    `claude attach <jobId>` — that a listing built from tmux panes cannot see.
+    The BLQC governance session ran for days invisible to this dashboard for
+    exactly that reason (2026-09-22). `target` is None, and that is the client's
+    signal that the card has no terminal to open (lib/web/live.js).
+
+    `matched_pids` are the record pids a listed pane already accounts for.
+    """
+    out = []
+    for rec in registry:
+        # A record with a tmux ref belongs to a pane — its own, or one this
+        # dashboard deliberately hides (the `web-` bridge sessions).
+        if rec.get("pane_id") or rec.get("pid") in matched_pids:
+            continue
+        name = _safe_label(rec.get("name")) or f"bg-{rec.get('pid')}"
+        job = _safe_label(rec.get("jobId"), limit=32)
+        where = _safe_label(rec.get("cwd"), limit=80)
+        reach = f"claude attach {job}" if job else "background session"
+        out.append({
+            "session": name,
+            "target": None,              # no pane: nothing to capture or attach
+            "title": name,
+            "command": "claude",
+            "state": REGISTRY_STATUS_TO_STATE.get(rec.get("status"),
+                                                  UNKNOWN_STATUS_STATE),
+            "substate": "",
+            "registered": True,          # the record IS the session
+            "agents": 0,
+            "preview": f"{reach} · {where}" if where else reach,
+            "model": None,
+            "ctx": None,
+            "b5h": None,
+            "b7d": None,
+            "size": "",
+            "bg": True,
+        })
+    return out
 
 
 def detect_session_state(pane, registry=None):
@@ -1215,10 +1283,13 @@ async def handle_status(request):
     panes = list_panes()
     registry = read_session_registry()
     sessions = []
+    matched_pids = set()
     for p in panes:
         if p["command"] != "claude":
             continue
         rec = registry_record(p, registry)
+        if rec is not None:
+            matched_pids.add(rec.get("pid"))
         state = detect_session_state(p, registry)
         # 12 lines: enough to see a dialog/banner/agent-tree for substates,
         # not just the 3-line preview.
@@ -1277,6 +1348,10 @@ async def handle_status(request):
             "b7d": b7d,
             "size": f"{p['width']}x{p['height']}",
         })
+
+    # The sessions no pane owns — `claude` background jobs. Without this the
+    # list is only as complete as tmux is, and a bg job is nowhere in tmux.
+    sessions.extend(paneless_sessions(registry, matched_pids))
 
     result = {"sessions": sessions, "ntfy_configured": bool(NTFY_TOPIC)}
     _status_cache.set(result)

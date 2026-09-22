@@ -347,3 +347,45 @@ def test_scroll_paging_is_not_tracked():
     check('teardown leaves nothing outstanding', T.uplinkPending() === -1);
     """)
     assert out["total"] == 2
+
+
+def test_a_pane_less_session_is_listed_but_opens_no_terminal():
+    """A `claude` background job is a real session with no tmux pane, so
+    /api/status sends it with target: null. It must reach the fleet list (it was
+    invisible until 2026-09-22) without leaving a card whose click does nothing:
+    openTerminal resolves a tmux session name, and a bg job has none."""
+    out = _run_js("""
+    sandbox.renderLiveSessions([
+      { session: 'orch-MS-9', command: 'claude', state: 'waiting', preview: 'a',
+        target: 'blqc-build:1.1' },
+      { session: 'BLQC Program T-000 day-0 verifications', command: 'claude',
+        state: 'working', preview: 'claude attach 82d531ea', target: null, bg: true },
+    ]);
+    const html = el('live-sessions').innerHTML;
+    check('the pane session is listed', html.includes('orch-MS-9'));
+    check('the bg session is listed too', html.includes('BLQC Program T-000'));
+    check('the pane session opens its terminal',
+          html.includes("openTerminal('orch-MS-9')"));
+    check('the bg session has no terminal click',
+          !html.includes("openTerminal('BLQC"));
+    check('and says why instead', html.includes('bg job'));
+
+    // The waiting badge's shortcut is a pane-only path: it must skip a waiting
+    // bg job and reach the next session that does have a terminal.
+    let opened = null;
+    const realOpen = sandbox.openTerminal;
+    sandbox.openTerminal = (n) => { opened = n; };
+    sandbox.updateNotifications([
+      { session: 'bgonly', command: 'claude', state: 'waiting', target: null },
+    ]);
+    sandbox.openWaitingSession();
+    check('a waiting bg job is never opened as a terminal', opened === null);
+    sandbox.updateNotifications([
+      { session: 'bgonly', command: 'claude', state: 'waiting', target: null },
+      { session: 'realpane', command: 'claude', state: 'waiting', target: 'realpane:1.1' },
+    ]);
+    sandbox.openWaitingSession();
+    sandbox.openTerminal = realOpen;
+    check('the pane session behind it still opens', opened === 'realpane');
+    """)
+    assert out["total"] == 7

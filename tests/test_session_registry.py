@@ -190,3 +190,67 @@ def test_is_trust_dialog():
     assert serve.is_trust_dialog("Quick safety check: Is this a project you created")
     assert not serve.is_trust_dialog("⏺ Done.\n❯ ")
     assert not serve.is_trust_dialog("")
+
+
+# ─── Sessions the pane listing cannot see (2026-09-22) ───
+# Two of them, found together: the BLQC governance session was absent from the
+# dashboard for days. It is a `claude` BACKGROUND JOB — no tmux pane at all —
+# and the one pane an operator had attached from reported `claude.exe`, which
+# every "is this a claude pane" comparison in serve.py and live.js rejected.
+
+def _tmux_line(session, cmd, win=1, pane=1, pane_id="%70", pid=4242):
+    return "\t".join([session, str(win), str(pane), "✳ title", cmd,
+                      "80", "24", "1", pane_id, str(pid)])
+
+
+def test_claude_exe_is_a_claude_pane(monkeypatch):
+    """npm ships bin/claude.exe and links bin/claude -> it, so a REPL exec'd
+    through the resolved path reports `claude.exe`. It is the same program."""
+    monkeypatch.setattr(serve.subprocess, "check_output", lambda *a, **k: "\n".join([
+        _tmux_line("viaLink", "claude", pane_id="%1", pid=1),
+        _tmux_line("viaPath", "claude.exe", pane_id="%2", pid=2),
+        _tmux_line("aShell", "bash", pane_id="%3", pid=3),
+    ]))
+    panes = serve.list_panes()
+    assert [p["command"] for p in panes] == ["claude", "claude", "bash"]
+    # …and so it reaches every downstream claude-pane test, not just the listing
+    assert serve.registry_coverage(panes, []) == (0, 2)
+    assert serve.detect_session_state(panes[1], []) == "waiting"
+    assert serve.detect_session_state(panes[2], []) == "idle"
+
+
+def test_background_jobs_are_listed_although_they_own_no_pane(registry_dir):
+    _write(registry_dir, 4242, status="busy", tmux=None, kind="bg",
+           jobId="82d531ea", cwd="/data/blqc/blqc-build",
+           name="BLQC Program T-000 day-0 verifications")
+    _write(registry_dir, 4343, status="idle")            # an ordinary pane session
+    reg = serve.read_session_registry()
+
+    bg = serve.paneless_sessions(reg, matched_pids={4343})
+    assert len(bg) == 1
+    s = bg[0]
+    assert s["session"] == "BLQC Program T-000 day-0 verifications"
+    assert s["state"] == "working" and s["registered"] is True
+    assert s["command"] == "claude"        # the client lists claude sessions only
+    assert s["target"] is None             # no pane: the card opens no terminal
+    assert s["bg"] is True
+    assert "claude attach 82d531ea" in s["preview"]
+    assert "/data/blqc/blqc-build" in s["preview"]
+    # a pane already accounts for it -> not listed twice
+    assert serve.paneless_sessions(reg, matched_pids={4242, 4343}) == []
+
+
+def test_a_nameless_background_job_still_gets_a_label(registry_dir):
+    _write(registry_dir, 4242, status="idle", tmux=None, kind="bg", cwd="")
+    bg = serve.paneless_sessions(serve.read_session_registry(), set())
+    assert bg[0]["session"] == "bg-4242" and bg[0]["preview"] == "background session"
+    assert bg[0]["state"] == "waiting"
+
+
+def test_a_job_name_cannot_carry_markup_into_the_card():
+    """Session names used to come from tmux; a bg job's name is free text, and
+    the SPA interpolates it into HTML and into an inline onclick."""
+    assert serve._safe_label("<img src=x onerror=alert(1)>") == "img src x onerror alert 1"
+    assert "'" not in serve._safe_label("it's \"quoted\" \\ and <b>bold</b>")
+    assert serve._safe_label("x" * 200) == "x" * 60
+    assert serve._safe_label(None) == ""

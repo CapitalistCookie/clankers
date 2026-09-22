@@ -528,6 +528,8 @@ th[data-col]:hover { color: var(--accent-cream); }
   cursor: pointer; transition: background 0.15s;
 }
 .session-card:hover { background: rgba(255,255,255,0.02); padding-left: 8px; padding-right: 8px; margin: 0 -8px; }
+/* A pane-less session (a `claude` background job): listed, but nothing to open. */
+.session-card.no-terminal { cursor: default; }
 .fav-star { cursor: pointer; color: var(--border); font-size: 16px; line-height: 1; margin-right: 10px; flex-shrink: 0; transition: color 0.15s; }
 .fav-star.on { color: var(--accent-amber); }
 .fav-star:hover { color: var(--accent-amber); }
