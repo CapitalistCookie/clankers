@@ -2,6 +2,8 @@
 proposal 2): a scripted `claude -p` carries CLAUDE_CODE_ENTRYPOINT=sdk-cli, and
 the gauge exits before it reads stdin. CLANKER_INJECT_NESTED=1 keeps it on.
 `--selftest` clears both variables, so a nested caller still gets 16/16.
+(That is checked with a stub selftest: the real one keys fixed /tmp marker
+names, so it races any concurrent run of itself, such as ci/full's.)
 
 The gauge keys /tmp markers on the transcript name; each test uses a unique
 name and removes only the markers it created."""
@@ -68,10 +70,11 @@ def test_interactive_or_injected_run_still_measures(gauge, extra):
     assert "first reading" in json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
 
 
-def test_selftest_passes_when_called_from_a_nested_run(gauge):
+def test_selftest_branch_clears_the_nested_env(gauge):
     d, _payload, _markers, tmp_path = gauge
+    (d / "tests" / "test_context_gauge.sh").write_text(
+        'echo "entry=${CLAUDE_CODE_ENTRYPOINT:-unset} inject=${CLANKER_INJECT_NESTED:-unset}"\n')
     r = subprocess.run(["bash", str(d / "context-gauge.sh"), "--selftest"], text=True,
-                       capture_output=True, timeout=120,
-                       env=_env(tmp_path, CLAUDE_CODE_ENTRYPOINT="sdk-cli"))
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "context-gauge selftest: 16/16 PASS" in r.stdout
+                       capture_output=True, timeout=30,
+                       env=_env(tmp_path, CLAUDE_CODE_ENTRYPOINT="sdk-cli", CLANKER_INJECT_NESTED="1"))
+    assert r.returncode == 0 and r.stdout == "entry=unset inject=unset\n", r.stdout + r.stderr

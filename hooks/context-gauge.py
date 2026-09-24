@@ -30,12 +30,12 @@ transcripts. An internal failure is swallowed for the session and logged to the 
 # blocks and never writes to stdout. Usage: hook_err(rc, step, error text or
 # exception); stderr_tail is "<step>: " plus the end of the text (of the
 # traceback, for an exception), 300 characters at most. Set
-# HOOK_ERR["session_id"] and HOOK_ERR["cwd"] once the payload is parsed.
+# HOOK_ERR["session_id"] and HOOK_ERR["cwd"] once the payload is parsed; a
+# script read from stdin has no __file__ and sets HOOK_ERR["hook"] as well.
 import os as _he_os
 import sys as _he_sys
 
-HOOK_ERR = {"hook": (_he_os.path.basename(_he_sys.argv[0]) if _he_sys.argv
-                     and _he_sys.argv[0] not in ("", "-", "-c") else "?"),
+HOOK_ERR = {"hook": _he_os.path.basename(globals().get("__file__") or "") or "?",
             "session_id": "", "cwd": ""}
 
 

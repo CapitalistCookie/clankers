@@ -263,3 +263,18 @@ def test_normal_payloads_log_nothing(tmp_path):
             if os.path.exists(p):
                 os.remove(p)
     assert _rows(tmp_path) == []
+
+
+def test_python_hook_names_itself_when_imported_in_process(tmp_path, monkeypatch):
+    """A test suite may import a hook in-process (sys.argv[0] is then pytest's);
+    the row must still name the hook, from the module's own __file__."""
+    import importlib.util
+    monkeypatch.setenv("CLANKER_DATA", str(tmp_path / "data"))
+    spec = importlib.util.spec_from_file_location(
+        "tpg_under_test", os.path.join(HARNESS, "task-payload-gate.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.HOOK_ERR["hook"] == "task-payload-gate.py"
+    mod.hook_err(1, "in-process probe", ValueError("x"))
+    row = _rows(tmp_path)[-1]
+    assert row["hook"] == "task-payload-gate.py" and row["stderr_tail"].startswith("in-process probe: ")
