@@ -20,6 +20,12 @@
 #   repo that lives on a data volume behind a ~/projects symlink.
 # - A scripted `claude -p` run (CLAUDE_CODE_ENTRYPOINT=sdk-cli, in the env or
 #   on the transcript's lines) is tagged nested: true.
+# - The hook reads no other file of this repo. The limit-signature catalog is
+#   inlined: its source, the subagent auto-resume detector, was retired the
+#   same day, and the fallback the installed copy used held 7 of its 17
+#   signatures. The handoff writer is gone: its import of the handoff module
+#   pointed at a lib directory that never existed on the installed side, so
+#   it had not run since 07-19.
 set -uo pipefail
 
 CLANKER_DATA="${CLANKER_DATA:-/data/clanker}"
@@ -57,10 +63,7 @@ find /tmp -maxdepth 1 -name "clanker-session-*" -mmin +5 -delete 2>/dev/null || 
 # Extract metrics using Python
 OUTFILE="$SESSIONS_DIR/$(date -u +%Y-%m-%d).jsonl"
 
-# CLANKER_LIB serves the handoff import below; the metrics block needs no lib.
-HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLANKER_LIB="$HOOK_DIR/../lib"
-export TRANSCRIPT SESSION_ID CWD CLANKER_LIB HOOK_DIR END_REASON
+export TRANSCRIPT SESSION_ID CWD END_REASON
 
 # -I: isolated (no user site, no PYTHON* env); the block imports stdlib only.
 python3 -I -u << 'PYEOF' | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null
@@ -579,22 +582,22 @@ if first_ts and last_ts:
         pass
 
 # ── Why did this session end? (P6, audit M4) ──────────────────────────────
-# failure_reason: first limit/API-error signature in the transcript TAIL —
-# the SAME catalog the subagent auto-resume detector matches (imported from
-# it: one source of truth, the two can't drift). Tail-only keeps sessions
-# that merely DISCUSS limits from matching on their own working text; a real
-# kill signature is terminal, so it lives in the last lines.
+# failure_reason: the first limit/API-error signature, in this order, found in
+# the transcript TAIL. Tail-only keeps sessions that merely DISCUSS limits from
+# matching on their own working text; a real kill signature is terminal, so it
+# lives in the last lines. The catalog is the subagent auto-resume detector's
+# LIMIT_SIGNS, verbatim and in its order (the detector was retired
+# 2026-09-24): transcript JSON and rendered text, with the server-transient
+# "temporarily limiting requests (not your usage limit) Rate limited" family
+# added 2026-06-14.
+LIMIT_SIGNS = ('"error":"rate_limit"', '"apiErrorStatus":429', '"status":429',
+               "hit your session limit", "usage limit", "rate_limit_error",
+               "Overloaded", "overloaded_error",
+               "temporarily limiting", "not your usage limit", "Rate limited",
+               '"apiErrorStatus":529', '"status":529', '"apiErrorStatus":503', '"status":503',
+               "overloaded", "service_unavailable")
 failure_reason = None
-try:
-    import importlib.util
-    _sp = importlib.util.spec_from_file_location(
-        "_detect", os.path.join(os.environ.get("HOOK_DIR", ""), "subagent-resume-detect.py"))
-    _dm = importlib.util.module_from_spec(_sp)
-    _sp.loader.exec_module(_dm)
-    _signs = _dm.LIMIT_SIGNS
-except Exception:   # fail-open with the core signatures
-    _signs = ('"error":"rate_limit"', "hit your session limit", "usage limit",
-              "Rate limited", "Overloaded", '"status":429', '"status":529')
+_signs = LIMIT_SIGNS
 _tail_blob = "".join(tail_lines)
 failure_reason = next((s for s in _signs if s in _tail_blob), None)
 
@@ -656,22 +659,5 @@ record = {
 
 print(json.dumps(record))
 PYEOF
-
-# Generate handoff — env-passed, no shell interpolation into python (a quote
-# in $CWD used to break the block silently — audit L3). Carries the last
-# assistant line: post-crash briefings need "what was I doing", not just git
-# state (audit §6, folded into P6).
-if [ -n "$CWD" ] && [ -d "$CWD/.git" ]; then
-    LAST_MSG="$(python3 "$HOOK_DIR/harness/last-assistant-msg.py" "$TRANSCRIPT" 2>/dev/null | head -c 400 || true)"
-    export LAST_MSG
-    python3 - <<'HEOF' 2>/dev/null || true
-import os, sys
-sys.path.insert(0, os.environ.get("CLANKER_LIB", ""))
-from handoff import generate_handoff
-cwd = os.environ.get("CWD", "")
-generate_handoff(os.environ.get("SESSION_ID", ""), os.path.basename(cwd), cwd,
-                 last_msg=os.environ.get("LAST_MSG") or None)
-HEOF
-fi
 
 exit 0

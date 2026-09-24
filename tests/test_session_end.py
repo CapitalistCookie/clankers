@@ -1,8 +1,8 @@
 """End-to-end tests for hooks/session-end.sh (P6, audit M4): the SessionEnd
 record must say WHY a session ended — end_reason (the hook input's own reason),
-failure_reason (limit/API-error signature in the transcript tail, same catalog
-as the subagent auto-resume detector), last_assistant_line — and the handoff
-must carry a "Last activity" line so post-crash briefings aren't git-state-blind.
+failure_reason (limit/API-error signature in the transcript tail, from the
+catalog inlined from the retired subagent auto-resume detector) and
+last_assistant_line. The handoff writer was removed on 2026-09-24.
 
 Hermetic: HOME→tmp, CLANKER_DATA→conftest tmp, unique session ids (the
 hook's /tmp dedup marker is per-session-id). The memory-autocommit block that
@@ -143,22 +143,26 @@ def test_duration_capped_at_write_wall_clock_raw(tmp_path):
     assert rec2["duration_s"] == rec2["wall_clock_s"] == 600
 
 
-def test_handoff_carries_last_activity_line(tmp_path):
-    """cwd is a real git repo → the hook generates a handoff; it must contain
-    the last assistant line (audit §6: 'what was I doing', not just git state)."""
-    repo = tmp_path / "p6repo"
+def test_no_handoff_and_no_lib_or_sibling_file(tmp_path):
+    """The handoff writer imported lib/handoff.py from a lib directory that
+    never existed on the installed side (dead since 07-19) and is removed. The
+    hook reads no other file of the repo, so `clanker sync` ships it alone."""
+    name = f"p9repo-{uuid.uuid4().hex[:8]}"
+    repo = tmp_path / name
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c",
                     "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"],
                    check=True)
-    _run_hook(tmp_path, _sid("handoff"), _transcript_lines(), cwd=repo)
+    rec = _run_hook(tmp_path, _sid("nohandoff"), _transcript_lines(), cwd=repo)
+    assert rec["project"] == name                    # an unregistered repo, named by git
     handoff = os.path.join(os.environ["CLANKER_DATA"], "wiki", "projects",
-                           "p6repo-handoff.md")
-    assert os.path.exists(handoff), "handoff not generated for git cwd"
-    text = open(handoff).read()
-    assert "**Last activity:** Fixed the auth test and pushed." in text
-    assert "**Branch:**" in text                     # git section still present
+                           f"{name}-handoff.md")
+    assert not os.path.exists(handoff)
+    src = open(HOOK).read()
+    for gone in ("../lib", "CLANKER_LIB", "HOOK_DIR", "handoff import", "generate_handoff",
+                 "subagent-resume-detect", "importlib"):
+        assert gone not in src, gone
 
 
 # ── Telemetry truth + nested tag + registry attribution (2026-09-24) ─────────
@@ -360,3 +364,43 @@ def test_start_and_end_name_the_same_project_the_registry_way(tmp_path):
         rows = _read_rows(sid)
         assert rows[0]["outcome"] == "open", rows
         assert (rows[0]["project"], final["project"]) == (want, want), (str(cwd), rows)
+
+
+# The detector's LIMIT_SIGNS, which the installed copy lost when the detector
+# was retired: its fallback held only the first group. The second group was
+# silently dropped (a tail with only these signatures got failure_reason None).
+FALLBACK_SIGNS = ('"error":"rate_limit"', "hit your session limit", "usage limit",
+                  "Rate limited", "Overloaded", '"status":429', '"status":529')
+RESTORED_SIGNS = ('"apiErrorStatus":429', "rate_limit_error", "overloaded_error",
+                  "temporarily limiting", "not your usage limit", '"apiErrorStatus":529',
+                  '"apiErrorStatus":503', '"status":503', "overloaded", "service_unavailable")
+
+
+def test_failure_reason_uses_the_full_inlined_catalog(tmp_path):
+    """Run the hook copied ALONE into a directory (the installed layout, with
+    no detector beside it): every restored signature is still detected."""
+    import shutil
+    alone = tmp_path / "dist"
+    alone.mkdir()
+    hook = alone / "session-end.sh"
+    shutil.copy(HOOK, hook)
+    for sign in RESTORED_SIGNS:
+        sid = _sid("sign")
+        if sign.startswith('"'):        # a key of the compact-JSON line itself
+            tail = '{"type":"system","timestamp":"2026-09-24T00:00:01Z",' + sign + "}"
+        else:                           # rendered error text
+            tail = json.dumps({"type": "system", "timestamp": "2026-09-24T00:00:01Z",
+                               "content": f"API Error: {sign}"}, separators=(",", ":"))
+        json.loads(tail)
+        tp = tmp_path / f"{sid}.jsonl"
+        tp.write_text(_transcript_lines() + tail + "\n")
+        r = subprocess.run(["bash", str(hook)], capture_output=True, text=True, timeout=60,
+                           env=_hook_env(tmp_path),
+                           input=json.dumps({"session_id": sid, "transcript_path": str(tp),
+                                             "cwd": str(tmp_path), "reason": "other"}))
+        assert r.returncode == 0, r.stderr
+        got = _read_rows(sid)[-1]["failure_reason"]
+        # "not your usage limit" contains "usage limit", which comes first in
+        # the catalog's order, so that is the signature reported for it
+        assert got == ("usage limit" if sign == "not your usage limit" else sign), (sign, got)
+        assert got not in FALLBACK_SIGNS or sign == "not your usage limit"

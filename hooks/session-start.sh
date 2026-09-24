@@ -29,8 +29,7 @@
 #
 # Kept: the /clear hand-off of the previous transcript to session-end.sh
 # (telemetry), the P7 heartbeat stub row, and the CLAUDE_ENV_FILE exports of
-# CLANKER_PROJECT (read by prompt-check.sh and skill-tracker.sh) and
-# CLANKER_ARCHETYPE.
+# CLANKER_PROJECT (read by skill-tracker.sh) and CLANKER_ARCHETYPE.
 #
 # PERF: one python3 interpreter started with -I (isolated: skips the user
 # site's .pth files, the bulk of interpreter start-up here), no jq, two git
