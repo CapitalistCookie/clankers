@@ -31,7 +31,7 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | PostToolUse | `Bash` | `Bash(git commit *)` | `closure-claim-verifier.sh` | 10 | Warns when a commit claims a closure but shows no integration-test evidence. |
 | PostToolUse | `Skill` | none | `clanker-dist/skill-tracker.sh` | 5 | Records which skills run (telemetry only). |
 | PostToolUse | `Edit\|Write` | none | `governance-gates-autorun.sh` | 150 | Runs the gates of a research spec directory after an edit to one of its registry files. |
-| PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. In a nested run (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`), it stops at once, unless `CLANKER_INJECT_NESTED=1`. |
+| PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. |
 | Stop | none | none | `iron-law-check.sh` (`asyncRewake`) | 30 | Blocks a success claim that has no evidence token in the recent tool output. |
 | SessionEnd | none | none | `clanker-dist/session-end.sh` | 20 | Records the session metrics for clanker. |
 
@@ -59,11 +59,20 @@ These hooks moved out of this directory on 2026-09-24.
 | eigenstate | `.claude/hooks/check-git-target.sh` | PreToolUse `Bash`, `if: Bash(*git*push*)` | 5 | Blocks a push when unpushed commits change `research/` or `docs/papers/`. |
 | eigenstate | `.claude/hooks/deploy-gate.sh` | PreToolUse `Bash`, prefilter in the script | 60 | Blocks `--delete-data`. Runs the deploy pre-flight before `deploy-vm.sh` or `spacetime publish`. |
 | eigenstate | `.claude/hooks/backfill-safety.sh` | PreToolUse `Bash`, prefilter in the script | 5 | Gives advice before a backfill script runs without `--limit`. |
+| eigenstate | `.claude/hooks/branded-pdf-guard.sh` | PreToolUse `Bash`, prefilter in the script | 5 | Blocks `pandoc`, `weasyprint`, or `wkhtmltopdf` on research content. Use the branded PDF system. |
+| eigenstate | `.claude/hooks/reducer-design-check.sh` | PreToolUse `Edit\|Write`, prefilter in the script | 5 | Gives advice when an edit to a reducer adds `.iter()`, more than 3 writes, or `JSON.parse`. |
+| eigenstate | `.claude/hooks/data-flow-map-check.sh` | PreToolUse `Edit\|Write`, prefilter in the script | 5 | Gives advice to update `docs/DATA_FLOW_MAP.md` when an edit adds a table. |
+| eigenstate | `.claude/hooks/post-deploy-screenshot.sh` | PostToolUse `Bash`, prefilter in the script | 60 | Takes a screenshot of production after `deploy-vm.sh` or `spacetime publish`. |
+| eigenstateresearch | `.claude/hooks/research-rule-guards.sh` | PreToolUse `Bash`, prefilter in the script | 5 | Blocks a commit of research code that breaks Rule 8, 9, or 10. Runs `research-rule9-ast.py` from the same directory. |
+| eigenstateresearch | `.claude/hooks/research-optimization-check.sh` | PreToolUse `Bash`, prefilter in the script | 5 | Gives advice before a research script with slow loops runs. Reads only `GPU_HOST` and `RESEARCH_ROOT` from `~/.claude/research.env`. |
 | polymarket | `clanker_hooks/pwb-pre-commit-bot-change-needs-test.sh` | PreToolUse `Bash`, `if: Bash(*git*commit*)` | 10 | Blocks a commit that changes bot code without a test. |
 | polymarket | `.claude/hooks/pwb-risk-surface-review-required.sh` | PreToolUse `Bash`, `if: Bash(*git*commit*)` | 10 | Blocks a commit to the risk surface that has no review marker. |
 | polymarket | `clanker_hooks/pwb-pre-deploy-suite-green.sh` | PreToolUse `Bash`, `if: Bash(*polymarket_weather_bot*)` | 120 | Blocks a restart or a kill of the bot when the test suite fails. |
-| constructionmanagement, gramdyne-infra | `.claude/hooks/post-commit-oi-scan.sh` | PostToolUse `Bash`, `if: Bash(git *)` | 5 | Lists the open issues that a commit names and that are still open. |
+| polymarket | `clanker_hooks/pwb-post-resolution-real-sim.sh` | SessionEnd | 30 | Adds the gap between paper P&L and simulated live P&L to a log. |
+| polymarket | `clanker_hooks/pwb-sessionend-compile.sh` | SessionEnd | 60 | Runs `clanker compile`. |
 | yon | `.claude/hooks/toxicflow-compute-routing.sh` | PreToolUse `Bash`, `if: Bash(*python*)` | 5 | Advice to send heavy toxicflow compute to the 5070 laptop. |
+
+The open-issue scan `post-commit-oi-scan.sh` is retired. It read only `### OI-N` headings. Constructionmanagement and gramdyne-infra keep their open issues as table rows, so the scan found nothing after 2026-07-05. The script is in `/data/claude-archive/googleclidev/hooks-retired-20260924/oi-scan/`.
 
 ## Clanker sync
 
@@ -103,27 +112,6 @@ About the payload:
 - Read the fields of the payload with `jq`. A text match on the raw payload can find the same key inside `tool_input` or `tool_response`. On 2026-09-24, this error caused the context gauge to repeat its first reading after each Agent call.
 - Claude Code reloads the hook configuration when a settings file changes. The next tool call uses the new configuration. A headless test on 2026-09-24 showed this behavior.
 
-## Hook errors
-
-A hook must not stop the session when one of its steps fails. Thus the hook continues, but it also records the failure.
-
-Each hook that clanker syncs has the same hook-error block, in Bash or in Python. When a step fails, the block adds one JSON line to `$CLANKER_DATA/raw/health/hook-errors-<UTC day>.jsonl`. The default value of `CLANKER_DATA` is `/data/clanker`.
-
-| Field | Value |
-|---|---|
-| `ts` | The UTC time of the failure. |
-| `hook` | The file name of the hook. |
-| `session_id` | The session ID from the payload. It is empty when the hook has no payload. |
-| `cwd` | The `cwd` from the payload, or else the working directory of the hook. |
-| `rc` | The exit code of the step that failed. A Python exception gives 1. |
-| `stderr_tail` | The name of the step, then the end of its error text. The maximum length is 300 characters. |
-
-The block does not write to stdout. It does not change the exit code of the hook. `clanker doctor --harness` counts the lines.
-
-A gate decision is not an error. For example, a deny or a governance FAIL is a result, and the block does not record it.
-
-When you change a hook, keep its block the same as the block in the other hooks. The test `tests/test_hook_errors.py` in the clanker repo compares the blocks.
-
 ## Change a hook
 
 1. If the rule applies to one project only, write a project hook.
@@ -140,5 +128,4 @@ When you change a hook, keep its block the same as the block in the other hooks.
 1. After a change to the dispatcher or to one of its gates, run `bash ~/.claude/hooks/tests/test_pretooluse_dispatch.sh`. Each row must show PASS.
 2. After a change to the context gauge, run `bash ~/.claude/hooks/context-gauge.sh --selftest`.
 3. After a change to the iron-law hook, run `bash ~/.claude/hooks/iron-law-check.sh --selftest`.
-4. After a change to a hook or to its hook-error block, run `python3 -m pytest tests/test_hook_errors.py` in the clanker repo.
-5. Before you use a new `if` rule, test it in a headless session. Use `claude -p --setting-sources project` in a scratch project that has only that hook.
+4. Before you use a new `if` rule, test it in a headless session. Use `claude -p --setting-sources project` in a scratch project that has only that hook.

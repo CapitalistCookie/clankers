@@ -87,9 +87,17 @@ These files are in `~/.claude/hooks/`, but not in this directory.
 |---|---|---|
 | `check-compute.sh` | Yes, as dispatcher gate 1 | It names an operator path and private hosts. A generic copy needs a new design. |
 | `subagent-delivery-gate.py` | Yes, PreToolUse `Agent` | It came on 2026-08-01, after the first vendoring. It is not in this directory. |
-| `branded-pdf-guard.sh`, `data-flow-map-check.sh`, `post-deploy-screenshot.sh`, `reducer-design-check.sh`, `research-optimization-check.sh`, `research-rule-guards.sh`, `research-rule9-ast.py` | No | Not in `~/.claude/hooks/` since 2026-09-24. The first four moved to `.claude/hooks/` in the eigenstate repo (c0d5c23). The last three moved to `.claude/hooks/` in the eigenstateresearch repo (4387924). |
-| `pwb-post-resolution-real-sim.sh`, `pwb-sessionend-compile.sh` | No | Not in `~/.claude/hooks/` since 2026-09-24. The SessionEnd of the polymarket repo runs these scripts from its own `clanker_hooks/` directory (8d34bf4), so the two symlinks are gone. |
 | `tests/test_pretooluse_dispatch.sh` | not a hook | The parity test of the dispatcher. It contains operator paths and addresses. |
+| `tests/test_context_gauge.sh` | not a hook | The installed copy of `tests/test_context_gauge.sh` in this directory. See "Tests". |
+| `tests/test_task_payload_gate.py`, `tests/pytest.ini`, `tests/conftest.py` | not a hook | The pytest suite of `task-payload-gate.py` (`~/.claude` dc36824). `conftest.py` points `CLANKER_DATA` at a temporary directory, so that the suite writes no row to the live hook-error log (`~/.claude` 454b12f). |
+
+The nine project hooks below left `~/.claude/hooks/` on 2026-09-24. Their repos keep them now.
+
+| Files | Now in | Commit |
+|---|---|---|
+| `branded-pdf-guard.sh`, `data-flow-map-check.sh`, `post-deploy-screenshot.sh`, `reducer-design-check.sh` | `.claude/hooks/` of the eigenstate repo | c0d5c23 |
+| `research-optimization-check.sh`, `research-rule-guards.sh`, `research-rule9-ast.py` | `.claude/hooks/` of the eigenstateresearch repo | 4387924 |
+| `pwb-post-resolution-real-sim.sh`, `pwb-sessionend-compile.sh` | `clanker_hooks/` of the polymarket repo. Its SessionEnd runs them from there, so the two symlinks are gone. | 8d34bf4 |
 
 ## Files removed on 2026-09-24
 

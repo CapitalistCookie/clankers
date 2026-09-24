@@ -55,7 +55,7 @@ def cmd_sessions(args):
 
 def cmd_analyze(args):
     from analyze import run_analysis
-    run_analysis(args.mode, by=args.by, last_days=args.last, json_output=args.json)
+    return run_analysis(args.mode, by=args.by, last_days=args.last, json_output=args.json, rewrites=args.rewrites)
 
 def cmd_autonomy(args):
     from autonomy import report
@@ -798,6 +798,7 @@ def main():
     p.add_argument('--by', choices=['project', 'tool', 'archetype'], default='project')
     p.add_argument('--last', type=int, default=7)
     p.add_argument('--json', action='store_true')
+    p.add_argument('--rewrites', action='store_true', help='Top sessions by cache-rewrite tokens over --last days (default 7)')
     p.set_defaults(func=cmd_analyze)
 
     p = sub.add_parser('propose', help='Generate proposals (auto-expires pending >30d first); --add files one by hand; --resolve closes one')
