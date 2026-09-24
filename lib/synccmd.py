@@ -7,7 +7,8 @@ and the only "sync" was luck. This module makes the repo the source of truth:
   repo hooks/          (repo-run set)      --apply--> ~/.claude/hooks/clanker-dist/
   repo hooks/harness/  (vendored generic)  --apply--> ~/.claude/hooks/
   repo hooks/context-gauge.py              --apply--> ~/.claude/hooks/context-gauge.py
-  repo lib/*.py        (hook import root)  --apply--> ~/.claude/hooks/lib/
+
+  repo lib/ is NOT shipped (2026-09-24): a hook must not import it.
 
   sync --check   parity table (sha256), exit 1 on any drift   [doctor runs this]
   sync --apply   install repo -> ~/.claude with git snapshots either side,
@@ -87,26 +88,11 @@ def _pairs(repo_root=None, claude=None):
                     or not os.path.isfile(src)):
                 continue
             yield ("harness", src, os.path.join(claude, "hooks", name))
-    # Dist hooks import repo modules via `$HOOK_DIR/../lib` — i.e.
-    # <claude>/hooks/lib when running from clanker-dist. Nothing shipped that
-    # dir, so after --pin (2026-07-19) every lib import in the dist set failed
-    # open: briefings, handoffs, and git-aware project resolution silently
-    # stopped (found 2026-07-22: newest handoff predated the pin). Ship the
-    # whole top level so cross-imports never need dependency-chasing;
-    # subpackages (orch/, ecc/) are CLI/dashboard-side, not hook-side.
-    # 2026-09-24: the one importer left is session-end.sh (projects.
-    # resolve_project, handoff.generate_handoff). No apply has run since this
-    # set was added (07-22 07:05; the last apply ran 07-22 05:41), so
-    # <claude>/hooks/lib has never existed and both imports still fail open.
-    # An apply installs it and turns both on. If session-end drops those two
-    # imports, drop this set too.
-    lib = os.path.join(repo_root, "lib")
-    if os.path.isdir(lib):
-        for name in sorted(os.listdir(lib)):
-            src = os.path.join(lib, name)
-            if not name.endswith(".py") or not os.path.isfile(src):
-                continue
-            yield ("lib", src, os.path.join(claude, "hooks", "lib", name))
+    # lib/ is not shipped (2026-09-24). A lib set was added on 2026-07-22
+    # because dist hooks imported `$HOOK_DIR/../lib`, but no apply ran after
+    # that, so <claude>/hooks/lib never existed and those imports always
+    # failed open. The last importer, session-end.sh, now inlines what it
+    # used. tests/test_synccmd.py fails if a distributed hook imports lib again.
 
 
 # ── last-applied state (the hand-edit guard) ────────────────────────────────
@@ -302,9 +288,7 @@ def apply(repo_root=None, claude=None, force=False):
         shutil.copy2(src, dst)
         os.chmod(dst, 0o755)
         new_state[key] = _sha(dst)
-        # lib files are MODULES, not hooks — a "--selftest" string inside one
-        # is coincidental; executing `python3 <module> --selftest` proves nothing.
-        st = None if label == "lib" else _selftest(dst)
+        st = _selftest(dst)
         forced = "  (--force: overwrote a copy changed outside sync)" if kind not in ("new", "update") else ""
         if st is False:
             failures.append(dst)

@@ -45,10 +45,9 @@ by hand. It stops and tells you to use `--force`.
 |---|---|---|
 | `hooks/context-gauge.py` | `~/.claude/hooks/context-gauge.py` | `gauge` |
 | `hooks/session-start.sh`, `hooks/session-end.sh`, `hooks/skill-tracker.sh`, `hooks/subagent-tier-gate.py` | `~/.claude/hooks/clanker-dist/<name>` | `repo-run` |
-| `lib/*.py` | `~/.claude/hooks/lib/<name>` | `lib` |
 
-`lib/synccmd.py` holds the lists that sync uses. The `lib` set is there because
-`hooks/session-end.sh` imports `projects` and `handoff` from `$HOOK_DIR/../lib`.
+`lib/synccmd.py` holds the lists that sync uses. Sync does not copy `lib/`, so a hook
+must not import the repo's `lib` modules. A test in `tests/test_synccmd.py` enforces this rule.
 
 ## Bash dispatcher gates
 

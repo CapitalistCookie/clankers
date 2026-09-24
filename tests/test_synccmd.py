@@ -29,14 +29,11 @@ def _mk_repo(tmp):
         f.write("#!/bin/bash\nexit 0\n")
     with open(os.path.join(hooks, "harness", "MANIFEST.md"), "w") as f:
         f.write("# manifest — not a hook\n")
-    # lib modules ship to <claude>/hooks/lib (the dist hooks' import root).
-    # modlike.py would EXIT 1 if apply mistook its "--selftest" string for a
-    # real selftest and executed it — proves lib files skip the selftest path.
+    # lib/ is NOT shipped (2026-09-24): the fake repo has a module, and
+    # apply must leave <claude>/hooks/lib absent.
     os.makedirs(os.path.join(root, "lib"))
     with open(os.path.join(root, "lib", "handoff.py"), "w") as f:
         f.write("def generate_handoff(*a, **kw):\n    return None\n")
-    with open(os.path.join(root, "lib", "modlike.py"), "w") as f:
-        f.write("import sys\nif '--selftest' in sys.argv:\n    sys.exit(1)\nX = 1\n")
     return root
 
 
@@ -53,18 +50,17 @@ def test_check_reports_missing_then_apply_reaches_parity():
         drifted, missing, total = synccmd.check(repo, claude, quiet=True)
         assert not drifted
         assert len(missing) == total  # nothing installed yet
-        assert total == len(synccmd.REPO_RUN) + 4  # + gauge + 1 harness + 2 lib
+        assert total == len(synccmd.REPO_RUN) + 2  # + gauge + 1 harness; no lib
 
         rc = synccmd.apply(repo, claude)
-        assert rc == 0  # also proves lib "--selftest" strings are NOT executed
+        assert rc == 0
         drifted, missing, _ = synccmd.check(repo, claude, quiet=True)
         assert not drifted and not missing
         assert len(_state(claude)) == total  # first apply creates the baseline
         # harness hook installed flat; repo-run under clanker-dist; manifest skipped
         assert os.path.exists(os.path.join(claude, "hooks", "generic-gate.sh"))
-        # lib modules land at <claude>/hooks/lib — the exact path the dist
-        # hooks resolve as $HOOK_DIR/../lib (dead 07-19→07-22, audit follow-up)
-        assert os.path.exists(os.path.join(claude, "hooks", "lib", "handoff.py"))
+        # lib/ is not shipped (2026-09-24): no hook imports $HOOK_DIR/../lib
+        assert not os.path.exists(os.path.join(claude, "hooks", "lib"))
         assert os.path.exists(
             os.path.join(claude, "hooks", "clanker-dist", "session-start.sh"))
         assert not os.path.exists(os.path.join(claude, "hooks", "MANIFEST.md"))
@@ -289,3 +285,19 @@ def test_pin_aborts_when_apply_refuses():
             f.write(raw)
         assert synccmd.pin(repo, claude) == 1
         assert open(os.path.join(claude, "settings.json")).read() == raw
+
+
+def test_no_distributed_hook_imports_repo_lib():
+    """Sync stopped shipping lib/ on 2026-09-24 because no hook imported it.
+    A hook that reads `$HOOK_DIR/../lib` (or CLANKER_LIB) again would fail
+    open in the installed layout, as briefings, handoffs and project
+    resolution did from 2026-07-19 on. Every file sync distributes must stay
+    free of that import root."""
+    import re
+    pat = re.compile(r"\.\./lib\b|CLANKER_LIB")
+    offenders = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for _label, src, _dst in synccmd._pairs(synccmd.REPO_ROOT, tmp):
+            if os.path.exists(src) and pat.search(open(src, errors="ignore").read()):
+                offenders.append(os.path.relpath(src, synccmd.REPO_ROOT))
+    assert offenders == []
