@@ -64,12 +64,23 @@ hook_err() {
 }
 # ---- end of hook-error log --------------------------------------------------------
 
-PY="$(dirname "$0")/context-gauge.py"
-
 if [ "${1:-}" = "--selftest" ]; then
+  # The selftest drives interactive-run cases: a nested caller's env must not
+  # silence them.
+  unset CLAUDE_CODE_ENTRYPOINT CLANKER_INJECT_NESTED
   exec bash "$(dirname "$0")/tests/test_context_gauge.sh"
 fi
 
+# Nested runs (2026-09-24): every scripted `claude -p` carries
+# CLAUDE_CODE_ENTRYPOINT=sdk-cli, and hooks inherit it. A one-shot run has no
+# use for a context reading, so the gauge exits before it reads stdin: no cat,
+# no stat, no python, no grounding line. CLANKER_INJECT_NESTED=1 keeps the
+# gauge on, as it keeps the start brief on.
+if [ "${CLAUDE_CODE_ENTRYPOINT:-}" = sdk-cli ] && [ -z "${CLANKER_INJECT_NESTED:-}" ]; then
+  exit 0
+fi
+
+PY="$(dirname "$0")/context-gauge.py"
 INPUT=$(cat)
 
 # The gauge's stdout goes to the hook's stdout; its stderr is captured and, on

@@ -131,6 +131,7 @@
   "tests/test_briefing.py",
   "tests/test_cleanup_memory.py",
   "tests/test_cli.py",
+  "tests/test_context_gauge_nested.py",
   "tests/test_ecc_budget.py",
   "tests/test_ecc_guard.py",
   "tests/test_ecc_overlap.py",
@@ -169,5 +170,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "404b8d2"
+ "source_commit": "cc4e73a"
 }

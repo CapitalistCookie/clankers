@@ -31,7 +31,7 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | PostToolUse | `Bash` | `Bash(git commit *)` | `closure-claim-verifier.sh` | 10 | Warns when a commit claims a closure but shows no integration-test evidence. |
 | PostToolUse | `Skill` | none | `clanker-dist/skill-tracker.sh` | 5 | Records which skills run (telemetry only). |
 | PostToolUse | `Edit\|Write` | none | `governance-gates-autorun.sh` | 150 | Runs the gates of a research spec directory after an edit to one of its registry files. |
-| PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. |
+| PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. In a nested run (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`), it stops at once, unless `CLANKER_INJECT_NESTED=1`. |
 | Stop | none | none | `iron-law-check.sh` (`asyncRewake`) | 30 | Blocks a success claim that has no evidence token in the recent tool output. |
 | SessionEnd | none | none | `clanker-dist/session-end.sh` | 20 | Records the session metrics for clanker. |
 
