@@ -151,3 +151,13 @@ When you change a hook, keep its block the same as the block in the other hooks.
 3. After a change to the iron-law hook, run `bash ~/.claude/hooks/iron-law-check.sh --selftest`.
 4. After a change to a hook or to its hook-error block, run `python3 -m pytest tests/test_hook_errors.py` in the clanker repo.
 5. Before you use a new `if` rule, test it in a headless session. Use `claude -p --setting-sources project` in a scratch project that has only that hook.
+
+## Tool set policy
+
+The user settings remove tools and skill-list text that sessions do not use (2026-09-24, measured on Claude Code 2.1.280 with Fable 5.1 and Opus 5.5):
+
+- `permissions.deny` holds `"ReportFindings"`. A deny rule without content removes the tool from the request: 821 tokens per session. `/code-review` reports its findings with this tool. Remove `"ReportFindings"` from the deny list before you use `/code-review`.
+- `"feedbackDrafts": "off"` removes the SendFeedback tool. No draft is queued.
+- `skillOverrides` sets `"name-only"` for ten bundled skills that had no call in 60 days: update-config, keybindings-help, code-review, simplify, fewer-permission-prompts, loop, schedule, run, init, security-review. The skill list shows only their names (9,165 B to 5,846 B). You can still type `/<name>`.
+
+Eleven repos also turn off Artifact in their project settings, and ten of them deny ScheduleWakeup. See `~/projects/clanker/templates/settings/README.md`. Never deny Skill or ToolSearch: without Skill, other tool descriptions grow by 11,331 tokens; without ToolSearch, all deferred tools load (26,176 tokens).
