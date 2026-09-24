@@ -269,19 +269,28 @@ def test_boot_script_never_launches_claude(startup):
 
 
 def test_boot_script_creates_only_missing_sessions_as_shells(tmp_path, monkeypatch):
-    """Execute the GENERATED script against a fake tmux: the missing session is
-    created at its dir, the live one is left alone, and no key is ever sent."""
+    """Execute the GENERATED script against a fake tmux that resolves targets the
+    way tmux does (`=name` exact, a bare name by prefix): the missing sessions
+    are created at their dir — including `web` while `web-2` runs, which a bare
+    `-t web` would have prefix-matched — the live one is left alone, and no key
+    is ever sent."""
     import subprocess
     script = tmp_path / "tmux-startup.sh"
     monkeypatch.setattr(tmux_manager, "STARTUP_SCRIPT", str(script))
-    tmux_manager.write_startup({"alive": str(tmp_path), "gone": str(tmp_path)})
+    tmux_manager.write_startup({"alive": str(tmp_path), "gone": str(tmp_path),
+                                "web": str(tmp_path)})
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     log = tmp_path / "tmux.log"
     (fakebin / "tmux").write_text(
         "#!/bin/bash\n"
         f'echo "$*" >> "{log}"\n'
-        'if [ "$1" = has-session ]; then [ "$3" = alive ] && exit 0; exit 1; fi\n'
+        'if [ "$1" = has-session ]; then\n'
+        '  for s in alive web-2; do\n'
+        '    case "$3" in "=$s") exit 0;; =*) ;; *) case "$s" in "$3"*) exit 0;; esac;; esac\n'
+        '  done\n'
+        '  exit 1\n'
+        'fi\n'
         "exit 0\n")
     (fakebin / "sleep").write_text("#!/bin/bash\nexit 0\n")
     for f in ("tmux", "sleep"):
@@ -292,5 +301,7 @@ def test_boot_script_creates_only_missing_sessions_as_shells(tmp_path, monkeypat
     assert r.returncode == 0, r.stderr
     lines = log.read_text().splitlines()
     assert f"new-session -d -s gone -c {tmp_path} -x 220 -y 50" in lines
+    assert f"new-session -d -s web -c {tmp_path} -x 220 -y 50" in lines
+    assert "has-session -t =web" in lines
     assert not any("-s alive" in ln for ln in lines)
     assert not any(ln.startswith("send-keys") for ln in lines)

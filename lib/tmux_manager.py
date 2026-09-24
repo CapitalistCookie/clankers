@@ -17,6 +17,8 @@ Rewritten 2026-07-05 (fleet-regression postmortem):
     never types a claude launch line and runs no trust acceptor. Claude starts
     on demand only: `clanker work <project>` (which also starts claude in a
     mapped session that boot left as a plain shell) or `clanker tmux add`.
+    The has-session guard uses the exact `=name` target: a bare name
+    prefix-matches, so a missing `web` counted as present while `web-2` ran.
 """
 
 import os
@@ -46,7 +48,8 @@ for entry in "${sessions[@]}"; do
     name="${entry%%:*}"
     dir="${entry#*:}"
     [ -d "$dir" ] || dir="$HOME"
-    if ! tmux has-session -t "$name" 2>/dev/null; then
+    # "=$name" is an exact match; a bare name would prefix-match another session.
+    if ! tmux has-session -t "=$name" 2>/dev/null; then
         tmux new-session -d -s "$name" -c "$dir" -x 220 -y 50
     fi
 done
