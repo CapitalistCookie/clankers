@@ -16,6 +16,17 @@ and the only "sync" was luck. This module makes the repo the source of truth:
                  clanker-dist copies, so editing the repo no longer changes
                  live behavior until a sync deploys it
 
+Hand-edit guard (2026-09-24). That night an operator rewire edited six
+installed hooks and archived nine, and an apply from the old repo state would
+have silently reverted all of it. apply now records the sha256 of every file
+it leaves in parity in ~/.claude/hooks/.clanker-sync-state.json. Before it
+copies anything it checks every installed file: one whose sha256 matches
+neither the repo copy nor that record was changed outside sync (edited by
+hand, or removed after an apply). Then apply installs NOTHING, prints the
+three hashes, and exits 1. Carry the wanted edits into the repo first, or
+re-run with --force to overwrite them. With no record at all (first run),
+any installed file that differs from the repo counts as hand-edited.
+
 Operator-specific values NEVER live in hook bodies (publint law) — they belong
 in ~/.claude/harness.env, which vendored hooks source. sync never touches it.
 """
@@ -29,6 +40,8 @@ import sys
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+STATE_NAME = ".clanker-sync-state.json"
 
 
 def _claude_dir():
@@ -81,6 +94,12 @@ def _pairs(repo_root=None, claude=None):
     # stopped (found 2026-07-22: newest handoff predated the pin). Ship the
     # whole top level so cross-imports never need dependency-chasing;
     # subpackages (orch/, ecc/) are CLI/dashboard-side, not hook-side.
+    # 2026-09-24: the one importer left is session-end.sh (projects.
+    # resolve_project, handoff.generate_handoff). No apply has run since this
+    # set was added (07-22 07:05; the last apply ran 07-22 05:41), so
+    # <claude>/hooks/lib has never existed and both imports still fail open.
+    # An apply installs it and turns both on. If session-end drops those two
+    # imports, drop this set too.
     lib = os.path.join(repo_root, "lib")
     if os.path.isdir(lib):
         for name in sorted(os.listdir(lib)):
@@ -90,24 +109,97 @@ def _pairs(repo_root=None, claude=None):
             yield ("lib", src, os.path.join(claude, "hooks", "lib", name))
 
 
+# ── last-applied state (the hand-edit guard) ────────────────────────────────
+
+def _state_path(claude):
+    return os.path.join(claude, "hooks", STATE_NAME)
+
+
+def _state_key(claude, dst):
+    return os.path.relpath(dst, claude)
+
+
+def _load_state(claude):
+    """{installed path relative to <claude>: sha256 at the last apply}."""
+    try:
+        with open(_state_path(claude)) as f:
+            files = json.load(f).get("files", {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return files if isinstance(files, dict) else {}
+
+
+def _write_state(claude, files, head):
+    path = _state_path(claude)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    doc = {
+        "version": 1,
+        "note": ("Written by `clanker sync`. sha256 of each managed file as last "
+                 "applied (or found in parity). apply refuses to overwrite an "
+                 "installed file that matches neither the repo copy nor this record."),
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "clanker_head": head,
+        "files": dict(sorted(files.items())),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _head(repo_root):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
+    except Exception:
+        return "?"
+
+
+def _classify(src, dst, last):
+    """(state, repo_sha, installed_sha) for one managed pair.
+
+    state: parity | new (not installed, no record) | update (installed copy is
+    the last-applied one; the repo moved on) | hand-edited | hand-removed."""
+    want = _sha(src)
+    if not os.path.exists(dst):
+        return ("hand-removed" if last else "new"), want, None
+    have = _sha(dst)
+    if have == want:
+        return "parity", want, have
+    if last and have == last:
+        return "update", want, have
+    return "hand-edited", want, have
+
+
 def check(repo_root=None, claude=None, quiet=False):
     """Parity table. Returns (drifted, missing, total)."""
+    claude = claude or _claude_dir()
+    state = _load_state(claude)
     drifted, missing, total = [], [], 0
+    notes = {}
     for label, src, dst in _pairs(repo_root, claude):
         total += 1
         if not os.path.exists(src):
             missing.append((label, src, "missing-in-REPO"))
             continue
-        if not os.path.exists(dst):
+        kind, _, _ = _classify(src, dst, state.get(_state_key(claude, dst)))
+        if kind in ("new", "hand-removed"):
             missing.append((label, dst, "not-installed"))
-            continue
-        if _sha(src) != _sha(dst):
+            if kind == "hand-removed":
+                notes[dst] = "removed after the last apply: apply will refuse"
+        elif kind != "parity":
             drifted.append((label, os.path.basename(src)))
+            if kind == "hand-edited":
+                notes[(label, os.path.basename(src))] = "installed copy edited outside sync: apply will refuse"
     if not quiet:
         for label, name in drifted:
-            print(f"  DRIFT      [{label:8}] {name}")
+            note = f"  ({notes[(label, name)]})" if (label, name) in notes else ""
+            print(f"  DRIFT      [{label:8}] {name}{note}")
         for label, path, why in missing:
-            print(f"  {why:<10} [{label:8}] {path}")
+            note = f"  ({notes[path]})" if path in notes else ""
+            print(f"  {why:<10} [{label:8}] {path}{note}")
         ok = total - len(drifted) - len(missing)
         print(f"sync: {ok}/{total} in parity"
               + ("" if not (drifted or missing) else
@@ -145,38 +237,86 @@ def _selftest(path):
     return r.returncode == 0
 
 
-def apply(repo_root=None, claude=None):
+def record_baseline(repo_root=None, claude=None):
+    """Record every pair that is in parity NOW as last-applied; install nothing.
+
+    For an install that reached parity without an apply (hand copies, as on
+    2026-09-24), so the next apply has a baseline. Returns the entry count."""
     repo_root = repo_root or REPO_ROOT
     claude = claude or _claude_dir()
-    _git_snapshot(claude, "sync: pre-apply snapshot")
-    installed, failures = [], []
+    state = _load_state(claude)
+    managed = set()
+    for _label, src, dst in _pairs(repo_root, claude):
+        key = _state_key(claude, dst)
+        managed.add(key)
+        if os.path.exists(src) and os.path.exists(dst) and _sha(src) == _sha(dst):
+            state[key] = _sha(dst)
+    state = {k: v for k, v in state.items() if k in managed}
+    _write_state(claude, state, _head(repo_root))
+    return len(state)
+
+
+def apply(repo_root=None, claude=None, force=False):
+    repo_root = repo_root or REPO_ROOT
+    claude = claude or _claude_dir()
+    state = _load_state(claude)
+    managed, parity, todo, refused = set(), {}, [], []
     for label, src, dst in _pairs(repo_root, claude):
+        key = _state_key(claude, dst)
+        managed.add(key)
         if not os.path.exists(src):
             continue
-        if os.path.exists(dst) and _sha(src) == _sha(dst):
-            continue
+        kind, want, have = _classify(src, dst, state.get(key))
+        if kind == "parity":
+            parity[key] = have
+        elif kind in ("new", "update") or force:
+            todo.append((label, src, dst, key, kind))
+        else:
+            refused.append((label, dst, kind, want, have, state.get(key)))
+
+    new_state = {k: v for k, v in state.items() if k in managed}
+    new_state.update(parity)
+    head = _head(repo_root)
+
+    # All or nothing: a hand-changed file may be part of a set of edits made
+    # together (tonight: a dispatcher plus its gates), so no partial install.
+    if refused:
+        for label, dst, kind, want, have, last in refused:
+            why = ("edited outside clanker sync" if kind == "hand-edited"
+                   else "removed after the last apply")
+            print(f"  REFUSED    [{label:8}] {dst}: installed copy {why}", file=sys.stderr)
+            print(f"               repo          {want}", file=sys.stderr)
+            print(f"               installed     {have or '(missing)'}", file=sys.stderr)
+            print(f"               last applied  {last or '(no record)'}", file=sys.stderr)
+        _write_state(claude, new_state, head)
+        print(f"sync: installed NOTHING — {len(refused)} installed file(s) changed outside "
+              f"clanker sync. Carry the wanted edits into the repo, or use --force to "
+              f"overwrite them.", file=sys.stderr)
+        return 1
+
+    if todo:
+        _git_snapshot(claude, "sync: pre-apply snapshot")
+    installed, failures = [], []
+    for label, src, dst, key, kind in todo:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
         os.chmod(dst, 0o755)
+        new_state[key] = _sha(dst)
         # lib files are MODULES, not hooks — a "--selftest" string inside one
         # is coincidental; executing `python3 <module> --selftest` proves nothing.
         st = None if label == "lib" else _selftest(dst)
+        forced = "  (--force: overwrote a copy changed outside sync)" if kind not in ("new", "update") else ""
         if st is False:
             failures.append(dst)
-            print(f"  INSTALLED  {os.path.basename(dst)}  — SELFTEST FAILED", file=sys.stderr)
+            print(f"  INSTALLED  {os.path.basename(dst)}  — SELFTEST FAILED{forced}", file=sys.stderr)
         else:
             note = "" if st is None else "  (selftest PASS)"
-            print(f"  installed  [{label:8}] {os.path.basename(dst)}{note}")
+            print(f"  installed  [{label:8}] {os.path.basename(dst)}{note}{forced}")
         installed.append(dst)
+    _write_state(claude, new_state, head)
     if not installed:
         print("sync: nothing to install — already in parity")
     else:
-        try:
-            head = subprocess.check_output(
-                ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
-                text=True, timeout=10).strip()
-        except Exception:
-            head = "?"
         _git_snapshot(claude, f"sync: apply from clanker@{head}")
     if failures:
         print(f"sync: {len(failures)} selftest FAILURE(S) — the installed copies are "
@@ -185,13 +325,13 @@ def apply(repo_root=None, claude=None):
     return 0
 
 
-def pin(repo_root=None, claude=None):
+def pin(repo_root=None, claude=None, force=False):
     """Rewrite settings.json: repo-working-tree hook paths -> clanker-dist copies."""
     repo_root = repo_root or REPO_ROOT
     claude = claude or _claude_dir()
-    rc = apply(repo_root, claude)          # dist copies must exist and be current
+    rc = apply(repo_root, claude, force=force)   # dist copies must exist and be current
     if rc != 0:
-        print("pin: aborting — apply reported selftest failures", file=sys.stderr)
+        print("pin: aborting — apply did not complete (see above)", file=sys.stderr)
         return rc
     settings = os.path.join(claude, "settings.json")
     with open(settings) as f:
@@ -248,10 +388,10 @@ def pin(repo_root=None, claude=None):
     return 0
 
 
-def run(mode="check"):
+def run(mode="check", force=False):
     if mode == "apply":
-        return apply()
+        return apply(force=force)
     if mode == "pin":
-        return pin()
+        return pin(force=force)
     drifted, missing, _ = check()
     return 1 if (drifted or missing) else 0

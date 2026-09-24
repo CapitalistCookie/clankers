@@ -133,7 +133,10 @@ def cmd_memory_new(args):
 def cmd_sync(args):
     from synccmd import run as sync_run
     mode = "apply" if args.apply else ("pin" if args.pin else "check")
-    sys.exit(sync_run(mode))
+    if args.force and mode == "check":
+        print("sync: --force needs --apply or --pin", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(sync_run(mode, force=args.force))
 
 def cmd_publish(args):
     from publishcmd import publish
@@ -861,6 +864,8 @@ def main():
     p.add_argument('--check', action='store_true', help='parity table (default)')
     p.add_argument('--apply', action='store_true', help='install repo hooks into ~/.claude (git-snapshotted, selftested)')
     p.add_argument('--pin', action='store_true', help='rewrite settings.json repo paths -> clanker-dist (implies --apply)')
+    p.add_argument('--force', action='store_true',
+                   help='with --apply/--pin: overwrite installed files that were edited or removed outside clanker sync')
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser('publish', help='Sanitized sync to the public sister repo (strip + publint/gitleaks gates + commit)')
