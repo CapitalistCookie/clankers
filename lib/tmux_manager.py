@@ -118,16 +118,19 @@ def add_session(name, project_path=None):
         project_path = os.path.expanduser(f"~/projects/{name}")
     project_path = os.path.abspath(os.path.expanduser(project_path))
 
-    exists = subprocess.run(["tmux", "has-session", "-t", name],
+    # Exact targets (2026-09-24): "=name" never prefix-matches, so a missing
+    # `clanker` is not taken for a running `clanker-41`; "=name:" sends the
+    # keys to that session's current window only.
+    exists = subprocess.run(["tmux", "has-session", "-t", f"={name}"],
                             capture_output=True).returncode == 0
     if exists:
         print(f"Tmux session '{name}' already exists — leaving as-is, registering for boot")
     else:
         from newsession import tmux_new_session
         _r, healed = tmux_new_session(name, project_path)   # login shell guaranteed
-        subprocess.run(["tmux", "send-keys", "-t", name, "-l", "--",
+        subprocess.run(["tmux", "send-keys", "-t", f"={name}:", "-l", "--",
                         _launch_cmd(project_path)], capture_output=True)
-        subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], capture_output=True)
+        subprocess.run(["tmux", "send-keys", "-t", f"={name}:", "Enter"], capture_output=True)
         print(f"Created tmux session: {name} → {project_path}"
               + (f" (healed tmux default-shell: was {healed})" if healed else ""))
 

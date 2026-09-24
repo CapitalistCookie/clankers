@@ -433,3 +433,96 @@ def test_work_cli_starts_claude_in_existing_plain_shell_end_to_end(tmp_path):
     assert typed[0].endswith(f"cd {proj} && {newsession.LAUNCH}")
     assert sum(1 for ln in lines if ln.startswith("send-keys") and ln.endswith("Enter")) == 2
     assert not any(ln.startswith("new-session") for ln in lines)
+
+
+# ── 2026-09-24: exact session targets — `clanker` must never be `clanker-41` ──
+
+def _tmux_like_run(alive):
+    """subprocess.run stand-in that resolves `-t` like tmux: `=name` matches
+    exactly; a bare name matches exactly, else by a unique prefix. Logs a
+    RESOLVED row for each target it resolves."""
+    def resolve(target):
+        s = target.split(":", 1)[0]
+        if s.startswith("="):
+            return s[1:] if s[1:] in alive else None
+        if s in alive:
+            return s
+        hits = [n for n in alive if n.startswith(s)]
+        return hits[0] if len(hits) == 1 else None
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        hit = resolve(argv[argv.index("-t") + 1]) if "-t" in argv else None
+        if hit:
+            calls.append(["RESOLVED", argv[1], hit])
+        if "has-session" in argv:
+            return FakeProc(rc=0 if hit else 1)
+        if "new-session" in argv:
+            alive.append(argv[argv.index("-s") + 1])
+        return FakeProc(rc=0)
+    return run
+
+
+def test_session_exists_matches_the_exact_name_only(monkeypatch):
+    monkeypatch.setattr(newsession.subprocess, "run", _tmux_like_run(["clanker-41"]))
+    assert newsession._session_exists("clanker") is False
+    assert newsession._session_exists("clanker-41") is True
+    assert ["tmux", "has-session", "-t", "=clanker"] in calls
+    assert newsession._unique_name("clanker") == "clanker"
+
+
+def test_work_clanker_never_resolves_to_clanker_41_end_to_end(tmp_path):
+    """The real `clanker work clanker` entry point against a fake tmux that
+    resolves targets like tmux, with only `clanker-41` running. A bare
+    `has-session -t clanker` prefix-matched `clanker-41`: work reported the
+    session as present and never created `clanker`. Now `clanker` is created
+    and no command resolves to `clanker-41`."""
+    proj = tmp_path / "clanker"
+    proj.mkdir()
+    reg = tmp_path / "registry.yaml"
+    reg.write_text("projects:\n  clanker:\n    archetype: tool\n"
+                   f"    path: {proj}\n")
+    log, alive, cap = tmp_path / "tmux.log", tmp_path / "alive", tmp_path / "capture.n"
+    alive.write_text("clanker-41\n")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "tmux").write_text(
+        "#!/bin/bash\n"
+        f'log="{log}"; alive="{alive}"; cap="{cap}"\n'
+        'echo "$*" >> "$log"\n'
+        't=""; prev=""; for a in "$@"; do [ "$prev" = "-t" ] && t="$a"; prev="$a"; done\n'
+        'resolve() {  # like tmux: =name exact; a bare name exact, else unique prefix\n'
+        '  local s="${1%%:*}" names m\n'
+        '  names=$(cat "$alive")\n'
+        '  case "$s" in =*) grep -qxF -- "${s#=}" <<<"$names" && echo "${s#=}"; return;; esac\n'
+        '  if grep -qxF -- "$s" <<<"$names"; then echo "$s"; return; fi\n'
+        '  m=$(while read -r n; do case "$n" in "$s"*) echo "$n";; esac; done <<<"$names")\n'
+        '  [ "$(grep -c . <<<"$m")" = 1 ] && echo "$m"\n'
+        '}\n'
+        'r=""; [ -n "$t" ] && r=$(resolve "$t")\n'
+        '[ -n "$r" ] && echo "RESOLVED $1 $r" >> "$log"\n'
+        'case "$1" in\n'
+        '  has-session) [ -n "$r" ] || exit 1;;\n'
+        '  new-session) prev=""; for a in "$@"; do [ "$prev" = "-s" ] && echo "$a" >> "$alive"; prev="$a"; done;;\n'
+        '  display-message) [ -n "$r" ] || exit 1; echo bash;;\n'
+        '  capture-pane)\n'
+        '    [ -n "$r" ] || exit 1\n'
+        '    n=$(cat "$cap" 2>/dev/null || echo 0); echo $((n+1)) > "$cap"\n'
+        "    if [ \"$n\" = 0 ]; then echo '$ '; else\n"
+        "      printf 'Do you trust the files in this folder?\\n❯ Yes, I trust this folder\\n  No, exit\\n'; fi;;\n"
+        'esac\n'
+        'exit 0\n')
+    (fakebin / "tmux").chmod(0o755)
+    env = {**os.environ, "HOME": str(tmp_path), "CLANKER_REGISTRY": str(reg),
+           "CLANKER_PROJECT_ROOTS": str(tmp_path), "CLANKER_DATA": str(tmp_path / "data"),
+           "PATH": f"{fakebin}:{os.environ['PATH']}"}
+    env.pop("TMUX", None)
+    r = _REAL_RUN([os.path.join(_REPO, "bin", "clanker"), "work", "clanker", "--no-attach"],
+                  capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "session 'clanker'" in r.stdout and "already exists" not in r.stdout
+    lines = log.read_text().splitlines()
+    assert "has-session -t =clanker" in lines
+    assert any(ln.startswith("new-session -d -s clanker ") for ln in lines)
+    assert not [ln for ln in lines if ln.startswith("RESOLVED") and ln.endswith(" clanker-41")]
+    assert alive.read_text().split() == ["clanker-41", "clanker"]

@@ -305,3 +305,39 @@ def test_boot_script_creates_only_missing_sessions_as_shells(tmp_path, monkeypat
     assert "has-session -t =web" in lines
     assert not any("-s alive" in ln for ln in lines)
     assert not any(ln.startswith("send-keys") for ln in lines)
+
+
+# ── 2026-09-24: exact targets in add_session ──────────────────────────────────
+
+def test_add_session_creates_clanker_while_clanker_41_runs(startup, monkeypatch, capsys):
+    """A bare `has-session -t clanker` prefix-matches a running `clanker-41`
+    (tmux resolves an exact name first, then a unique prefix), so add_session
+    skipped creating `clanker`. The `=name` target matches exactly, and the
+    keys go to `=clanker:`, never to `clanker-41`."""
+    alive = ["clanker-41"]
+
+    def resolve(target):
+        s = target.split(":", 1)[0]
+        if s.startswith("="):
+            return s[1:] if s[1:] in alive else None
+        if s in alive:
+            return s
+        hits = [n for n in alive if n.startswith(s)]
+        return hits[0] if len(hits) == 1 else None
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        hit = resolve(argv[argv.index("-t") + 1]) if "-t" in argv else None
+        if "has-session" in argv:
+            return FakeProc(0 if hit else 1)
+        if "new-session" in argv:
+            alive.append(argv[argv.index("-s") + 1])
+        return FakeProc(0)
+
+    monkeypatch.setattr(tmux_manager.subprocess, "run", run)
+    tmux_manager.add_session("clanker", "/proj/clanker")
+    assert "Created tmux session: clanker" in capsys.readouterr().out
+    assert alive == ["clanker-41", "clanker"]
+    assert ["tmux", "has-session", "-t", "=clanker"] in calls
+    keys = [c for c in calls if "send-keys" in c]
+    assert len(keys) == 2 and all(c[c.index("-t") + 1] == "=clanker:" for c in keys)

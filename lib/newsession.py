@@ -102,7 +102,11 @@ def _tmux():
 
 
 def _session_exists(name):
-    return subprocess.run(["tmux", "has-session", "-t", name],
+    """True iff a session named EXACTLY `name` exists. The `=` target never
+    prefix-matches: a bare `-t clanker` resolved to `clanker-41` while no
+    `clanker` ran, so `clanker work clanker` reported the session as present
+    and `clanker open` attached to the other one (2026-09-24)."""
+    return subprocess.run(["tmux", "has-session", "-t", f"={name}"],
                           capture_output=True).returncode == 0
 
 
