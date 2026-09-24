@@ -74,74 +74,15 @@ def run_gc(dry_run=False):
                 f.writelines(entries)
     results["proposals_pruned"] = pruned
 
-    # 5. Memory-router maintenance (sharded-router design 2026-07-19): refresh
-    # the generated registry snapshot and lint-sweep memory namespaces so
-    # on-disk violations and orphan counts surface weekly, not never.
-    # 2026-07-22 (audit M3, P5b/c): the sweep now covers REGISTERED PROJECT
-    # namespaces too, and a FAIL raises a real alert instead of a line in cron
-    # stdout that nobody reads — the system was measuring this debt weekly
-    # and telling no one.
+    # 5. Memory maintenance is off (2026-09-24). Auto-memory is disabled since
+    # 2026-08-08 (autoMemoryEnabled: false) and memory-lint.sh is retired, so
+    # gc no longer regenerates ROUTER-AUTO.md in the memory dir, lint-sweeps
+    # the namespaces or raises the memory-doctor alert: nothing may write to a
+    # memory dir, and the sweep had nothing to run. `clanker memory
+    # router-gen` still runs on demand.
+    results["memory_doctor"] = ("skipped: auto-memory is off since 2026-08-08 "
+                                "and memory-lint is retired")
     if not dry_run:
-        try:
-            import subprocess
-            import sys as _sys
-            _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            import memorycmd
-            memorycmd.router_gen()
-            lint = os.path.expanduser("~/.claude/hooks/memory-lint.sh")
-            targets = {"global": memorycmd.GLOBAL_MEM}
-            try:
-                from memoryns import memory_root, ns_dir
-                from registry import Registry
-                reg = Registry()
-                for name in sorted(reg.projects):
-                    path = reg.get_path(name)
-                    mdir = os.path.join(ns_dir(memory_root(path)), "memory")
-                    if os.path.isfile(os.path.join(mdir, "MEMORY.md")):
-                        targets[name] = mdir
-            except Exception:
-                pass          # registry trouble degrades to the global-only sweep
-            # Several registry entries can resolve to the SAME namespace dir
-            # (toxicflow / -es / -nq all live under the yon repo, so all three
-            # map to the one yon/memory namespace dir). Without this, one violation is
-            # linted N times and reported as N failing namespaces.
-            by_dir = {}
-            for _name, _mdir in sorted(targets.items()):
-                by_dir.setdefault(os.path.realpath(_mdir), _name)
-            targets = {_name: _dir for _dir, _name in by_dir.items()}
-            failing = {}
-            if os.path.exists(lint):
-                for name, mdir in sorted(targets.items()):
-                    if not os.path.isdir(mdir):
-                        continue
-                    r = subprocess.run(["bash", lint, "--doctor", mdir],
-                                       capture_output=True, text=True, timeout=120)
-                    if r.returncode != 0:
-                        # memory-lint prints VIOLATIONS to stderr and bookkeeping
-                        # ("orphans=N") to stdout. Reading stdout first made every
-                        # alert say "orphans=0" and hid the real reason, which is
-                        # why the standing memory-doctor alert sat ignored 13 days.
-                        out = (r.stderr or "") + "\n" + (r.stdout or "")
-                        first = next((l.strip() for l in out.splitlines() if l.strip()), "")
-                        failing[name] = first[:200]
-                results["memory_doctor"] = ("pass" if not failing
-                                            else "FAIL: " + ", ".join(sorted(failing)))
-                results["memory_namespaces_swept"] = len(targets)
-                try:
-                    from alerts import _create_alert, _dismiss_alert
-                    if failing:
-                        _create_alert(
-                            "memory-doctor", "warning", "gc",
-                            f"memory doctor FAILING in {len(failing)} namespace(s): "
-                            f"{', '.join(sorted(failing))} — triage: clanker memory doctor",
-                            details=failing)
-                    else:
-                        _dismiss_alert("memory-doctor")
-                except Exception:
-                    pass
-        except Exception as e:
-            results["memory_doctor"] = f"error: {e}"
-
         # --- orphaned scheduled work -------------------------------------
         # The removal GATE (onboard.remove_project) prevents NEW orphans, but
         # cron installed outside clanker, or a project retired before the gate
@@ -185,8 +126,8 @@ def run_gc(dry_run=False):
     # re-raise every 15 minutes: each came back the next pass with first_seen,
     # ignored_days and escalated_at reset, and escalated again 3 days later.
     # _escalate_ignored keeps first_seen as its clock. This step runs last so
-    # an alert raised by this run (step 5 re-raises memory-doctor and
-    # schedules-orphaned weekly) is judged on that raise, not last week's.
+    # an alert raised by this run (step 5 re-raises schedules-orphaned
+    # weekly) is judged on that raise, not last week's.
     alerts_dir = os.path.join(DATA_DIR, "alerts")
     expired = 0
     if os.path.isdir(alerts_dir):

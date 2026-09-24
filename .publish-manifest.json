@@ -94,6 +94,7 @@
   "lib/schedules.py",
   "lib/serve.py",
   "lib/serve_user.py",
+  "lib/settings_templates.py",
   "lib/skills_audit.py",
   "lib/synccmd.py",
   "lib/sysmon_sampler.py",
@@ -122,6 +123,13 @@
   "localci/install.sh",
   "localci/localci-install",
   "scripts/bootstrap.py",
+  "templates/settings/README.md",
+  "templates/settings/build.json",
+  "templates/settings/frontend.json",
+  "templates/settings/infra.json",
+  "templates/settings/production.json",
+  "templates/settings/research.json",
+  "templates/settings/tool.json",
   "tests/conftest.py",
   "tests/fixtures/registry.yaml",
   "tests/test_adopt.py",
@@ -161,6 +169,7 @@
   "tests/test_session_end.py",
   "tests/test_session_registry.py",
   "tests/test_session_start.py",
+  "tests/test_settings_templates.py",
   "tests/test_skills_audit.py",
   "tests/test_spa_js.py",
   "tests/test_synccmd.py",
@@ -170,5 +179,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "cc4e73a"
+ "source_commit": "0777a0d"
 }

@@ -1,12 +1,16 @@
-"""P5 (b–d) memory-debt burndown: gc sweeps registered project namespaces (not
-just global), a failing memory doctor raises a real ALERT (not a cron-stdout
-whisper), and the weekly digest lists top-N orphans for triage.
+"""gc and the memory commands after auto-memory went off (2026-09-24): gc runs
+no memory-lint, writes nothing to a memory dir and raises no memory-doctor
+alert; `clanker memory doctor` says the lint is retired and exits 1; `memory
+new` runs no lint. The weekly digest still lists top-N orphans (P5d), and the
+alert-expiry tests keep their 2026-09-24 contract.
 
 Hermetic: every import-time-captured path (cleanup.DATA_DIR, alerts.ALERTS_DIR,
 memorycmd.GLOBAL_MEM, memoryns.CLAUDE_PROJECTS) is monkeypatched; HOME→tmp so
-the swept lint script is a planted fake; registry+roots pinned to tmp."""
+a planted fake lint would show if anything ran it; registry+roots pinned to
+tmp; schedules.scan is stubbed, so no test reads the machine's crontab."""
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -20,6 +24,7 @@ import cleanup      # noqa: E402
 import alerts       # noqa: E402
 import memorycmd    # noqa: E402
 import memoryns     # noqa: E402
+import schedules    # noqa: E402
 
 
 @pytest.fixture
@@ -31,8 +36,10 @@ def gc_env(tmp_path, monkeypatch):
     gmem.mkdir()
     (gmem / "MEMORY.md").write_text("# global router\n")
     monkeypatch.setattr(memorycmd, "GLOBAL_MEM", str(gmem))
-    monkeypatch.setattr(memorycmd, "router_gen", lambda: 0)
+    router_calls = []
+    monkeypatch.setattr(memorycmd, "router_gen", lambda: router_calls.append(1) or 0)
     monkeypatch.setattr(memoryns, "CLAUDE_PROJECTS", str(tmp_path / "claude-projects"))
+    monkeypatch.setattr(schedules, "scan", lambda *a, **k: [])
 
     proj = tmp_path / "projA"
     proj.mkdir()
@@ -50,38 +57,65 @@ def gc_env(tmp_path, monkeypatch):
     hooks.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     return {"lint": hooks / "memory-lint.sh", "alerts": tmp_path / "data" / "alerts",
-            "ns_mem": ns_mem}
+            "ns_mem": ns_mem, "gmem": gmem, "router_calls": router_calls,
+            "ran": tmp_path / "lint-ran"}
 
 
-def _write_lint(path, fail_pattern=""):
-    body = "#!/bin/bash\n"
-    if fail_pattern:
-        body += (f'case "$2" in\n  *{fail_pattern}*) '
-                 'echo "MEMORY.md VIOLATION (line 1)"; exit 1;;\nesac\n')
-    body += "exit 0\n"
-    path.write_text(body)
+def _write_lint(env):
+    """A fake memory-lint that leaves a mark and fails, if anything runs it."""
+    env["lint"].write_text(f'#!/bin/bash\ntouch "{env["ran"]}"\n'
+                           'echo "MEMORY.md VIOLATION (line 1)" >&2; exit 1\n')
 
 
-def test_gc_sweeps_project_namespaces_and_alerts_on_fail(gc_env):
-    _write_lint(gc_env["lint"], fail_pattern="projA")
+def test_gc_runs_no_memory_lint_and_writes_no_memory_file(gc_env):
+    _write_lint(gc_env)
+    before = sorted(os.listdir(gc_env["gmem"])), sorted(os.listdir(gc_env["ns_mem"]))
     results = cleanup.run_gc()
-    assert results["memory_namespaces_swept"] == 2          # global + projA (P5c)
-    assert results["memory_doctor"] == "FAIL: projA"
-    alert_file = gc_env["alerts"] / "memory-doctor.json"     # P5b: a real alert
-    assert alert_file.exists(), "failing doctor did not raise an alert"
-    a = json.loads(alert_file.read_text())
-    assert a["severity"] == "warning" and "projA" in a["message"]
-    assert "VIOLATION" in a["details"]["projA"]
+    assert results["memory_doctor"] == ("skipped: auto-memory is off since 2026-08-08 "
+                                        "and memory-lint is retired")
+    assert "memory_namespaces_swept" not in results
+    assert not gc_env["ran"].exists(), "gc ran a memory lint"
+    assert gc_env["router_calls"] == [], "gc regenerated ROUTER-AUTO.md in the memory dir"
+    assert (sorted(os.listdir(gc_env["gmem"])), sorted(os.listdir(gc_env["ns_mem"]))) == before
+    assert not (gc_env["alerts"] / "memory-doctor.json").exists()
+    assert cleanup.run_gc(dry_run=True)["memory_doctor"].startswith("skipped")
 
 
-def test_gc_pass_dismisses_stale_doctor_alert(gc_env):
-    _write_lint(gc_env["lint"])                              # everything passes
-    os.makedirs(gc_env["alerts"], exist_ok=True)
-    stale = gc_env["alerts"] / "memory-doctor.json"
-    stale.write_text(json.dumps({"id": "memory-doctor", "severity": "warning"}))
-    results = cleanup.run_gc()
-    assert results["memory_doctor"] == "pass"
-    assert not stale.exists(), "healthy sweep must dismiss the standing alert"
+def test_gc_leaves_an_old_memory_doctor_alert_to_expiry(gc_env):
+    """No sweep dismisses or re-raises memory-doctor now: a leftover alert
+    expires 7 days after its newest raise, like any other."""
+    adir = gc_env["alerts"]
+    os.makedirs(adir, exist_ok=True)
+    _put_alert(adir, "memory-doctor", {"id": "memory-doctor", "timestamp": _iso_ago(1)})
+    cleanup.run_gc()
+    assert (adir / "memory-doctor.json").exists()
+    _put_alert(adir, "memory-doctor", {"id": "memory-doctor", "timestamp": _iso_ago(8)})
+    assert cleanup.run_gc()["alerts_expired"] == 1
+    assert not (adir / "memory-doctor.json").exists()
+
+
+def test_memory_doctor_is_retired_and_exits_1(gc_env, capsys, monkeypatch):
+    _write_lint(gc_env)
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a))
+    assert memorycmd.doctor() == 1
+    assert memorycmd.doctor(project="projA") == 1
+    err = capsys.readouterr().err
+    assert "memory doctor: nothing checked — memory-lint is retired" in err
+    assert calls == [] and not gc_env["ran"].exists()
+
+
+def test_memory_new_scaffolds_without_a_lint_run(gc_env, capsys, monkeypatch):
+    _write_lint(gc_env)
+    calls = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: calls.append(a))
+    assert memorycmd.new("a-fact", "project", "what the fact is") == 0
+    assert (gc_env["gmem"] / "a-fact.md").read_text().startswith("---\nname: a-fact\n")
+    assert "- [a-fact](a-fact.md) — what the fact is" in (gc_env["gmem"] / "MEMORY.md").read_text()
+    out = capsys.readouterr()
+    assert "memory new: no lint run — memory-lint is retired" in out.err
+    assert "OTHER lint violations" not in out.err
+    assert calls == [] and not gc_env["ran"].exists()
 
 
 def test_orphans_top_parses_index_and_sorts_by_size(tmp_path, monkeypatch):
@@ -131,7 +165,6 @@ def test_gc_expires_alerts_on_their_newest_raise(gc_env):
     first_seen, which expired standing alerts their producers re-raise every
     15 minutes. Expiry now keys on the newest raise: timestamp, else ts, else
     first_seen; mtime only when none exists. `created` is a birth time."""
-    _write_lint(gc_env["lint"])
     adir = gc_env["alerts"]
     os.makedirs(adir, exist_ok=True)
     put, iso = (lambda *a, **k: _put_alert(adir, *a, **k)), _iso_ago
@@ -168,19 +201,22 @@ def test_gc_expires_alerts_on_their_newest_raise(gc_env):
     assert standing["ignored_days"] == 20
 
 
-def test_gc_judges_its_own_weekly_raise_after_raising_it(gc_env):
-    """gc re-raises memory-doctor (and schedules-orphaned) once a week, in a
-    step after the old expiry step: the week-old raise expired first and the
-    re-raise came back as a new alert, first_seen reset. Expiry now runs last."""
-    _write_lint(gc_env["lint"], fail_pattern="projA")
+def test_gc_judges_its_own_weekly_raise_after_raising_it(gc_env, monkeypatch):
+    """gc re-raises schedules-orphaned once a week, in a step before the
+    expiry step: the week-old raise must not expire first and come back as a
+    new alert with first_seen reset. (This test used memory-doctor until that
+    raise went away on 2026-09-24.)"""
+    rogue = [{"active": True, "paths": ["/srv/unregistered-repo"], "line": "x"}]
+    monkeypatch.setattr(schedules, "scan", lambda *a, **k: rogue)
+    monkeypatch.setattr(schedules, "unowned", lambda items, known_paths=None, **k: list(items))
     adir = gc_env["alerts"]
     os.makedirs(adir, exist_ok=True)
     born = _iso_ago(30)
-    _put_alert(adir, "memory-doctor", {"id": "memory-doctor", "severity": "warning",
-                                       "first_seen": born, "timestamp": _iso_ago(7.01),
-                                       "message": "memory doctor FAILING"}, 7.01)
+    _put_alert(adir, "schedules-orphaned", {"id": "schedules-orphaned", "severity": "warning",
+                                            "first_seen": born, "timestamp": _iso_ago(7.01),
+                                            "message": "1 active scheduled item"}, 7.01)
     results = cleanup.run_gc()
-    assert results["alerts_expired"] == 0
-    a = json.loads((adir / "memory-doctor.json").read_text())
+    assert results["alerts_expired"] == 0 and results["schedules_orphaned"] == 1
+    a = json.loads((adir / "schedules-orphaned.json").read_text())
     assert a["first_seen"] == born                 # the same alert, not a reborn one
     assert a["timestamp"] > _iso_ago(0.01)         # raised by this run

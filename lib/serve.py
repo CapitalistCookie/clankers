@@ -2189,7 +2189,9 @@ async def monitor_sessions(app):
       - subagent fan-out: first sight of agent activity per working episode
         (low prio, informational, says what fanned out)
       - vanished-mid-work: pane gone while last seen working (crash/kill)
-      - subagent limit-kills: new pending entries in agent_resume_queue.jsonl
+    (The subagent limit-kill ping read ~/.claude/agent_resume_queue.jsonl. Its
+    producer, the SubagentStop resume hook, was retired on 2026-09-24 and the
+    queue had been empty since 2026-07-22, so the read is gone.)
 
     Three gates kill the false-firing:
       1. TRANSITION — only an observed working→waiting edge arms a notification.
@@ -2211,10 +2213,6 @@ async def monitor_sessions(app):
     parked_check = {}      # sid -> ts of last parked check (throttle: 1/30s per pane)
     parked_pending = {}    # sid -> ts first seen parked, awaiting the aggregate ping
     announced = False
-    # Subagent limit-kill watcher: the SubagentStop hook appends to this queue;
-    # start at the current size so historical entries never burst on restart.
-    queue_path = os.path.expanduser("~/.claude/agent_resume_queue.jsonl")
-    queue_offset = os.path.getsize(queue_path) if os.path.exists(queue_path) else 0
 
     async with ClientSession() as http:
         while True:
@@ -2258,45 +2256,6 @@ async def monitor_sessions(app):
                         now, muted_until)
                 for sid in gone:
                     agents_pinged.discard(sid)
-
-                # Subagent limit-kills: the SubagentStop hook queues them in
-                # agent_resume_queue.jsonl — new pending entries earn a ping so
-                # a dead lane isn't discovered hours later at the desk. Offset
-                # advances only once processed (or when ntfy is unconfigured),
-                # so a quota-mute delays the ping instead of dropping it.
-                try:
-                    qsize = (os.path.getsize(queue_path)
-                             if os.path.exists(queue_path) else 0)
-                    if qsize < queue_offset:
-                        queue_offset = 0  # queue truncated/cleared
-                    if qsize > queue_offset:
-                        if not NTFY_TOPIC:
-                            queue_offset = qsize
-                        elif now >= muted_until:
-                            with open(queue_path) as qf:
-                                qf.seek(queue_offset)
-                                fresh = qf.read()
-                            queue_offset = qsize
-                            for qline in fresh.strip().split("\n"):
-                                if not qline.strip():
-                                    continue
-                                try:
-                                    e = json.loads(qline)
-                                except json.JSONDecodeError:
-                                    continue
-                                if e.get("status") != "pending":
-                                    continue
-                                proj = os.path.basename(e.get("cwd", "")) or "?"
-                                body = (e.get("prompt", "") or "").strip()[:120] \
-                                    or "queued for resume"
-                                reset = e.get("reset_hint", "")
-                                if reset and reset != "unknown":
-                                    body = f"resets {reset} — {body}"
-                                _, muted_until = await _post_ntfy(
-                                    http, f"subagent limit-killed: {proj}",
-                                    "high", "zzz", body, now, muted_until)
-                except Exception as e:
-                    log.debug("resume-queue watch error: %s", e)
 
                 for p in panes:
                     sid = p["session"]

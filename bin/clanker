@@ -570,6 +570,35 @@ def cmd_skills_hide(args):
         return 1
     return hide(path, args.skills, mode=args.mode, dry_run=args.dry_run)
 
+def cmd_settings_check(args):
+    """Per-repo drift from the archetype settings template; exit 1 on drift."""
+    import json as _json
+    from settings_templates import check, render
+    if not args.repos and not args.all:
+        print("settings check: name repo(s) or pass --all", file=sys.stderr)
+        return 2
+    rows = check(None if args.all else args.repos)
+    print(_json.dumps(rows, indent=1) if args.json else render(rows))
+    return 1 if any(r['status'] != 'ok' for r in rows) else 0
+
+def cmd_settings_apply(args):
+    """Write one template key into the named repos' .claude/settings.json."""
+    import harness_lint
+    from registry import Registry
+    from settings_templates import apply_key, load_config
+    reg_path = harness_lint.default_registry_path()
+    projects = harness_lint.load_projects(reg_path)
+    reg, cfg = Registry(reg_path), load_config(reg_path)
+    rc = 0
+    for name in args.repos:
+        if name not in projects:
+            print(f"{name}: not a registered repo on disk", file=sys.stderr)
+            rc = 1
+            continue
+        rc |= apply_key(name, projects[name], reg.get_archetype(name), args.key, cfg,
+                        commit=args.commit, dry_run=args.dry_run, create=args.create)
+    return rc
+
 def cmd_export(args):
     from advanced import export_harness
     export_harness(args.output)
@@ -1005,6 +1034,25 @@ def main():
     sp.add_argument('--mode', choices=['off', 'user-invocable-only', 'name-only', 'on'], default='off')
     sp.add_argument('--dry-run', action='store_true', help='print the merged file; write nothing')
     sp.set_defaults(func=cmd_skills_hide)
+
+    p = sub.add_parser('settings', help='Archetype settings templates: `settings check <repo...>|--all` (drift), `settings apply <repo...> --key K` (write one key)')
+    ssub = p.add_subparsers(dest='settings_action', required=True)
+    sp = ssub.add_parser('check', help='per repo: template keys missing or different, extra keys, hook timeouts > 60 s; exit 1 on drift',
+                         description='Compare each repo\'s tracked .claude/settings.json with templates/settings/<archetype>.json '
+                                     '(registry `settings_templates: {overrides: {repo: template}}` picks another template).')
+    sp.add_argument('repos', nargs='*', help='registry project names')
+    sp.add_argument('--all', action='store_true', help='every registered repo')
+    sp.add_argument('--json', action='store_true')
+    sp.set_defaults(func=cmd_settings_check)
+    sp = ssub.add_parser('apply', help='write the template value of one key into the named repos (minimal diff; --commit = one plain commit per repo)',
+                         description='Never all repos at once: name them. A repo whose template lacks the key is refused. '
+                                     '--commit refuses a dirty settings file and restores the file when the commit fails.')
+    sp.add_argument('repos', nargs='+', help='registry project names')
+    sp.add_argument('--key', required=True, help='template key, e.g. disableClaudeAiConnectors')
+    sp.add_argument('--commit', action='store_true', help='commit .claude/settings.json alone, one commit per repo')
+    sp.add_argument('--dry-run', action='store_true')
+    sp.add_argument('--create', action='store_true', help='create .claude/settings.json when it is absent')
+    sp.set_defaults(func=cmd_settings_apply)
 
     p = sub.add_parser('export', help='Export harness state')
     p.add_argument('--output', help='Output tarball path')

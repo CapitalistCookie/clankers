@@ -23,7 +23,9 @@ fi
 echo "[ci/full] publint…";  bash ci/publint.sh || fail publint
 # Live-harness hook selftests: these scripts gate every session on this box —
 # a broken edit must fail CI loudly, not wait to be noticed at 2am.
-for st in "$HOME/.claude/hooks/memory-lint.sh" "$HOME/.claude/hooks/context-gauge.sh"; do
+# (memory-lint.sh left this list on 2026-09-24: the hook is retired with
+# auto-memory.)
+for st in "$HOME/.claude/hooks/context-gauge.sh"; do
   if [ -f "$st" ]; then
     echo "[ci/full] selftest $(basename "$st")…"
     bash "$st" --selftest || fail "selftest:$(basename "$st")"
