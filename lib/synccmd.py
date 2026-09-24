@@ -35,12 +35,13 @@ def _claude_dir():
     return os.environ.get("CLANKER_CLAUDE_DIR", os.path.expanduser("~/.claude"))
 
 
-# The repo-run set: wired from the repo working tree today; --pin moves the
-# wiring to the dist copies. Keep in sync with settings.json's clanker entries.
+# The repo-run set: installed to clanker-dist and wired from there (--pin,
+# 2026-07-19). Keep in sync with settings.json's clanker entries. On 2026-09-24
+# agent-resume-surface.sh, subagent-resume-detect.py, prompt-check.sh and
+# status-stale-nudge.sh were unwired, then removed (git history keeps them).
 REPO_RUN = [
-    "session-start.sh", "session-end.sh", "prompt-check.sh", "skill-tracker.sh",
-    "status-stale-nudge.sh", "agent-resume-surface.sh",
-    "subagent-resume-detect.py", "subagent-tier-gate.py",
+    "session-start.sh", "session-end.sh", "skill-tracker.sh",
+    "subagent-tier-gate.py",
 ]
 
 

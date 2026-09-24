@@ -1,5 +1,4 @@
 #!/bin/bash
-# distribution source: synced to ~/.claude/hooks by clanker sync (do not edit the installed copy)
 # Two-layer selftest for the context gauge: context-gauge.sh (fast-path skip
 # logic) + context-gauge.py (measurement/emission). RED/GREEN per behavior.
 # Run: bash context-gauge.sh --selftest   (or this file directly)
@@ -88,8 +87,31 @@ chk $st "G1 cache line2 = resolved subagent path"
 outG2=$(run "$PAYG"); [ -z "$outG2" ] && [ ! -f "$PROBE" ] && st=ok || st=bad
 chk $st "G2 subagent skip path (silent, python not spawned)"
 
+# ── H: first-reading text stays <= 200 chars (2026-09-24 shortening) ────────
+lenA=$(printf '%s' "$outA" | jq -r '.hookSpecificOutput.additionalContext' 2>/dev/null | tr -d '\n' | wc -m)
+[ "${lenA:-999}" -le 200 ] && st=ok || st=bad
+chk $st "H first-reading text <= 200 chars (got $lenA)"
+
+# ── I: a NESTED agent_id (Agent tool_response naming a spawned teammate) must
+#       not mint a new key: the grounded parent stays silent (2026-09-24 bug) ──
+TPI="$T/ccgtestI.jsonl"; usage_line 200000 > "$TPI"
+PAYI=$(printf '{"transcript_path":"%s","session_id":"ccgtests"}' "$TPI")
+run "$PAYI" >/dev/null
+PAYI2=$(printf '{"transcript_path":"%s","session_id":"ccgtests","tool_name":"Agent","tool_response":{"status":"teammate_spawned","agent_id":"ccgtagent-nested@s1"}}' "$TPI")
+outI=$(run "$PAYI2")
+! echo "$outI" | grep -q 'first reading' && [ ! -e /tmp/cc-ctxgauge-grounded-ag-ccgtagent-nested_s1 ] && st=ok || st=bad
+chk $st "I nested agent_id ignored (no re-grounding, no stray key): got: ${outI:0:60}"
+
+# ── J: parallel first calls (a batch of parallel tool calls) ground ONCE ─────
+TPJ="$T/ccgtestJ.jsonl"; usage_line 200000 > "$TPJ"
+PAYJ=$(printf '{"transcript_path":"%s","session_id":"ccgtests"}' "$TPJ")
+for i in $(seq 1 12); do ( printf '%s' "$PAYJ" | bash "$W" > "$T/j.$i" 2>/dev/null ) & done; wait
+nJ=$(grep -l 'first reading' "$T"/j.* 2>/dev/null | wc -l)
+[ "$nJ" -eq 1 ] && st=ok || st=bad
+chk $st "J 12 parallel first calls -> exactly 1 grounding (got $nJ)"
+
 if [ "$fails" -eq 0 ]; then
-  echo "context-gauge selftest: 13/13 PASS"
+  echo "context-gauge selftest: 16/16 PASS"
   exit 0
 fi
 echo "context-gauge selftest: FAILURES"

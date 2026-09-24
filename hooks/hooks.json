@@ -1,5 +1,5 @@
 {
-  "description": "Clanker harness hooks \u2014 session tracking, alerts, briefings, skill monitoring, prompt analysis, subagent usage-limit auto-resume. PARTIAL INSTALL: this plugin manifest carries NO governance chain (no Stop dispatcher, no PreToolUse bash-dispatch, no memory-lint) \u2014 the full gated install is `clanker sync` from the repo.",
+  "description": "Clanker harness hooks \u2014 session tracking, cold-start brief, skill monitoring, context gauge. PARTIAL INSTALL: this plugin manifest carries NO governance gates (no Bash dispatcher, no iron-law Stop check) \u2014 the full gated install is `clanker sync` from the repo.",
   "hooks": {
     "SessionStart": [
       {
@@ -9,22 +9,6 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh",
             "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/agent-resume-surface.sh",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "SubagentStop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/subagent-resume-detect.py",
-            "timeout": 10
           }
         ]
       }
@@ -58,18 +42,6 @@
           {
             "type": "command",
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/context-gauge.py",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/prompt-check.sh",
             "timeout": 5
           }
         ]

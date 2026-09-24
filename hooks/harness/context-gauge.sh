@@ -36,8 +36,13 @@ tp=""; agent=""
 case "$INPUT" in
   *'"transcript_path":"'*) tp=${INPUT#*\"transcript_path\":\"}; tp=${tp%%\"*} ;;
 esac
+# agent_id must be the TOP-LEVEL field (2026-09-24). The old bare substring
+# match also caught NESTED ones (an Agent tool_response naming the spawned
+# teammate), minting a fresh key per spawn: the parent re-received its "first
+# reading" on every Agent call (19 repeats in one coordinator session). jq runs
+# only when the substring is present, so the common path stays spawn-free.
 case "$INPUT" in
-  *'"agent_id":"'*) agent=${INPUT#*\"agent_id\":\"}; agent=${agent%%\"*} ;;
+  *'"agent_id"'*) agent=$(printf '%s' "$INPUT" | jq -r 'if type == "object" then (.agent_id // empty | tostring) else empty end' 2>/dev/null) || agent="" ;;
 esac
 
 # Subagent payloads: resolution/grounding logic lives in python — always run it

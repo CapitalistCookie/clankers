@@ -3,7 +3,7 @@
 """GPU guard hook — health-checks the shared GPU before kicking off remote work.
 
 Post-containerization reality (see memory/gpu-usage.md):
-- GPU is on CT 200 (host from research.env GPU_HOST), shared with Frigate via MPS.
+- GPU is on CT 200 (host from GPU_HOST in ~/.claude/harness.env), shared with Frigate via MPS.
 - This CT (112) has no direct GPU access — training runs remotely via
   the `gpu-train` wrapper which SSHes to CT 200.
 - MPS enforces per-client share via CUDA_MPS_ACTIVE_THREAD_PERCENTAGE;
@@ -18,20 +18,14 @@ import re
 import subprocess
 import sys
 
-# ── Load config from research.env ──────────────────────────
-_ENV_PATH = os.path.expanduser("~/.claude/research.env")
-_config = {}
-if os.path.exists(_ENV_PATH):
-    with open(_ENV_PATH) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                _config[k.strip()] = v.strip()
-
-GPU_HOST = _config.get("GPU_HOST", "")  # de-personalized: no baked-in LAN IP
-GPU_USER = _config.get("GPU_USER", "root")
-GPU_SSH_KEY = _config.get("GPU_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
+# ── Config from the environment ────────────────────────────
+# GPU_HOST / GPU_USER come from ~/.claude/harness.env, which the Bash dispatcher
+# sources and exports to this child. research.env is deliberately NOT read
+# (2026-09-24): it also carries third-party API keys that must not enter the
+# gate process. GPU_SSH_KEY defaults to the key research.env used to name.
+GPU_HOST = os.environ.get("GPU_HOST", "")  # de-personalized: no baked-in LAN IP
+GPU_USER = os.environ.get("GPU_USER", "root")
+GPU_SSH_KEY = os.environ.get("GPU_SSH_KEY", os.path.expanduser("~/.ssh/id_ed25519"))
 
 SSH_BASE = [
     "ssh", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=10",
@@ -105,7 +99,7 @@ def main() -> None:
         return
 
     # Activate only on commands that target the GPU host. When GPU_HOST is unset
-    # (generic copy, no research.env), the host-match is skipped so the guard is
+    # (generic copy, no harness.env), the host-match is skipped so the guard is
     # inert except for the `gpu-train` wrapper path — never fires on every command.
     if (not GPU_HOST or GPU_HOST not in cmd) and "gpu-train" not in cmd:
         return

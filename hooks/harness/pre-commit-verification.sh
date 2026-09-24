@@ -3,15 +3,16 @@
 # PreToolUse hook: for RESEARCH commits, remind Claude to invoke
 # superpowers:verification-before-completion + disclose deviations.
 #
-# v2 (2026-04-21 session 18 P3 fix): scope check — skip entirely when all
-# staged files are bot-infrastructure or ops docs. Previously the hook
-# fired on every polymarket commit because its remote is
-# github.com/<org>/eigenstateresearch, producing walk-forward/
-# frozen-memory prompts that don't apply to trading-bot code.
+# Scope (v3, 2026-09-24 hooks rewire): the clanker registry decides. Repos
+# registered archetype=research get the prompt; registered non-research repos
+# AND unregistered dirs exit early. The per-repo carve-outs of v2 (the
+# cottondashboard / hftbacktester path checks and the polymarket bot/ops
+# staged-file filter) were deleted: the first two repos are unregistered, so
+# the early exit covers them, and polymarket had no commits in 60 days.
 #
-# Also adds cd-prefix target parsing (same approach as v2.2+ of
-# pwb-risk-surface-review-required.sh) so `cd /repo && git commit` is
-# evaluated against /repo's index rather than the session CWD's index.
+# cd-prefix target parsing (same approach as v2.2+ of
+# pwb-risk-surface-review-required.sh): `cd /repo && git commit` is
+# evaluated against /repo rather than the session CWD.
 
 cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null || true)
 [ -z "$cmd" ] && exit 0
@@ -32,12 +33,11 @@ if [ -n "$cd_target" ] && [ -d "$cd_target" ]; then
     cd "$cd_target" 2>/dev/null || exit 0  # fail-open; this is advisory
 fi
 
-# Registry-archetype scope (2026-07-05, replaces per-repo whack-a-mole): research
+# Registry-archetype scope (2026-07-05, tightened 2026-09-24): research
 # discipline applies ONLY to repos registered archetype=research in
-# ~/projects/.clanker.yaml. The 4th documented false-fire class (a `docs:` commit
-# in clanker) triggered this: the message-prefix filter below never matched
-# because msg extraction didn't isolate the -m text. Registered non-research →
-# exit 0 here; UNREGISTERED repos fall through to the legacy heuristics.
+# ~/projects/.clanker.yaml. Registered non-research repos AND unregistered dirs
+# (the lookup prints nothing) exit 0 here. Unregistered dirs used to fall
+# through to per-repo legacy heuristics.
 arch=$(python3 - "$(pwd)" <<'PY' 2>/dev/null
 import os, subprocess, sys, yaml
 try:
@@ -61,60 +61,12 @@ except Exception:
     pass
 PY
 )
-if [ -n "$arch" ] && [ "$arch" != "research" ]; then
-    exit 0
-fi
+[ "$arch" = "research" ] || exit 0
 
 # Extract the actual -m message so the prefix/keyword filters below see the
 # MESSAGE, not "git commit -q -m ..." (the extraction bug behind false-fire #4).
 m_arg=$(printf '%s' "$cmd" | sed -nE 's/.*-m[[:space:]]+"([^"]+)".*/\1/p' | head -1)
 [ -z "$m_arg" ] && m_arg=$(printf '%s' "$cmd" | sed -nE "s/.*-m[[:space:]]+'([^']+)'.*/\1/p" | head -1)
-
-# Cotton-dashboard scope check (added 2026-04-27): cottondashboard
-# commits frequently include "research", "walk-forward", "validation"
-# tokens because the repo vendors research.ecc.* and runs walk-forward
-# crons — but those tokens describe PRODUCT plumbing, not research
-# findings. The frozen-memory + leakage prompts don't apply.
-#
-# Detect via current working directory OR cd-prefix target.
-pwd_now=$(pwd)
-if echo "$pwd_now" | grep -qE '/projects/cottondashboard(/|$)' || \
-   echo "$cd_target" | grep -qE '/projects/cottondashboard(/|$)' || \
-   ([ -d ".git" ] && git remote get-url origin 2>/dev/null | grep -qE '/cottondashboard\.git$'); then
-    exit 0
-fi
-
-# hftbacktester scope check (added 2026-04-27 session-4 v0.1.1 prep): the
-# pmframework backtest-framework repo's commits routinely contain "backtest"
-# / "validation" / "research" tokens because it BUILDS a backtest framework
-# (the verb is "build", not "research"). Frozen-memory + leakage prompts
-# don't apply to software-engineering commits in this repo. Skip when the
-# session is under /projects/hftbacktester{,-worktrees}/ OR remote is
-# <org>/hftbacktester.git.
-if echo "$pwd_now" | grep -qE '/projects/hftbacktester(-worktrees)?(/|$)' || \
-   echo "$cd_target" | grep -qE '/projects/hftbacktester(-worktrees)?(/|$)' || \
-   ([ -d ".git" ] && git remote get-url origin 2>/dev/null | grep -qE '/hftbacktester\.git$'); then
-    exit 0
-fi
-
-# Scope check: is this a bot/ops commit (not research)?
-# Paths that mean NOT research:
-#   polymarket_{scalper,weather_bot,core,ops}/
-#   docs/OPS_RUNBOOK.md  docs/SESSION*_HANDOFF*.md
-#   docs/plans/  docs/reviews/
-#   .githooks/  .github/
-#   clanker_hooks/  clanker_plugins/
-# Anything outside this set (e.g., research/) triggers the research check.
-staged=$(git diff --cached --name-only 2>/dev/null)
-if [ -n "$staged" ]; then
-    bot_or_ops_re='^(polymarket_[a-z_]+/|docs/(OPS_RUNBOOK|SESSION[0-9]+_HANDOFF|plans/|reviews/)|\.githooks/|\.github/|clanker_hooks/|clanker_plugins/)'
-    non_bot=$(echo "$staged" | grep -vE "$bot_or_ops_re" || true)
-    if [ -z "$non_bot" ]; then
-        # All staged files are bot-infrastructure or ops docs. Not a
-        # research commit — skip the research-specific verification prompts.
-        exit 0
-    fi
-fi
 
 # Extract the commit-message portion only. Prefer the parsed -m argument;
 # fall back to stripping the cd/path prefix so "/polymarket_research" paths

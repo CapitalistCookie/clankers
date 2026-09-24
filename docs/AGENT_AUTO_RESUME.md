@@ -1,5 +1,10 @@
 # Subagent auto-resume
 
+> **Removed on 2026-09-24.** The two hooks in this document are no longer in this repo or
+> in `~/.claude/settings.json`. The detector read `transcript_path`, which is the transcript
+> of the parent session. Thus it did not queue a killed subagent. The queue file is empty
+> since 2026-07-22. Git history keeps both hooks. The text below records the old design.
+
 Turns a usage/rate-limit kill of a subagent from a **silent loss of parallel work**
 into an automatic, staged, context-aware retry. Registered globally (all projects)
 in `~/.claude/settings.json`.

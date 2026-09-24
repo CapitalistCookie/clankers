@@ -130,6 +130,25 @@ def _key_for(agent_id, tp):
     return "tp-" + (base[:-6] if base.endswith(".jsonl") else base)
 
 
+def _claim_once(path):
+    """Atomically create `path`. True ONLY for the one caller that created it.
+
+    RACE FIX (2026-09-24): the old exists()-then-write() pair let several
+    PostToolUse hooks from one batch of parallel tool calls all see "no marker"
+    and all emit. O_CREAT|O_EXCL is atomic on the local fs, so exactly one wins.
+    Any error (marker exists, /tmp unwritable) -> False: a missed grounding line
+    is harmless, a repeated one reads to the model like a fresh instruction."""
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except OSError:
+        return False
+    try:
+        os.write(fd, b"1")
+    finally:
+        os.close(fd)
+    return True
+
+
 def _write_cache(key, tp, limit, pct):
     """Fast-path cache consumed by context-gauge.sh: 'size window pct' + resolved
     transcript path on line 2. Only written after a SUCCESSFUL fresh measurement —
@@ -201,11 +220,7 @@ def main() -> None:
         else:
             # Can't locate own transcript → FAIL SAFE: never push a subagent to wrap up on the parent's %.
             marker = f"/tmp/cc-ctxgauge-sub-{agent_key}"
-            if not os.path.exists(marker):
-                try:
-                    open(marker, "w").write("1")
-                except Exception:
-                    pass
+            if _claim_once(marker):
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": (
                     "CONTEXT GAUGE: you are a SUBAGENT with your OWN fresh ~1M-token window, independent of the "
                     "parent. Your true usage isn't measurable here, so IGNORE any parent-derived % — do NOT scope "
@@ -236,23 +251,19 @@ def main() -> None:
     # a5a520aa peaked at 53k/1M = 94.7% FREE yet handed off claiming "~5% remaining" and skipped the
     # compute. Fix: emit ONE explicit grounding line on the first tool call of each transcript (every
     # subagent has its own transcript_path → grounds exactly once), forbidding guessing/early-abort.
-    key = os.environ.get("CCG_KEY") or _key_for(agent_id, tp)
+    # Key from the PARSED top-level agent_id / transcript_path (2026-09-24). The
+    # wrapper's CCG_KEY is ignored: its old substring match picked up NESTED
+    # agent_id values (an Agent tool_response naming the spawned teammate), so
+    # every Agent spawn minted a fresh key and the parent session re-received
+    # its "first reading" once per spawned agent.
+    key = _key_for(agent_id, tp)
     grounded_marker = f"/tmp/cc-ctxgauge-grounded-{key}"
-    if not os.path.exists(grounded_marker):
-        try:
-            with open(grounded_marker, "w") as f:
-                f.write("1")
-        except Exception:
-            pass
+    if _claim_once(grounded_marker):
         gnote = (
-            f"CONTEXT GAUGE (first reading — MEASURED from your OWN transcript; window {limit // 1000}k): "
-            f"you have ~{remaining_pct:.0f}% of the context window FREE ({used_k:.0f}k used). Do NOT estimate "
-            f"or guess your remaining context, and do NOT abort, hand off, or skip the compute on an imagined "
-            f"low budget — proceed with the FULL task. This gauge re-speaks only if you genuinely approach the "
-            f"limit (<32% remaining). If you are a subagent, this is YOUR OWN fresh window, independent of the parent."
+            f"CONTEXT GAUGE (first reading, window {limit // 1000}k): ~{remaining_pct:.0f}% free "
+            f"({used_k:.0f}k used), measured from your own transcript. Use it; never guess your budget or stop early."
         )
-        if remaining_pct < 30:
-            gnote += " (You are genuinely below 30% — do the most valuable bounded increment, then wrap up.)"
+        gnote += " Below 30%: finish one bounded step, then wrap up." if remaining_pct < 30 else " Re-speaks below 32%."
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": gnote}}))
         _write_cache(key, tp, limit, remaining_pct)
         return
