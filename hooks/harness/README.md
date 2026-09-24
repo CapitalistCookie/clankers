@@ -31,7 +31,7 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | PostToolUse | `Bash` | `Bash(git commit *)` | `closure-claim-verifier.sh` | 10 | Warns when a commit claims a closure but shows no integration-test evidence. |
 | PostToolUse | `Skill` | none | `clanker-dist/skill-tracker.sh` | 5 | Records which skills run (telemetry only). |
 | PostToolUse | `Edit\|Write` | none | `governance-gates-autorun.sh` | 150 | Runs the gates of a research spec directory after an edit to one of its registry files. |
-| PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. |
+| PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. In a nested run (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`), it stops at once, unless `CLANKER_INJECT_NESTED=1`. |
 | Stop | none | none | `iron-law-check.sh` (`asyncRewake`) | 30 | Blocks a success claim that has no evidence token in the recent tool output. |
 | SessionEnd | none | none | `clanker-dist/session-end.sh` | 20 | Records the session metrics for clanker. |
 
@@ -112,6 +112,27 @@ About the payload:
 - Read the fields of the payload with `jq`. A text match on the raw payload can find the same key inside `tool_input` or `tool_response`. On 2026-09-24, this error caused the context gauge to repeat its first reading after each Agent call.
 - Claude Code reloads the hook configuration when a settings file changes. The next tool call uses the new configuration. A headless test on 2026-09-24 showed this behavior.
 
+## Hook errors
+
+A hook must not stop the session when one of its steps fails. Thus the hook continues, but it also records the failure.
+
+Each hook that clanker syncs has the same hook-error block, in Bash or in Python. When a step fails, the block adds one JSON line to `$CLANKER_DATA/raw/health/hook-errors-<UTC day>.jsonl`. The default value of `CLANKER_DATA` is `/data/clanker`.
+
+| Field | Value |
+|---|---|
+| `ts` | The UTC time of the failure. |
+| `hook` | The file name of the hook. |
+| `session_id` | The session ID from the payload. It is empty when the hook has no payload. |
+| `cwd` | The `cwd` from the payload, or else the working directory of the hook. |
+| `rc` | The exit code of the step that failed. A Python exception gives 1. |
+| `stderr_tail` | The name of the step, then the end of its error text. The maximum length is 300 characters. |
+
+The block does not write to stdout. It does not change the exit code of the hook. `clanker doctor --harness` counts the lines.
+
+A gate decision is not an error. For example, a deny or a governance FAIL is a result, and the block does not record it.
+
+When you change a hook, keep its block the same as the block in the other hooks. The test `tests/test_hook_errors.py` in the clanker repo compares the blocks.
+
 ## Change a hook
 
 1. If the rule applies to one project only, write a project hook.
@@ -128,4 +149,5 @@ About the payload:
 1. After a change to the dispatcher or to one of its gates, run `bash ~/.claude/hooks/tests/test_pretooluse_dispatch.sh`. Each row must show PASS.
 2. After a change to the context gauge, run `bash ~/.claude/hooks/context-gauge.sh --selftest`.
 3. After a change to the iron-law hook, run `bash ~/.claude/hooks/iron-law-check.sh --selftest`.
-4. Before you use a new `if` rule, test it in a headless session. Use `claude -p --setting-sources project` in a scratch project that has only that hook.
+4. After a change to a hook or to its hook-error block, run `python3 -m pytest tests/test_hook_errors.py` in the clanker repo.
+5. Before you use a new `if` rule, test it in a headless session. Use `claude -p --setting-sources project` in a scratch project that has only that hook.
