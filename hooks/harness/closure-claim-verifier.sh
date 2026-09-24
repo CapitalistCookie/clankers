@@ -24,13 +24,60 @@
 # pattern (D54/D55/D56/D51 marked closed via narrow patches; P1+P2+P3
 # shipped with only unit tests). See:
 #   ~/.claude/projects/<namespace>/memory/feedback_no_closure_claim_without_integration_test.md
+#
+# Fail-visible (2026-09-24): a failed parse or cd, and any command that aborts
+# the hook under set -e (the ERR trap), land in the hook-error log (block below).
 set -euo pipefail
 
+# ---- hook-error log: the same block in every clanker bash hook ------------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# ${CLANKER_DATA:-/data/clanker}/raw/health/hook-errors-<UTC day>.jsonl, where
+# `clanker doctor --harness` counts it. hook_err never blocks, never writes to
+# stdout and never changes the hook's exit code, under set -e and set -u too.
+# Usage: hook_err <rc> <step> [<error text>]. stderr_tail is "<step>: " plus the
+# end of the text, 300 characters at most. Put the raw hook payload in
+# HOOK_ERR_IN so that the row names the session and its cwd.
+HOOK_ERR_IN=""
+hook_err_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+}
+hook_err() {
+    (
+        set +eu
+        rc="$1" step="${2:-?}" text="$3" sid="" re=""
+        [[ $rc =~ ^-?[0-9]+$ ]] || rc=1
+        room=$(( 298 - ${#step} ))
+        if (( room <= 0 )); then text=""
+        elif (( ${#text} > room )); then text="${text:${#text}-room}"; fi
+        msg="$step${text:+: $text}"
+        re='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]*)"'
+        [[ $HOOK_ERR_IN =~ $re ]] && sid="${BASH_REMATCH[1]}"
+        re='"cwd"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+        if [[ $HOOK_ERR_IN =~ $re ]]; then cwd="\"${BASH_REMATCH[1]}\""
+        else cwd=$(hook_err_str "$PWD"); fi
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        d="${CLANKER_DATA:-/data/clanker}/raw/health"
+        mkdir -p "$d" && printf '{"ts":"%s","hook":%s,"session_id":"%s","cwd":%s,"rc":%s,"stderr_tail":%s}\n' \
+            "$ts" "$(hook_err_str "${0##*/}")" "$sid" "$cwd" "$rc" "$(hook_err_str "${msg:0:300}")" \
+            >> "$d/hook-errors-${ts%%T*}.jsonl"
+        exit 0
+    ) </dev/null >/dev/null 2>&1
+    return 0
+}
+# ---- end of hook-error log --------------------------------------------------------
+trap 'hook_err $? "line $LINENO" "$BASH_COMMAND"' ERR
+
 input=$(cat)
+HOOK_ERR_IN="$input"
 
 # Extract Bash command. Skip non-Bash invocations (matcher already
 # filters but defense-in-depth).
-cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null || echo "")
+cmd=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null) \
+    || { hook_err $? "jq: parse the hook input"; exit 0; }
 [ -z "$cmd" ] && exit 0
 
 # Skip non-git-commit invocations. The settings.json `if` filter
@@ -41,7 +88,7 @@ fi
 
 # Locate repo root. CLAUDE_PROJECT_DIR if set; otherwise PWD.
 repo_dir="${CLAUDE_PROJECT_DIR:-$PWD}"
-cd "$repo_dir" 2>/dev/null || exit 0
+cd "$repo_dir" 2>/dev/null || { hook_err 1 "cd $repo_dir"; exit 0; }
 
 # git log/diff are no-ops if we're not in a git repo or the commit
 # already failed (HEAD unchanged) — exit cleanly without false alarms.

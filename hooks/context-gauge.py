@@ -20,8 +20,55 @@ Output: a hookSpecificOutput.additionalContext line — THROTTLED so it's quiet 
 plentiful and vocal as it approaches the 30% line (the common `/goal "...<30% context"` threshold).
 
 Pure stdlib; never throws out (a gauge must never block a tool). Tail-read keeps it O(1) on big
-transcripts.
+transcripts. An internal failure is swallowed for the session and logged to the hook-error log.
 """
+# ---- hook-error log: the same block in every clanker python hook ----------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# $CLANKER_DATA/raw/health/hook-errors-<UTC day>.jsonl (default /data/clanker),
+# where `clanker doctor --harness` counts it. hook_err never raises, never
+# blocks and never writes to stdout. Usage: hook_err(rc, step, error text or
+# exception); stderr_tail is "<step>: " plus the end of the text (of the
+# traceback, for an exception), 300 characters at most. Set
+# HOOK_ERR["session_id"] and HOOK_ERR["cwd"] once the payload is parsed.
+import os as _he_os
+import sys as _he_sys
+
+HOOK_ERR = {"hook": (_he_os.path.basename(_he_sys.argv[0]) if _he_sys.argv
+                     and _he_sys.argv[0] not in ("", "-", "-c") else "?"),
+            "session_id": "", "cwd": ""}
+
+
+def hook_err(rc, step, err=""):
+    try:
+        import json
+        import time
+        import traceback
+        if isinstance(err, BaseException):
+            err = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+        step, err = str(step), str(err or "").strip()
+        room = 298 - len(step)
+        msg = (step + ": " + err[-room:]) if err and room > 0 else step
+        try:
+            cwd = HOOK_ERR.get("cwd") or _he_os.getcwd()
+        except OSError:
+            cwd = ""
+        rc = int(rc) if str(rc).lstrip("-").isdigit() else 1
+        now = time.gmtime()
+        d = _he_os.path.join(_he_os.environ.get("CLANKER_DATA") or "/data/clanker",
+                             "raw", "health")
+        _he_os.makedirs(d, exist_ok=True)
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", now),
+               "hook": str(HOOK_ERR.get("hook") or "?"),
+               "session_id": str(HOOK_ERR.get("session_id") or ""), "cwd": str(cwd),
+               "rc": rc, "stderr_tail": msg[:300]}
+        path = _he_os.path.join(d, "hook-errors-" + time.strftime("%Y-%m-%d", now) + ".jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+# ---- end of hook-error log --------------------------------------------------------
+
 import json
 import os
 import sys
@@ -72,7 +119,10 @@ def configured_window() -> int:
                 # Only an explicit 1M signal floors the window — a bare model id
                 # resolving to the 200k default must not masquerade as evidence.
                 _configured_window = w if w > WINDOWS["default"] else 0
-        except Exception:
+        except FileNotFoundError:
+            _configured_window = 0
+        except Exception as e:
+            hook_err(1, "read the configured model from settings.json", e)
             _configured_window = 0
     return _configured_window
 
@@ -157,8 +207,8 @@ def _write_cache(key, tp, limit, pct):
         size = os.path.getsize(tp)
         with open(f"/tmp/cc-ctxgauge-fast-{key}", "w") as f:
             f.write(f"{size} {limit} {int(pct)}\n{tp}\n")
-    except Exception:
-        pass
+    except Exception as e:
+        hook_err(1, "write the fast-path cache", e)
 
 
 def main() -> None:
@@ -170,8 +220,13 @@ def main() -> None:
             pass
     try:
         data = json.load(sys.stdin)
-    except Exception:
+    except Exception as e:
+        hook_err(1, "parse hook input", e)
         return
+    if not isinstance(data, dict):
+        hook_err(1, "parse hook input", "payload is not a JSON object")
+        return
+    HOOK_ERR.update(session_id=str(data.get("session_id") or ""), cwd=str(data.get("cwd") or ""))
     tp = data.get("transcript_path")
     # ── SUBAGENT FIX (2026-06-22): the harness hands a subagent the PARENT's transcript_path AND the
     # parent's session_id, so reading transcript_path reports the PARENT's context % to the subagent.
@@ -215,8 +270,8 @@ def main() -> None:
             try:
                 with open(tp_cache, "w") as f:
                     f.write(tp)
-            except Exception:
-                pass
+            except Exception as e:
+                hook_err(1, "write the subagent transcript cache", e)
         else:
             # Can't locate own transcript → FAIL SAFE: never push a subagent to wrap up on the parent's %.
             marker = f"/tmp/cc-ctxgauge-sub-{agent_key}"
@@ -282,8 +337,8 @@ def main() -> None:
     try:
         with open(state, "w") as f:
             f.write(str(bucket))
-    except Exception:
-        pass
+    except Exception as e:
+        hook_err(1, "write the throttle state", e)
     near = remaining_pct < 32
     if not (near or (remaining_pct <= 65 and bucket != prev)):
         _write_cache(key, tp, limit, remaining_pct)
@@ -307,6 +362,7 @@ def main() -> None:
 
 try:
     main()
-except Exception:
-    # A gauge must NEVER break a tool call — swallow internal errors (fail-open).
-    pass
+except Exception as e:
+    # A gauge must NEVER break a tool call — swallow internal errors (fail-open),
+    # but log them.
+    hook_err(1, "main", e)

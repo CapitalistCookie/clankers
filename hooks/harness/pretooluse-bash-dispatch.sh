@@ -43,7 +43,52 @@
 #     "Claude receives all of the values" — preserved, just in one envelope).
 #   * Advisory stderr from an exit-0 gate passes through to dispatcher stderr
 #     (transcript-visible), as before.
+#   * Fail-visible (2026-09-24): a gate that errors (rc not 0/2), hits its
+#     budget or prints unparseable stdout, and a failed harness.env source or
+#     jq emit, append a row to the hook-error log (block below). Gate
+#     decisions are unchanged.
 set -uo pipefail
+
+# ---- hook-error log: the same block in every clanker bash hook ------------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# ${CLANKER_DATA:-/data/clanker}/raw/health/hook-errors-<UTC day>.jsonl, where
+# `clanker doctor --harness` counts it. hook_err never blocks, never writes to
+# stdout and never changes the hook's exit code, under set -e and set -u too.
+# Usage: hook_err <rc> <step> [<error text>]. stderr_tail is "<step>: " plus the
+# end of the text, 300 characters at most. Put the raw hook payload in
+# HOOK_ERR_IN so that the row names the session and its cwd.
+HOOK_ERR_IN=""
+hook_err_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+}
+hook_err() {
+    (
+        set +eu
+        rc="$1" step="${2:-?}" text="$3" sid="" re=""
+        [[ $rc =~ ^-?[0-9]+$ ]] || rc=1
+        room=$(( 298 - ${#step} ))
+        if (( room <= 0 )); then text=""
+        elif (( ${#text} > room )); then text="${text:${#text}-room}"; fi
+        msg="$step${text:+: $text}"
+        re='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]*)"'
+        [[ $HOOK_ERR_IN =~ $re ]] && sid="${BASH_REMATCH[1]}"
+        re='"cwd"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+        if [[ $HOOK_ERR_IN =~ $re ]]; then cwd="\"${BASH_REMATCH[1]}\""
+        else cwd=$(hook_err_str "$PWD"); fi
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        d="${CLANKER_DATA:-/data/clanker}/raw/health"
+        mkdir -p "$d" && printf '{"ts":"%s","hook":%s,"session_id":"%s","cwd":%s,"rc":%s,"stderr_tail":%s}\n' \
+            "$ts" "$(hook_err_str "${0##*/}")" "$sid" "$cwd" "$rc" "$(hook_err_str "${msg:0:300}")" \
+            >> "$d/hook-errors-${ts%%T*}.jsonl"
+        exit 0
+    ) </dev/null >/dev/null 2>&1
+    return 0
+}
+# ---- end of hook-error log --------------------------------------------------------
 
 H="$HOME/.claude/hooks"
 
@@ -56,9 +101,12 @@ H="$HOME/.claude/hooks"
 # unconditionally broke the git-target parity case ever since harness.env
 # introduced an operator CHECK_GIT_TARGET_REPOS — latent since 07-17).
 HF="${CLANKER_HARNESS_ENV:-$HOME/.claude/harness.env}"
-[ -f "$HF" ] && . "$HF" 2>/dev/null || true
+if [ -f "$HF" ]; then
+    . "$HF" 2>/dev/null || hook_err $? "source $HF"
+fi
 
 INPUT=$(cat 2>/dev/null || true)
+HOOK_ERR_IN="$INPUT"
 
 # ── stdin parse (fail-closed on malformed payload) ─────────────────────────────
 if ! CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null); then
@@ -67,20 +115,20 @@ if ! CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/nu
 fi
 [[ -z "$CMD" ]] && exit 0
 
-ERRF=$(mktemp "${TMPDIR:-/tmp}/ptbd-err.XXXXXX") || ERRF=/dev/null
-trap 'rm -f "$ERRF" 2>/dev/null' EXIT
+ERRF=$(mktemp "${TMPDIR:-/tmp}/ptbd-err.XXXXXX") || { hook_err $? "mktemp (gate stderr is lost)"; ERRF=/dev/null; }
+trap '[ "$ERRF" = /dev/null ] || rm -f "$ERRF" 2>/dev/null' EXIT
 
 declare -a CTX=()
 declare -a SYS=()
 
 # ── route a gate's exit-0 stdout ────────────────────────────────────────────────
 classify_and_route() {
-    local label="$1" out="$2" kind
+    local label="$1" out="$2" kind jrc=0
     kind=$(printf '%s' "$out" | jq -r '
         if ((.hookSpecificOutput.permissionDecision // "") == "deny")
            or ((.hookSpecificOutput.permissionDecision // "") == "ask") then "deny"
         elif ((.decision // "") == "block") then "legacyblock"
-        else "soft" end' 2>/dev/null) || kind="invalid"
+        else "soft" end' 2>/dev/null) || { jrc=$?; kind="invalid"; }
     case "$kind" in
         deny)
             # Forward verbatim; if earlier advisories accumulated, carry them along.
@@ -90,7 +138,8 @@ classify_and_route() {
                 printf '%s' "$out" | jq -c --arg extra "${merged%$'\n\n'}" \
                     '.hookSpecificOutput.additionalContext =
                        ([$extra, (.hookSpecificOutput.additionalContext // "")]
-                        | map(select(. != "")) | join("\n\n"))'
+                        | map(select(. != "")) | join("\n\n"))' \
+                    || hook_err $? "gate $label: merge the deny with earlier advice (jq)"
             else
                 printf '%s\n' "$out"
             fi
@@ -100,7 +149,8 @@ classify_and_route() {
             local reason
             reason=$(printf '%s' "$out" | jq -r '.reason // "blocked"' 2>/dev/null) || reason="blocked"
             jq -cn --arg r "$reason" \
-                '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
+                '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}' \
+                || hook_err $? "gate $label: translate a legacy block (jq)"
             exit 0
             ;;
         soft)
@@ -112,6 +162,7 @@ classify_and_route() {
             ;;
         *)
             printf 'pretooluse-bash-dispatch: %s emitted unparseable stdout (ignored): %.200s\n' "$label" "$out" >&2
+            hook_err "$jrc" "gate $label: unparseable stdout ignored" "${out:0:200}"
             ;;
     esac
 }
@@ -131,12 +182,14 @@ run_gate() {
     fi
     if (( rc == 124 || rc == 137 )); then
         printf 'pretooluse-bash-dispatch: %s exceeded its %ss budget — skipped (fail-open)\n' "$label" "$budget" >&2
+        hook_err "$rc" "gate $label: exceeded its ${budget}s budget, skipped (fail-open)" "$err"
         return 0
     fi
     # Non-blocking error (rc not 0/2): fail-open, surface stderr like the old
-    # per-hook transcript notice.
+    # per-hook transcript notice, and log it.
     if (( rc != 0 )); then
         [[ -n "$err" ]] && printf '%s\n' "$err" >&2
+        hook_err "$rc" "gate $label: error, skipped (fail-open)" "$err"
         return 0
     fi
     # rc==0: advisory stderr passes through; stdout (if any) gets routed.
@@ -184,6 +237,7 @@ if (( ${#CTX[@]} > 0 || ${#SYS[@]} > 0 )); then
     jq -cn --arg ctx "${ctx_merged%$'\n\n'}" --arg sys "${sys_merged%$'\n'}" '
         {}
         | (if $sys != "" then .systemMessage = $sys else . end)
-        | (if $ctx != "" then .hookSpecificOutput = {hookEventName:"PreToolUse", additionalContext:$ctx} else . end)'
+        | (if $ctx != "" then .hookSpecificOutput = {hookEventName:"PreToolUse", additionalContext:$ctx} else . end)' \
+        || hook_err $? "emit the merged advice (jq)"
 fi
 exit 0

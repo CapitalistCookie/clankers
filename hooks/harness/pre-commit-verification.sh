@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # distribution source: synced to ~/.claude/hooks by clanker sync (do not edit the installed copy)
 # PreToolUse hook: for RESEARCH commits, remind Claude to invoke
 # superpowers:verification-before-completion + disclose deviations.
@@ -13,8 +13,57 @@
 # cd-prefix target parsing (same approach as v2.2+ of
 # pwb-risk-surface-review-required.sh): `cd /repo && git commit` is
 # evaluated against /repo rather than the session CWD.
+#
+# Fail-visible (2026-09-24): a failed parse or registry lookup (a missing yaml
+# module, an unreadable registry) lands in the hook-error log (block below)
+# instead of silently turning the research prompt off. Bash is required: the
+# dispatcher runs this file with bash.
 
-cmd=$(jq -r '.tool_input.command // empty' 2>/dev/null || true)
+# ---- hook-error log: the same block in every clanker bash hook ------------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# ${CLANKER_DATA:-/data/clanker}/raw/health/hook-errors-<UTC day>.jsonl, where
+# `clanker doctor --harness` counts it. hook_err never blocks, never writes to
+# stdout and never changes the hook's exit code, under set -e and set -u too.
+# Usage: hook_err <rc> <step> [<error text>]. stderr_tail is "<step>: " plus the
+# end of the text, 300 characters at most. Put the raw hook payload in
+# HOOK_ERR_IN so that the row names the session and its cwd.
+HOOK_ERR_IN=""
+hook_err_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+}
+hook_err() {
+    (
+        set +eu
+        rc="$1" step="${2:-?}" text="$3" sid="" re=""
+        [[ $rc =~ ^-?[0-9]+$ ]] || rc=1
+        room=$(( 298 - ${#step} ))
+        if (( room <= 0 )); then text=""
+        elif (( ${#text} > room )); then text="${text:${#text}-room}"; fi
+        msg="$step${text:+: $text}"
+        re='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]*)"'
+        [[ $HOOK_ERR_IN =~ $re ]] && sid="${BASH_REMATCH[1]}"
+        re='"cwd"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+        if [[ $HOOK_ERR_IN =~ $re ]]; then cwd="\"${BASH_REMATCH[1]}\""
+        else cwd=$(hook_err_str "$PWD"); fi
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        d="${CLANKER_DATA:-/data/clanker}/raw/health"
+        mkdir -p "$d" && printf '{"ts":"%s","hook":%s,"session_id":"%s","cwd":%s,"rc":%s,"stderr_tail":%s}\n' \
+            "$ts" "$(hook_err_str "${0##*/}")" "$sid" "$cwd" "$rc" "$(hook_err_str "${msg:0:300}")" \
+            >> "$d/hook-errors-${ts%%T*}.jsonl"
+        exit 0
+    ) </dev/null >/dev/null 2>&1
+    return 0
+}
+# ---- end of hook-error log --------------------------------------------------------
+
+INPUT=$(cat)
+HOOK_ERR_IN="$INPUT"
+cmd=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null) \
+    || { hook_err $? "jq: parse the hook input"; exit 0; }
 [ -z "$cmd" ] && exit 0
 
 first_line=$(echo "$cmd" | head -1)
@@ -38,15 +87,19 @@ fi
 # ~/projects/.clanker.yaml. Registered non-research repos AND unregistered dirs
 # (the lookup prints nothing) exit 0 here. Unregistered dirs used to fall
 # through to per-repo legacy heuristics.
-arch=$(python3 - "$(pwd)" <<'PY' 2>/dev/null
-import os, subprocess, sys, yaml
+arch=$(python3 - "$(pwd)" <<'PY' 2>&1
+import os, subprocess, sys
 try:
+    import yaml
     d = sys.argv[1]
     r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
                        capture_output=True, text=True, timeout=3)
     in_repo = r.returncode == 0 and r.stdout.strip()
     root = os.path.realpath(r.stdout.strip()) if in_repo else os.path.realpath(d)
-    reg = yaml.safe_load(open(os.path.expanduser("~/projects/.clanker.yaml"))) or {}
+    reg_path = os.path.expanduser("~/projects/.clanker.yaml")
+    if not os.path.exists(reg_path):
+        sys.exit(0)                     # no registry: no research repos, not an error
+    reg = yaml.safe_load(open(reg_path)) or {}
     for name, v in (reg.get("projects") or {}).items():
         if not isinstance(v, dict):
             continue
@@ -57,10 +110,17 @@ try:
         # like ~ would otherwise swallow every registered project as first-match.
         if root == rp or root.startswith(rp + os.sep) or (in_repo and rp.startswith(root + os.sep)):
             print(v.get("archetype", "unknown")); break
-except Exception:
-    pass
+except Exception as e:
+    print(f"{type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(3)
 PY
 )
+arch_rc=$?
+if [ "$arch_rc" -ne 0 ]; then
+    hook_err "$arch_rc" "registry lookup (python)" "$arch"
+    exit 0
+fi
+arch=${arch##*$'\n'}                   # the last line: a warning may precede it
 [ "$arch" = "research" ] || exit 0
 
 # Extract the actual -m message so the prefix/keyword filters below see the

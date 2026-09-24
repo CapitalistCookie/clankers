@@ -34,15 +34,63 @@
 #   gates share. sync installs it in ~/.claude/hooks, the parent of this
 #   hook's clanker-dist directory. Without it, this hook's own transcript pass
 #   supplies the line.
+# - Fail-visible (2026-09-24): a guarded step that fails, and a python run that
+#   exits nonzero, append a row to the hook-error log (block below).
 set -uo pipefail
+
+# ---- hook-error log: the same block in every clanker bash hook ------------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# ${CLANKER_DATA:-/data/clanker}/raw/health/hook-errors-<UTC day>.jsonl, where
+# `clanker doctor --harness` counts it. hook_err never blocks, never writes to
+# stdout and never changes the hook's exit code, under set -e and set -u too.
+# Usage: hook_err <rc> <step> [<error text>]. stderr_tail is "<step>: " plus the
+# end of the text, 300 characters at most. Put the raw hook payload in
+# HOOK_ERR_IN so that the row names the session and its cwd.
+HOOK_ERR_IN=""
+hook_err_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+}
+hook_err() {
+    (
+        set +eu
+        rc="$1" step="${2:-?}" text="$3" sid="" re=""
+        [[ $rc =~ ^-?[0-9]+$ ]] || rc=1
+        room=$(( 298 - ${#step} ))
+        if (( room <= 0 )); then text=""
+        elif (( ${#text} > room )); then text="${text:${#text}-room}"; fi
+        msg="$step${text:+: $text}"
+        re='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]*)"'
+        [[ $HOOK_ERR_IN =~ $re ]] && sid="${BASH_REMATCH[1]}"
+        re='"cwd"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+        if [[ $HOOK_ERR_IN =~ $re ]]; then cwd="\"${BASH_REMATCH[1]}\""
+        else cwd=$(hook_err_str "$PWD"); fi
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        d="${CLANKER_DATA:-/data/clanker}/raw/health"
+        mkdir -p "$d" && printf '{"ts":"%s","hook":%s,"session_id":"%s","cwd":%s,"rc":%s,"stderr_tail":%s}\n' \
+            "$ts" "$(hook_err_str "${0##*/}")" "$sid" "$cwd" "$rc" "$(hook_err_str "${msg:0:300}")" \
+            >> "$d/hook-errors-${ts%%T*}.jsonl"
+        exit 0
+    ) </dev/null >/dev/null 2>&1
+    return 0
+}
+# ---- end of hook-error log --------------------------------------------------------
 
 CLANKER_DATA="${CLANKER_DATA:-/data/clanker}"
 SESSIONS_DIR="$CLANKER_DATA/raw/sessions"
-mkdir -p "$SESSIONS_DIR" 2>/dev/null || exit 0
 
 # Read hook input from stdin
 INPUT=$(cat)
-SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
+HOOK_ERR_IN="$INPUT"
+if ! mkdir_err=$(mkdir -p "$SESSIONS_DIR" 2>&1); then
+    hook_err 1 "mkdir $SESSIONS_DIR" "$mkdir_err"
+    exit 0
+fi
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null) \
+    || { hook_err $? "jq: parse the hook input"; SESSION_ID=""; }
 TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || true)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)
 # SessionEnd's own reason (clear/logout/prompt_input_exit/other) — recorded as
@@ -78,7 +126,55 @@ LAST_MSG_HELPER="$HOOK_DIR/../last-assistant-msg.py"
 export TRANSCRIPT SESSION_ID CWD END_REASON LAST_MSG_HELPER
 
 # -I: isolated (no user site, no PYTHON* env); the block imports standard modules only.
-python3 -I -u << 'PYEOF' | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null
+metrics() {
+python3 -I -u << 'PYEOF'
+# ---- hook-error log: the same block in every clanker python hook ----------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# $CLANKER_DATA/raw/health/hook-errors-<UTC day>.jsonl (default /data/clanker),
+# where `clanker doctor --harness` counts it. hook_err never raises, never
+# blocks and never writes to stdout. Usage: hook_err(rc, step, error text or
+# exception); stderr_tail is "<step>: " plus the end of the text (of the
+# traceback, for an exception), 300 characters at most. Set
+# HOOK_ERR["session_id"] and HOOK_ERR["cwd"] once the payload is parsed.
+import os as _he_os
+import sys as _he_sys
+
+HOOK_ERR = {"hook": (_he_os.path.basename(_he_sys.argv[0]) if _he_sys.argv
+                     and _he_sys.argv[0] not in ("", "-", "-c") else "?"),
+            "session_id": "", "cwd": ""}
+
+
+def hook_err(rc, step, err=""):
+    try:
+        import json
+        import time
+        import traceback
+        if isinstance(err, BaseException):
+            err = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+        step, err = str(step), str(err or "").strip()
+        room = 298 - len(step)
+        msg = (step + ": " + err[-room:]) if err and room > 0 else step
+        try:
+            cwd = HOOK_ERR.get("cwd") or _he_os.getcwd()
+        except OSError:
+            cwd = ""
+        rc = int(rc) if str(rc).lstrip("-").isdigit() else 1
+        now = time.gmtime()
+        d = _he_os.path.join(_he_os.environ.get("CLANKER_DATA") or "/data/clanker",
+                             "raw", "health")
+        _he_os.makedirs(d, exist_ok=True)
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", now),
+               "hook": str(HOOK_ERR.get("hook") or "?"),
+               "session_id": str(HOOK_ERR.get("session_id") or ""), "cwd": str(cwd),
+               "rc": rc, "stderr_tail": msg[:300]}
+        path = _he_os.path.join(d, "hook-errors-" + time.strftime("%Y-%m-%d", now) + ".jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+# ---- end of hook-error log --------------------------------------------------------
+
 import itertools, json, os, re, subprocess, sys
 from datetime import datetime, timezone
 from collections import Counter, deque
@@ -86,6 +182,7 @@ from collections import Counter, deque
 transcript_path = os.environ.get("TRANSCRIPT", "")
 session_id = os.environ.get("SESSION_ID", "")
 cwd = os.environ.get("CWD", "")
+HOOK_ERR.update(hook="session-end.sh", session_id=session_id, cwd=cwd)
 
 # Fallback: read from env if heredoc substitution fails
 if not transcript_path:
@@ -166,8 +263,8 @@ def load_registry(path):
             for k, v in ((yaml.safe_load(text) or {}).get("projects") or {}).items():
                 v = v if isinstance(v, dict) else {}
                 projects[str(k)] = {kk: str(v[kk]) for kk in ("archetype", "path") if v.get(kk)}
-        except Exception:
-            pass
+        except Exception as e:
+            hook_err(1, "registry: flow-style yaml", e)
     return projects, aliases
 
 
@@ -297,8 +394,8 @@ project = "global"
 try:
     _reg, _aliases = load_registry(REGISTRY)
     project = resolve_project(cwd, _reg, _aliases)[0]
-except Exception:
-    pass
+except Exception as e:
+    hook_err(1, "resolve project", e)
 
 # ---- pricing ------------------------------------------------------------------
 # One price table and one way to count API calls. This block is byte-identical
@@ -569,8 +666,7 @@ try:
                             flags.append("architecture-discussion")
 
 except Exception as e:
-    # Log error but don't fail the hook
-    sys.stderr.write(f"clanker session-end: {e}\n")
+    hook_err(1, "main transcript", e)       # the row is still written, from what was read
 
 tokens, main_cost, api_calls = totals(calls)
 ctx = [calls[k][1] + calls[k][3] + calls[k][4] for k in ctx_per_call if k in calls]
@@ -582,13 +678,15 @@ peak_ctx = max(ctx) if ctx else None
 _helper = os.environ.get("LAST_MSG_HELPER", "")
 if _helper and os.path.isfile(_helper):
     try:
-        _out = subprocess.run([sys.executable, "-I", _helper, transcript_path],
-                              capture_output=True, encoding="utf-8", errors="replace",
-                              timeout=10).stdout
-        if _out.strip():
-            last_assistant_text = _out.strip()
-    except Exception:
-        pass
+        _r = subprocess.run([sys.executable, "-I", _helper, transcript_path],
+                            capture_output=True, encoding="utf-8", errors="replace",
+                            timeout=10)
+        if _r.returncode != 0:
+            hook_err(_r.returncode, "last-assistant-msg.py", _r.stderr)
+        elif _r.stdout.strip():
+            last_assistant_text = _r.stdout.strip()
+    except Exception as e:
+        hook_err(1, "last-assistant-msg.py", e)
 
 # ---- subagent transcripts --------------------------------------------------------
 # <transcript dir>/<session>/subagents/, nested levels included (workflow runs
@@ -621,10 +719,11 @@ try:
                             usage, m = msg.get("usage"), msg.get("model")
                             if isinstance(usage, dict) and m != "<synthetic>":
                                 note_usage(sub_calls, message_key(obj, msg), m, usage)
-                except OSError:
+                except OSError as e:
+                    hook_err(1, "subagent transcript " + fn, e)
                     continue
 except Exception as e:
-    sys.stderr.write(f"clanker session-end (subagents): {e}\n")
+    hook_err(1, "subagent transcripts", e)
 subagent_tokens, sub_cost, subagent_api_calls = totals(sub_calls)
 
 if not entrypoint:
@@ -638,8 +737,8 @@ if first_ts and last_ts:
         t1 = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
         t2 = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
         duration_s = int((t2 - t1).total_seconds())
-    except:
-        pass
+    except Exception as e:
+        hook_err(1, "duration from timestamps", e)
 
 # ── Why did this session end? (P6, audit M4) ──────────────────────────────
 # failure_reason: the first limit/API-error signature, in this order, found in
@@ -722,5 +821,12 @@ record = {
 
 print(json.dumps(record))
 PYEOF
+}
+
+# The row goes through flock + tee into the day file. The python's stderr is
+# captured, so a crash (or a syntax error after an edit) lands in the
+# hook-error log instead of vanishing; its guarded steps log themselves.
+{ metrics_err=$( { metrics 3>&- | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null 3>&-; } 2>&1 1>&3 ); metrics_rc=$?; } 3>&1
+[ "$metrics_rc" -eq 0 ] || hook_err "$metrics_rc" "metrics (python | flock tee)" "$metrics_err"
 
 exit 0

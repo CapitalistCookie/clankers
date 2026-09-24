@@ -36,13 +36,107 @@
 # calls, and a single pass over the alert dir for the count.
 # FAIL-OPEN: every piece is guarded; whatever lines succeeded are emitted and
 # the script always exits 0.
+# FAIL-VISIBLE (2026-09-24): a guarded step that fails, and a python run that
+# exits nonzero, append a row to the hook-error log (block below) instead of
+# vanishing: the briefing import stayed dead for two months unseen.
 set -uo pipefail
+
+# ---- hook-error log: the same block in every clanker bash hook ------------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# ${CLANKER_DATA:-/data/clanker}/raw/health/hook-errors-<UTC day>.jsonl, where
+# `clanker doctor --harness` counts it. hook_err never blocks, never writes to
+# stdout and never changes the hook's exit code, under set -e and set -u too.
+# Usage: hook_err <rc> <step> [<error text>]. stderr_tail is "<step>: " plus the
+# end of the text, 300 characters at most. Put the raw hook payload in
+# HOOK_ERR_IN so that the row names the session and its cwd.
+HOOK_ERR_IN=""
+hook_err_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+}
+hook_err() {
+    (
+        set +eu
+        rc="$1" step="${2:-?}" text="$3" sid="" re=""
+        [[ $rc =~ ^-?[0-9]+$ ]] || rc=1
+        room=$(( 298 - ${#step} ))
+        if (( room <= 0 )); then text=""
+        elif (( ${#text} > room )); then text="${text:${#text}-room}"; fi
+        msg="$step${text:+: $text}"
+        re='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]*)"'
+        [[ $HOOK_ERR_IN =~ $re ]] && sid="${BASH_REMATCH[1]}"
+        re='"cwd"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+        if [[ $HOOK_ERR_IN =~ $re ]]; then cwd="\"${BASH_REMATCH[1]}\""
+        else cwd=$(hook_err_str "$PWD"); fi
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        d="${CLANKER_DATA:-/data/clanker}/raw/health"
+        mkdir -p "$d" && printf '{"ts":"%s","hook":%s,"session_id":"%s","cwd":%s,"rc":%s,"stderr_tail":%s}\n' \
+            "$ts" "$(hook_err_str "${0##*/}")" "$sid" "$cwd" "$rc" "$(hook_err_str "${msg:0:300}")" \
+            >> "$d/hook-errors-${ts%%T*}.jsonl"
+        exit 0
+    ) </dev/null >/dev/null 2>&1
+    return 0
+}
+# ---- end of hook-error log --------------------------------------------------------
 
 CLANKER_HOOK_INPUT="$(cat 2>/dev/null || true)"
 CLANKER_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 export CLANKER_HOOK_INPUT CLANKER_HOOK_DIR
+HOOK_ERR_IN="$CLANKER_HOOK_INPUT"
 
-python3 -I - <<'PY' 2>/dev/null || true
+brief() {
+python3 -I - <<'PY'
+# ---- hook-error log: the same block in every clanker python hook ----------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# $CLANKER_DATA/raw/health/hook-errors-<UTC day>.jsonl (default /data/clanker),
+# where `clanker doctor --harness` counts it. hook_err never raises, never
+# blocks and never writes to stdout. Usage: hook_err(rc, step, error text or
+# exception); stderr_tail is "<step>: " plus the end of the text (of the
+# traceback, for an exception), 300 characters at most. Set
+# HOOK_ERR["session_id"] and HOOK_ERR["cwd"] once the payload is parsed.
+import os as _he_os
+import sys as _he_sys
+
+HOOK_ERR = {"hook": (_he_os.path.basename(_he_sys.argv[0]) if _he_sys.argv
+                     and _he_sys.argv[0] not in ("", "-", "-c") else "?"),
+            "session_id": "", "cwd": ""}
+
+
+def hook_err(rc, step, err=""):
+    try:
+        import json
+        import time
+        import traceback
+        if isinstance(err, BaseException):
+            err = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+        step, err = str(step), str(err or "").strip()
+        room = 298 - len(step)
+        msg = (step + ": " + err[-room:]) if err and room > 0 else step
+        try:
+            cwd = HOOK_ERR.get("cwd") or _he_os.getcwd()
+        except OSError:
+            cwd = ""
+        rc = int(rc) if str(rc).lstrip("-").isdigit() else 1
+        now = time.gmtime()
+        d = _he_os.path.join(_he_os.environ.get("CLANKER_DATA") or "/data/clanker",
+                             "raw", "health")
+        _he_os.makedirs(d, exist_ok=True)
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", now),
+               "hook": str(HOOK_ERR.get("hook") or "?"),
+               "session_id": str(HOOK_ERR.get("session_id") or ""), "cwd": str(cwd),
+               "rc": rc, "stderr_tail": msg[:300]}
+        path = _he_os.path.join(d, "hook-errors-" + time.strftime("%Y-%m-%d", now) + ".jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+# ---- end of hook-error log --------------------------------------------------------
+
+HOOK_ERR["hook"] = "session-start.sh"
 import json, os, re, shlex, subprocess, sys, time
 
 BUDGET, NOW_MAX, HEAD_MAX, NOW_MIN = 1200, 800, 600, 120
@@ -202,8 +296,8 @@ def load_registry(path):
             for k, v in ((yaml.safe_load(text) or {}).get("projects") or {}).items():
                 v = v if isinstance(v, dict) else {}
                 projects[str(k)] = {kk: str(v[kk]) for kk in ("archetype", "path") if v.get(kk)}
-        except Exception:
-            pass
+        except Exception as e:
+            hook_err(1, "registry: flow-style yaml", e)
     return projects, aliases
 
 
@@ -378,11 +472,13 @@ def git(where, *args):
 try:
     hook_in = json.loads(E.get("CLANKER_HOOK_INPUT") or "{}")
     hook_in = hook_in if isinstance(hook_in, dict) else {}
-except ValueError:
+except ValueError as e:
+    hook_err(1, "parse hook input", e)
     hook_in = {}
 cwd = str(hook_in.get("cwd") or "")
 source = str(hook_in.get("source") or "")
 session_id = str(hook_in.get("session_id") or "")
+HOOK_ERR.update(session_id=session_id, cwd=cwd)
 project_dir = E.get("CLAUDE_PROJECT_DIR") or cwd
 entrypoint = E.get("CLAUDE_CODE_ENTRYPOINT") or ""
 nested = entrypoint == "sdk-cli"
@@ -416,8 +512,8 @@ if source == "clear":
             p.stdin.write(json.dumps({"session_id": old_id, "transcript_path": old,
                                       "cwd": cwd}).encode())
             p.stdin.close()
-    except Exception:
-        pass
+    except Exception as e:
+        hook_err(1, "clear: hand the previous transcript to session-end", e)
 
 # --- 1. project + archetype -----------------------------------------------------
 reg, aliases = None, {}
@@ -425,8 +521,8 @@ resolved, kind, path, top, main = "global", "global", None, None, None
 try:
     reg, aliases = load_registry(REGISTRY)
     resolved, kind, path, top, main = resolve_project(project_dir, reg, aliases)
-except Exception:
-    pass
+except Exception as e:
+    hook_err(1, "resolve project", e)
 base = os.path.basename(os.path.normpath(project_dir)) if project_dir else ""
 project = resolved if kind in ("registry", "discovered", "name") else None
 name = project or base
@@ -471,8 +567,8 @@ if session_id:
                     "entrypoint": entrypoint or None,
                     "nested": nested,
                 }) + "\n")
-    except Exception:
-        pass
+    except Exception as e:
+        hook_err(1, "heartbeat stub row", e)
 
 # --- 3. env vars for downstream hooks -------------------------------------------
 envf = E.get("CLAUDE_ENV_FILE")
@@ -481,8 +577,8 @@ if envf and name and os.path.isfile(REGISTRY):
         with open(envf, "a") as f:
             f.write(f"export CLANKER_PROJECT={shlex.quote(name)}\n")
             f.write(f"export CLANKER_ARCHETYPE={shlex.quote(archetype)}\n")
-    except Exception:
-        pass
+    except Exception as e:
+        hook_err(1, "CLAUDE_ENV_FILE exports", e)
 
 # --- 4. the brief (none for a nested run) ---------------------------------------
 if quiet:
@@ -506,8 +602,8 @@ try:
         clanker_line += f" · {branch}@{sha} · {dirty} dirty"
         lg = git(root, "log", "--oneline", "--no-decorate", "--no-color", "-3")
         log3 = [ln.rstrip() for ln in (lg or "").splitlines() if ln.strip()][:3]
-except Exception:
-    pass
+except Exception as e:
+    hook_err(1, "git status/log", e)
 
 now_src, first_body, now_limit, now_lines, status_size = [], 0, 0, [], None
 try:
@@ -524,17 +620,18 @@ try:
             now_src = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
             now_limit = HEAD_MAX
         now_lines = fit(now_src, now_limit, first_body)
-except Exception:
-    pass
+except Exception as e:
+    hook_err(1, "STATUS.md NOW", e)
 
 index = "none"
 try:
     index = next((f for f in INDEX_FILES if os.path.isfile(os.path.join(root, f))), "none")
-except Exception:
-    pass
+except Exception as e:
+    hook_err(1, "index file", e)
 try:
     n_alerts = f"{count_alerts(name)} open for this project" if name else "0 open for this project"
-except Exception:
+except Exception as e:
+    hook_err(1, "count alerts", e)
     n_alerts = "? (unreadable)"
 state_line = ("state: " + (f"STATUS.md ({status_size} B)" if status_size is not None
                            else "no STATUS.md")
@@ -572,11 +669,19 @@ try:
     if nbytes(ctx) > BUDGET:                          # last resort: hard cap
         cut = ctx.encode("utf-8")[:BUDGET].decode("utf-8", "ignore")
         ctx = cut[:cut.rfind("\n")] if "\n" in cut else clip(ctx, BUDGET)
-except Exception:
+except Exception as e:
+    hook_err(1, "render the brief", e)
     ctx = clip("\n".join(x for x in (clanker_line, state_line) if x), BUDGET)
 
 print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                          "additionalContext": ctx}}))
 PY
+}
+
+# The brief's JSON goes to stdout; the python's stderr is captured, so a crash
+# (or a syntax error after an edit) lands in the hook-error log. Its guarded
+# steps log themselves.
+{ brief_err=$(brief 2>&1 1>&3 3>&-); brief_rc=$?; } 3>&1
+[ "$brief_rc" -eq 0 ] || hook_err "$brief_rc" "brief (python)" "$brief_err"
 
 exit 0

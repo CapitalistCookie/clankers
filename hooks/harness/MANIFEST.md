@@ -21,6 +21,9 @@ by hand. It stops and tells you to use `--force`.
   `~/.claude/harness.env` and exports the values to its gates.
 - A global hook must not read `~/.claude/research.env`. That file also holds API keys for
   third-party services.
+- Each hook has the hook-error block (see "Hook errors" in `README.md`). A swallowed failure
+  adds a line to the hook-error log. `tests/test_hook_errors.py` fails when a block differs from
+  the other blocks, or when a hook has no block.
 
 ## Distributed files
 

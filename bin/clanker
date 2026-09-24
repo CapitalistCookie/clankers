@@ -151,6 +151,12 @@ def cmd_memory_doctor(args):
     return doctor(project=args.project)
 
 def cmd_doctor(args):
+    if getattr(args, 'json', False) and not getattr(args, 'harness', False):
+        print("doctor: --json applies to --harness only", file=sys.stderr)
+        sys.exit(2)
+    if getattr(args, 'harness', False):
+        from harness_lint import main as harness_main
+        sys.exit(harness_main(json_out=getattr(args, 'json', False)))
     if getattr(args, 'fleet', False):
         from adopt import doctor_fleet
         sys.exit(doctor_fleet(include_secrets=getattr(args, 'secrets', False)))
@@ -222,6 +228,17 @@ def cmd_doctor(args):
             issues.append("hook-sync")
     except Exception:
         print("✗ Hook sync check errored")
+
+    # Harness lint: one row here; `clanker doctor --harness` prints the table.
+    try:
+        from harness_lint import run as _lint_run, summary_line as _lint_summary
+        ok, line = _lint_summary(_lint_run())
+        print(f"{'✓' if ok else '✗'} {line}")
+        if not ok:
+            issues.append("harness-lint")
+    except Exception as e:
+        print(f"✗ Harness lint errored: {e}")
+        issues.append("harness-lint")
 
     # Session-state source (2026-09-07): the dashboard's ntfy pings read Claude
     # Code's own session registry (~/.claude/sessions/<pid>.json). Every claude
@@ -777,13 +794,18 @@ def main():
     p = sub.add_parser('version', help='Version and status')
     p.set_defaults(func=cmd_version)
 
-    p = sub.add_parser('doctor', help='Self-diagnostics; with a project name, run the project CONTRACT check; --fleet = every registered project, one row each')
+    p = sub.add_parser('doctor', help='Self-diagnostics; with a project name, run the project CONTRACT check; --fleet = every registered project, one row each; --harness = harness lint table')
     p.add_argument('project', nargs='?', default=None,
                    help='project name: check registered/CLAUDE.md/state-file/ci/remote/no-plaintext-secrets')
     p.add_argument('--fleet', action='store_true',
                    help='contract check across the WHOLE registry (secret grep off; add --secrets)')
     p.add_argument('--secrets', action='store_true',
                    help='with --fleet: include the per-repo secret grep (slow on big repos)')
+    p.add_argument('--harness', action='store_true',
+                   help='harness lint: project refs in global files, skill descriptions > 300 chars, CLAUDE.md > 6 KB, '
+                        'STATUS.md NOW, hook timeouts > 60 s, missing hook scripts, rules scope, alerts dir, '
+                        'global env keys, hook errors (24 h); exit 1 on any finding')
+    p.add_argument('--json', action='store_true', help='with --harness: JSON instead of the table')
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser('sync', help='Repo ↔ installed-hook parity: --check (default) / --apply (install) / --pin (wire settings.json to dist copies)')

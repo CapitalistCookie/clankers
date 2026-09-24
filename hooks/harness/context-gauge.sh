@@ -19,7 +19,50 @@
 #   - growth since the cached run is < 4 MB (sanity bound)
 #
 # Selftest: bash context-gauge.sh --selftest   (covers wrapper AND python).
+# Fail-visible (2026-09-24): a python run that exits nonzero lands in the
+# hook-error log (block below); the python logs its own guarded failures.
 set -uo pipefail
+
+# ---- hook-error log: the same block in every clanker bash hook ------------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# ${CLANKER_DATA:-/data/clanker}/raw/health/hook-errors-<UTC day>.jsonl, where
+# `clanker doctor --harness` counts it. hook_err never blocks, never writes to
+# stdout and never changes the hook's exit code, under set -e and set -u too.
+# Usage: hook_err <rc> <step> [<error text>]. stderr_tail is "<step>: " plus the
+# end of the text, 300 characters at most. Put the raw hook payload in
+# HOOK_ERR_IN so that the row names the session and its cwd.
+HOOK_ERR_IN=""
+hook_err_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+}
+hook_err() {
+    (
+        set +eu
+        rc="$1" step="${2:-?}" text="$3" sid="" re=""
+        [[ $rc =~ ^-?[0-9]+$ ]] || rc=1
+        room=$(( 298 - ${#step} ))
+        if (( room <= 0 )); then text=""
+        elif (( ${#text} > room )); then text="${text:${#text}-room}"; fi
+        msg="$step${text:+: $text}"
+        re='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]*)"'
+        [[ $HOOK_ERR_IN =~ $re ]] && sid="${BASH_REMATCH[1]}"
+        re='"cwd"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+        if [[ $HOOK_ERR_IN =~ $re ]]; then cwd="\"${BASH_REMATCH[1]}\""
+        else cwd=$(hook_err_str "$PWD"); fi
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        d="${CLANKER_DATA:-/data/clanker}/raw/health"
+        mkdir -p "$d" && printf '{"ts":"%s","hook":%s,"session_id":"%s","cwd":%s,"rc":%s,"stderr_tail":%s}\n' \
+            "$ts" "$(hook_err_str "${0##*/}")" "$sid" "$cwd" "$rc" "$(hook_err_str "${msg:0:300}")" \
+            >> "$d/hook-errors-${ts%%T*}.jsonl"
+        exit 0
+    ) </dev/null >/dev/null 2>&1
+    return 0
+}
+# ---- end of hook-error log --------------------------------------------------------
 
 PY="$(dirname "$0")/context-gauge.py"
 
@@ -29,7 +72,15 @@ fi
 
 INPUT=$(cat)
 
-run_py() { printf '%s' "$INPUT" | CCG_KEY="${1:-}" CCG_SIZE="${2:-}" python3 "$PY"; exit 0; }
+# The gauge's stdout goes to the hook's stdout; its stderr is captured and, on
+# a nonzero exit, logged.
+run_py() {
+  local err rc
+  HOOK_ERR_IN="$INPUT"
+  { err=$(printf '%s' "$INPUT" | CCG_KEY="${1:-}" CCG_SIZE="${2:-}" python3 "$PY" 2>&1 1>&3 3>&-); rc=$?; } 3>&1
+  [ "$rc" -eq 0 ] || hook_err "$rc" "context-gauge.py" "$err"
+  exit 0
+}
 
 # ── pure-bash field extraction (payload is single-line JSON) ────────────────
 tp=""; agent=""

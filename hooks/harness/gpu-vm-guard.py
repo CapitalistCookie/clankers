@@ -10,7 +10,54 @@ Post-containerization reality (see memory/gpu-usage.md):
   do NOT stop Frigate to make room — use smaller GPU_SHARE instead.
 
 Fires as PreToolUse on Bash when the command targets the GPU host.
+An internal failure fails open and lands in the hook-error log.
 """
+# ---- hook-error log: the same block in every clanker python hook ----------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# $CLANKER_DATA/raw/health/hook-errors-<UTC day>.jsonl (default /data/clanker),
+# where `clanker doctor --harness` counts it. hook_err never raises, never
+# blocks and never writes to stdout. Usage: hook_err(rc, step, error text or
+# exception); stderr_tail is "<step>: " plus the end of the text (of the
+# traceback, for an exception), 300 characters at most. Set
+# HOOK_ERR["session_id"] and HOOK_ERR["cwd"] once the payload is parsed.
+import os as _he_os
+import sys as _he_sys
+
+HOOK_ERR = {"hook": (_he_os.path.basename(_he_sys.argv[0]) if _he_sys.argv
+                     and _he_sys.argv[0] not in ("", "-", "-c") else "?"),
+            "session_id": "", "cwd": ""}
+
+
+def hook_err(rc, step, err=""):
+    try:
+        import json
+        import time
+        import traceback
+        if isinstance(err, BaseException):
+            err = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+        step, err = str(step), str(err or "").strip()
+        room = 298 - len(step)
+        msg = (step + ": " + err[-room:]) if err and room > 0 else step
+        try:
+            cwd = HOOK_ERR.get("cwd") or _he_os.getcwd()
+        except OSError:
+            cwd = ""
+        rc = int(rc) if str(rc).lstrip("-").isdigit() else 1
+        now = time.gmtime()
+        d = _he_os.path.join(_he_os.environ.get("CLANKER_DATA") or "/data/clanker",
+                             "raw", "health")
+        _he_os.makedirs(d, exist_ok=True)
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", now),
+               "hook": str(HOOK_ERR.get("hook") or "?"),
+               "session_id": str(HOOK_ERR.get("session_id") or ""), "cwd": str(cwd),
+               "rc": rc, "stderr_tail": msg[:300]}
+        path = _he_os.path.join(d, "hook-errors-" + time.strftime("%Y-%m-%d", now) + ".jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+# ---- end of hook-error log --------------------------------------------------------
 
 import json
 import os
@@ -65,9 +112,13 @@ def ssh_run(cmd: str, timeout: int = 8) -> str | None:
             SSH_BASE + [cmd],
             capture_output=True, text=True, timeout=timeout,
         )
-        return r.stdout.strip() if r.returncode == 0 else None
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError) as e:
+        hook_err(1, "ssh health check (skipped)", e)
         return None
+    if r.returncode != 0:
+        hook_err(r.returncode, "ssh health check (skipped)", r.stderr)
+        return None
+    return r.stdout.strip()
 
 def get_script_imports(path: str) -> set[str]:
     pkgs = set()
@@ -89,10 +140,13 @@ def get_script_imports(path: str) -> set[str]:
 def main() -> None:
     try:
         hook_input = json.load(sys.stdin)
-    except Exception:
+    except Exception as e:
+        hook_err(1, "parse hook input", e)
         return  # malformed/missing stdin: never crash the session
     if not isinstance(hook_input, dict):
+        hook_err(1, "parse hook input", "payload is not a JSON object")
         return
+    HOOK_ERR.update(session_id=str(hook_input.get("session_id") or ""), cwd=str(hook_input.get("cwd") or ""))
     tool_input = hook_input.get("tool_input") or {}
     cmd = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
     if not isinstance(cmd, str) or not cmd:
@@ -159,7 +213,8 @@ def main() -> None:
         if result:
             try:
                 data = json.loads(result)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                hook_err(1, "ssh health check reply", e)
                 data = None
 
             if data:
@@ -214,7 +269,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        # Internal error → fail OPEN silently (block()/advise() exit via
+    except Exception as e:
+        # Internal error → fail OPEN, logged (block()/advise() exit via
         # SystemExit, which is not caught here, so gate decisions still work).
-        pass
+        hook_err(1, "main", e)

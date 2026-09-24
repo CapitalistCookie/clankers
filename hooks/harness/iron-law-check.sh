@@ -23,8 +23,53 @@
 # always empty and this hook never fired once (telemetry-proven). The message
 # is now extracted from transcript_path via last-assistant-msg.py. RED/GREEN
 # selftest: `bash iron-law-check.sh --selftest` (run it after ANY edit here).
+#
+# Fail-visible (2026-09-24): a failed jq parse, helper run, evidence read or
+# telemetry append lands in the hook-error log (block below); the check itself
+# still fails toward flagging a claim, as before.
 
 set -uo pipefail
+
+# ---- hook-error log: the same block in every clanker bash hook ------------------
+# A failure that the hook swallows (the hook stays fail-open for the session)
+# appends one JSON line {ts, hook, session_id, cwd, rc, stderr_tail} to
+# ${CLANKER_DATA:-/data/clanker}/raw/health/hook-errors-<UTC day>.jsonl, where
+# `clanker doctor --harness` counts it. hook_err never blocks, never writes to
+# stdout and never changes the hook's exit code, under set -e and set -u too.
+# Usage: hook_err <rc> <step> [<error text>]. stderr_tail is "<step>: " plus the
+# end of the text, 300 characters at most. Put the raw hook payload in
+# HOOK_ERR_IN so that the row names the session and its cwd.
+HOOK_ERR_IN=""
+hook_err_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"; s="${s//$'\r'/\\r}"; s="${s//$'\n'/\\n}"
+    printf '"%s"' "$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177')"
+}
+hook_err() {
+    (
+        set +eu
+        rc="$1" step="${2:-?}" text="$3" sid="" re=""
+        [[ $rc =~ ^-?[0-9]+$ ]] || rc=1
+        room=$(( 298 - ${#step} ))
+        if (( room <= 0 )); then text=""
+        elif (( ${#text} > room )); then text="${text:${#text}-room}"; fi
+        msg="$step${text:+: $text}"
+        re='"session_id"[[:space:]]*:[[:space:]]*"([^"\\]*)"'
+        [[ $HOOK_ERR_IN =~ $re ]] && sid="${BASH_REMATCH[1]}"
+        re='"cwd"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)"'
+        if [[ $HOOK_ERR_IN =~ $re ]]; then cwd="\"${BASH_REMATCH[1]}\""
+        else cwd=$(hook_err_str "$PWD"); fi
+        ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        d="${CLANKER_DATA:-/data/clanker}/raw/health"
+        mkdir -p "$d" && printf '{"ts":"%s","hook":%s,"session_id":"%s","cwd":%s,"rc":%s,"stderr_tail":%s}\n' \
+            "$ts" "$(hook_err_str "${0##*/}")" "$sid" "$cwd" "$rc" "$(hook_err_str "${msg:0:300}")" \
+            >> "$d/hook-errors-${ts%%T*}.jsonl"
+        exit 0
+    ) </dev/null >/dev/null 2>&1
+    return 0
+}
+# ---- end of hook-error log --------------------------------------------------------
 
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -32,6 +77,7 @@ HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "${1:-}" = "--selftest" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT
+  export CLANKER_DATA="$T/data"     # rows from the fixture runs stay out of the live log
   rm -f /tmp/.ironlaw-selftest* 2>/dev/null  # once-per-session markers must not mask RED reruns
   # RED: assistant claims deploy success; no evidence token in tool output
   printf '%s\n' \
@@ -73,13 +119,16 @@ if [ "${1:-}" = "--selftest" ]; then
 fi
 
 input=$(cat)
-transcript=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null || true)
+HOOK_ERR_IN="$input"
+transcript=$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null) \
+  || { hook_err $? "jq: parse the hook input"; transcript=""; }
 # 2.1.x Stop payloads carry the message NATIVELY as `last_assistant_message`
 # (docs-verified 2026-07-05) — prefer it (no python spawn); transcript-tail
 # extraction remains as fallback for older payloads and the selftest fixtures.
 msg=$(printf '%s' "$input" | jq -r '.last_assistant_message // empty' 2>/dev/null || true)
 if [ -z "$msg" ] && [ -n "$transcript" ] && [ -f "$transcript" ]; then
-  msg=$(python3 "$HOOKS_DIR/last-assistant-msg.py" "$transcript" 2>/dev/null || true)
+  msg=$(python3 "$HOOKS_DIR/last-assistant-msg.py" "$transcript" 2>&1) \
+    || { hook_err $? "last-assistant-msg.py" "$msg"; msg=""; }
 fi
 
 # Nothing to check if no assistant message could be extracted.
@@ -114,8 +163,8 @@ ensure_evidence() {
     # summary whose evidence tokens sat a few messages back — real evidence,
     # too-small window. Long-turn sessions need the deeper look-back.
     recent_output=$(tail -n 400 "$transcript" 2>/dev/null \
-      | jq -rs '.[] | (.tool_result? // .message?.content? // "") | tostring' 2>/dev/null \
-      || true)
+      | jq -rs '.[] | (.tool_result? // .message?.content? // "") | tostring' 2>/dev/null) \
+      || { hook_err $? "evidence: tail | jq over the transcript (every claim counts as unverified)"; recent_output=""; }
   fi
 }
 
@@ -167,7 +216,8 @@ LOG="$HOME/.claude/.self-improving-log.jsonl"
 session_id=$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null || echo unknown)
 ts=$(date -u +%FT%TZ)
 n="${#violations[@]}"
-printf '{"ts":"%s","hook":"iron-law-check","session_id":"%s","violations":%d}\n' "$ts" "$session_id" "$n" >> "$LOG" 2>/dev/null || true
+printf '{"ts":"%s","hook":"iron-law-check","session_id":"%s","violations":%d}\n' "$ts" "$session_id" "$n" >> "$LOG" 2>/dev/null \
+  || hook_err $? "append $LOG"
 
 # No violations → silent success.
 [ "$n" -eq 0 ] && exit 0

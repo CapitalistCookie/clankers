@@ -67,6 +67,7 @@
   "lib/ecosystem.py",
   "lib/events.py",
   "lib/handoff.py",
+  "lib/harness_lint.py",
   "lib/ingest.py",
   "lib/memorycmd.py",
   "lib/memoryns.py",
@@ -136,6 +137,8 @@
   "tests/test_ecc_risk.py",
   "tests/test_ecc_trend.py",
   "tests/test_handoff.py",
+  "tests/test_harness_lint.py",
+  "tests/test_hook_errors.py",
   "tests/test_live_js.py",
   "tests/test_livewatch_js.py",
   "tests/test_newsession.py",
@@ -164,5 +167,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "28bdf51"
+ "source_commit": "9b0a89f"
 }
