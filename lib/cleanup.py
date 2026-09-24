@@ -3,10 +3,15 @@
 import os
 import json
 import gzip
+import re
 import shutil
 from datetime import datetime, timedelta
 
 DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
+
+# A health log's day: the whole name (2026-09-24.jsonl, the alert-check cron)
+# or its last part (hook-errors-2026-09-24.jsonl, the hook-error log).
+HEALTH_DAY_RE = re.compile(r"(?:^|-)(\d{4}-\d{2}-\d{2})\.jsonl$")
 
 
 def run_gc(dry_run=False):
@@ -33,7 +38,8 @@ def run_gc(dry_run=False):
 
     # 2. Alert expiry runs last: see the end of this function.
 
-    # 3. Archive health check logs older than 30 days
+    # 3. Archive health logs older than 30 days. The day may end the name
+    # (hook-errors-<day>.jsonl, 2026-09-24): f[:10] alone never archived those.
     health_dir = os.path.join(DATA_DIR, "raw/health")
     health_archive = os.path.join(DATA_DIR, "archive/health")
     cutoff_30 = (datetime.utcnow() - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -41,7 +47,8 @@ def run_gc(dry_run=False):
     if os.path.isdir(health_dir):
         os.makedirs(health_archive, exist_ok=True)
         for f in sorted(os.listdir(health_dir)):
-            if f.endswith(".jsonl") and f[:10] < cutoff_30:
+            m = HEALTH_DAY_RE.search(f)
+            if m and m.group(1) < cutoff_30:
                 src = os.path.join(health_dir, f)
                 dst = os.path.join(health_archive, f + ".gz")
                 if not dry_run:

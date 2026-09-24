@@ -121,6 +121,18 @@ def test_selftest_failure_fails_apply():
         assert rc == 1
 
 
+def test_a_document_that_names_the_selftest_flag_is_not_run():
+    """The harness README mentions `--selftest` in its text; apply ran
+    `python3 README.md --selftest` and failed on it (2026-09-24)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _mk_repo(tmp)
+        claude = os.path.join(tmp, "claude")
+        with open(os.path.join(repo, "hooks", "harness", "README.md"), "w") as f:
+            f.write("# hooks\n\nRun `bash ~/.claude/hooks/context-gauge.sh --selftest`.\n")
+        assert synccmd._selftest(os.path.join(repo, "hooks", "harness", "README.md")) is None
+        assert synccmd.apply(repo, claude) == 0
+
+
 # ── hand-edit guard (2026-09-24) ────────────────────────────────────────────
 # That night an operator rewire edited six installed hooks and archived nine;
 # an apply from the old repo state would have reverted all of it. apply now

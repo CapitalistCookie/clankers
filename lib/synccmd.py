@@ -210,7 +210,13 @@ def _git_snapshot(claude, msg):
 
 
 def _selftest(path):
-    """Run `<hook> --selftest` when the file advertises one. None = no selftest."""
+    """Run `<hook> --selftest` when the file advertises one. None = no selftest.
+
+    Only a .sh or .py file can have one. The harness README names the flag in
+    its text, so the substring test alone ran `python3 README.md --selftest`
+    and reported a false SELFTEST FAILED (2026-09-24)."""
+    if not path.endswith((".sh", ".py")):
+        return None
     try:
         with open(path, errors="ignore") as f:
             if "--selftest" not in f.read():

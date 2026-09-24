@@ -220,3 +220,25 @@ def test_gc_judges_its_own_weekly_raise_after_raising_it(gc_env, monkeypatch):
     a = json.loads((adir / "schedules-orphaned.json").read_text())
     assert a["first_seen"] == born                 # the same alert, not a reborn one
     assert a["timestamp"] > _iso_ago(0.01)         # raised by this run
+
+
+def test_gc_archives_hook_error_logs_by_the_day_at_the_end_of_the_name(gc_env, tmp_path):
+    """raw/health holds the alert-check cron's <day>.jsonl and, since
+    2026-09-24, the hooks' hook-errors-<day>.jsonl. Both archive after 30
+    days; the old f[:10] test never matched the second kind."""
+    import gzip
+    health = tmp_path / "data" / "raw" / "health"
+    health.mkdir(parents=True)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    old = ["2026-01-01.jsonl", "hook-errors-2026-01-01.jsonl"]
+    keep = [f"{today}.jsonl", f"hook-errors-{today}.jsonl", "notes.jsonl", "2026-01-01.txt"]
+    for name in old + keep:
+        (health / name).write_text('{"row": "%s"}\n' % name)
+    assert cleanup.run_gc(dry_run=True)["health_archived"] == 2
+    assert sorted(p.name for p in health.iterdir()) == sorted(old + keep)   # dry run moves nothing
+    assert cleanup.run_gc()["health_archived"] == 2
+    assert sorted(p.name for p in health.iterdir()) == sorted(keep)
+    archive = tmp_path / "data" / "archive" / "health"
+    for name in old:
+        with gzip.open(archive / (name + ".gz"), "rt") as f:
+            assert f.read() == '{"row": "%s"}\n' % name
