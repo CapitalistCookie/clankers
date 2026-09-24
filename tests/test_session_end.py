@@ -435,3 +435,33 @@ def test_failure_reason_uses_the_full_inlined_catalog(tmp_path):
         # the catalog's order, so that is the signature reported for it
         assert got == ("usage limit" if sign == "not your usage limit" else sign), (sign, got)
         assert got not in FALLBACK_SIGNS or sign == "not your usage limit"
+
+
+# ── rewrite_tokens (design audit proposal 3, 2026-09-24) ─────────────────────
+
+def rewrite_transcript():
+    """Seven calls, two lines each (one per content block). Calls 3 and 7 read
+    less from the cache than the call before them on the same model: 8,000 +
+    3,000 rewrite tokens. Call 4 switches model (a new cache, not counted) and
+    call 6 reads exactly as much as call 5 (not a shrink)."""
+    seq = [("msg_1", "claude-fable-5-1", 0, 10_000),
+           ("msg_2", "claude-fable-5-1", 10_000, 2_000),
+           ("msg_3", "claude-fable-5-1", 4_000, 8_000),
+           ("msg_4", "claude-opus-5-5", 0, 12_000),
+           ("msg_5", "claude-opus-5-5", 12_000, 1_000),
+           ("msg_6", "claude-opus-5-5", 12_000, 500),
+           ("msg_7", "claude-opus-5-5", 11_999, 3_000)]
+    lines = []
+    for mid, model, cr, cc in seq:
+        u = _usage(10, 20, cr, cc)
+        lines += [_asst(mid, model, u, {"type": "thinking", "thinking": ""}),
+                  _asst(mid, model, u, _txt("step " + mid))]
+    return "\n".join(lines) + "\n"
+
+
+def test_rewrite_tokens_counts_shrinking_cache_reads(tmp_path):
+    sub = [_asst("msg_S", "claude-fable-5-1", _usage(1, 1, 0, 99_999), _txt("sub"))]
+    rec = _end(tmp_path, _sid("rewrite"), rewrite_transcript(), tmp_path, _hook_env(tmp_path),
+               subagents={"agent-x.jsonl": "\n".join(sub) + "\n"})
+    assert rec["api_calls"] == 7
+    assert rec["rewrite_tokens"] == 8_000 + 3_000        # subagents are not the session's thread

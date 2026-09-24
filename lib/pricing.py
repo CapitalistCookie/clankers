@@ -112,6 +112,25 @@ def totals(calls):
         t["cache_create"] += cc
         cost += call_cost(model, i, o, cr, cc, cc1h)
     return t, cost, len(calls)
+
+def rewrites(calls, order):
+    """Keys of the calls that re-wrote a cached prefix, in call order. Of two
+    consecutive calls on one model, the later one re-wrote when it read less
+    from the cache than the earlier one did: its cached prefix shrank."""
+    out, prev = [], None
+    for k in order:
+        row = calls.get(k)
+        if row is None:
+            continue
+        if prev is not None and row[0] == prev[0] and prev[3] > row[3]:
+            out.append(k)
+        prev = row
+    return out
+
+
+def rewrite_tokens(calls, order):
+    """Cache-write tokens of the calls that rewrites() names."""
+    return sum(calls[k][4] for k in rewrites(calls, order))
 # ---- end of pricing -----------------------------------------------------------
 
 

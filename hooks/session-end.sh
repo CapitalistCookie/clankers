@@ -26,6 +26,10 @@
 #   signatures. The handoff writer is gone: its import of the handoff module
 #   pointed at a module directory that never existed on the installed side,
 #   so it had not run since 07-19.
+# - rewrite_tokens (proposal 3): the cache writes of main-transcript calls
+#   that re-wrote a cached prefix, i.e. read less from the cache than the call
+#   before them on the same model. `clanker analyze --rewrites` ranks sessions
+#   by it.
 # - last_assistant_line comes from last-assistant-msg.py, the helper the Stop
 #   gates share. sync installs it in ~/.claude/hooks, the parent of this
 #   hook's clanker-dist directory. Without it, this hook's own transcript pass
@@ -398,6 +402,25 @@ def totals(calls):
         t["cache_create"] += cc
         cost += call_cost(model, i, o, cr, cc, cc1h)
     return t, cost, len(calls)
+
+def rewrites(calls, order):
+    """Keys of the calls that re-wrote a cached prefix, in call order. Of two
+    consecutive calls on one model, the later one re-wrote when it read less
+    from the cache than the earlier one did: its cached prefix shrank."""
+    out, prev = [], None
+    for k in order:
+        row = calls.get(k)
+        if row is None:
+            continue
+        if prev is not None and row[0] == prev[0] and prev[3] > row[3]:
+            out.append(k)
+        prev = row
+    return out
+
+
+def rewrite_tokens(calls, order):
+    """Cache-write tokens of the calls that rewrites() names."""
+    return sum(calls[k][4] for k in rewrites(calls, order))
 # ---- end of pricing -----------------------------------------------------------
 
 # ---- main transcript -----------------------------------------------------------
@@ -687,6 +710,9 @@ record = {
     "api_calls": api_calls,
     "first_call_ctx": first_call_ctx,
     "peak_ctx": peak_ctx,
+    # Cache writes of main-transcript calls whose cached prefix shrank against
+    # the call before on the same model (design audit proposal 3).
+    "rewrite_tokens": rewrite_tokens(calls, ctx_per_call),
     "subagent_tokens": subagent_tokens,
     "subagent_cost_usd": round(sub_cost, 2),
     "subagent_api_calls": subagent_api_calls,

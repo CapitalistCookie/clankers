@@ -125,6 +125,7 @@
   "tests/test_adopt.py",
   "tests/test_alerts_escalation.py",
   "tests/test_all.py",
+  "tests/test_analyze_rewrites.py",
   "tests/test_briefing.py",
   "tests/test_cleanup_memory.py",
   "tests/test_cli.py",
@@ -163,5 +164,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "cb7b400"
+ "source_commit": "adaa418"
 }
