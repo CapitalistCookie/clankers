@@ -28,6 +28,18 @@ class FakeProc:
         self.stderr = ""
 
 
+def _tmux_resolve(target, alive):
+    """Resolve a -t target the way tmux does: `=name` matches exactly; a bare
+    name matches exactly, else by a unique prefix. None when nothing matches."""
+    s = target.split(":", 1)[0]
+    if s.startswith("="):
+        return s[1:] if s[1:] in alive else None
+    if s in alive:
+        return s
+    hits = [n for n in alive if n.startswith(s)]
+    return hits[0] if len(hits) == 1 else None
+
+
 def _fake_run(argv, **kw):
     calls.append(list(argv))
     if "has-session" in argv:
@@ -109,7 +121,7 @@ def test_remove_session_deletes_entry_and_preserves_others(startup):
     assert '"beta:' not in text
     assert '"alpha:/p/alpha"' in text      # unrelated lines preserved
     assert '"gamma:/p/gamma"' in text
-    assert any("kill-session" in c and "beta" in c for c in calls)
+    assert any("kill-session" in c and "=beta" in c for c in calls)
 
 
 def test_remove_session_not_in_startup(startup, capsys):
@@ -316,18 +328,9 @@ def test_add_session_creates_clanker_while_clanker_41_runs(startup, monkeypatch,
     keys go to `=clanker:`, never to `clanker-41`."""
     alive = ["clanker-41"]
 
-    def resolve(target):
-        s = target.split(":", 1)[0]
-        if s.startswith("="):
-            return s[1:] if s[1:] in alive else None
-        if s in alive:
-            return s
-        hits = [n for n in alive if n.startswith(s)]
-        return hits[0] if len(hits) == 1 else None
-
     def run(argv, **kw):
         calls.append(list(argv))
-        hit = resolve(argv[argv.index("-t") + 1]) if "-t" in argv else None
+        hit = _tmux_resolve(argv[argv.index("-t") + 1], alive) if "-t" in argv else None
         if "has-session" in argv:
             return FakeProc(0 if hit else 1)
         if "new-session" in argv:
@@ -341,3 +344,27 @@ def test_add_session_creates_clanker_while_clanker_41_runs(startup, monkeypatch,
     assert ["tmux", "has-session", "-t", "=clanker"] in calls
     keys = [c for c in calls if "send-keys" in c]
     assert len(keys) == 2 and all(c[c.index("-t") + 1] == "=clanker:" for c in keys)
+
+
+def test_remove_session_never_kills_a_prefix_match(startup, monkeypatch):
+    """A bare `kill-session -t clanker` prefix-matches: with no `clanker`
+    running, `clanker tmux remove clanker` killed `clanker-41`. The `=name`
+    target matches exactly, so a missing name kills nothing."""
+    alive = ["clanker-41"]
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        if "kill-session" in argv:
+            hit = _tmux_resolve(argv[argv.index("-t") + 1], alive)
+            if not hit:
+                return FakeProc(1)
+            alive.remove(hit)
+        return FakeProc(0)
+
+    monkeypatch.setattr(tmux_manager.subprocess, "run", run)
+    tmux_manager.write_startup({"clanker": "/p/clanker", "clanker-41": "/p/c41"})
+    tmux_manager.remove_session("clanker")
+    assert alive == ["clanker-41"]
+    assert ["tmux", "kill-session", "-t", "=clanker"] in calls
+    text = startup.read_text()
+    assert '"clanker:' not in text and '"clanker-41:/p/c41"' in text

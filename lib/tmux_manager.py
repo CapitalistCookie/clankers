@@ -210,7 +210,9 @@ def resurrect(dry_run=False, sync_registry=False):
 
 def remove_session(name):
     """Remove a tmux session and its startup entry."""
-    subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+    # "=name" is exact (2026-09-24): a bare target prefix-matches, so removing
+    # a `clanker` that was not running killed a running `clanker-41`.
+    subprocess.run(["tmux", "kill-session", "-t", f"={name}"], capture_output=True)
     print(f"Killed tmux session (if it existed): {name}")
     entries = startup_entries()
     if name in entries:

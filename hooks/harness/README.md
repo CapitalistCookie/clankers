@@ -67,7 +67,13 @@ These hooks moved out of this directory on 2026-09-24.
 
 ## Clanker sync
 
-CAUTION: `clanker sync --apply` and `clanker sync --pin` copy the files in `~/projects/clanker/hooks/harness/` over the files in this directory. Until that directory gets the 2026-09-24 rewire, a sync puts back the old dispatcher, the old gates, and the retired scripts. The old dispatcher then blocks some Bash commands, because it calls a script that is not here.
+`clanker sync` manages the files that `~/projects/clanker/hooks/harness/MANIFEST.md` lists. They include the hooks in `clanker-dist/`. The clanker repo got the 2026-09-24 rewire in commit 68428ac.
+
+- To change a managed file, edit the copy in the clanker repo. Then run `clanker sync --apply`.
+- `clanker sync --check` compares each installed file with the repo copy.
+- The file `.clanker-sync-state.json` in this directory holds the hash of each managed file at the last apply.
+
+CAUTION: `clanker sync --apply` does not overwrite an installed file that was changed outside sync. An installed file can match neither the repo copy nor its hash in `.clanker-sync-state.json`. Then the apply installs nothing and shows the three hashes. Copy the change into the repo, or use `--force` to overwrite the installed file. `clanker sync --pin` does an apply first, so the same rule applies.
 
 ## Hook contract (Claude Code 2.1.x)
 
