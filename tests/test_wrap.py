@@ -38,7 +38,8 @@ res = {"type": "result", "subtype": "success", "is_error": mode == "error", "num
        "total_cost_usd": 0.0123, "duration_api_ms": 900,
        "usage": {"input_tokens": 10, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 200,
                  "output_tokens": 5},
-       "modelUsage": {"claude-haiku-4-5-20251001": {"costUSD": 0.0123}},
+       "modelUsage": {os.environ.get("FAKE_MODEL", "claude-haiku-4-5-20251001"): {"costUSD": 0.0023},
+                      **({"claude-haiku-4-5-20251001": {"costUSD": 0.01}} if os.environ.get("FAKE_MODEL") else {})},
        "permission_denials": []}
 fmt = sys.argv[sys.argv.index("--output-format") + 1] if "--output-format" in sys.argv else "text"
 if fmt == "stream-json":
@@ -284,3 +285,13 @@ def test_generic_command_returns_its_own_exit_code(fake):
     assert run_cli(["sh", "-c", "exit 3"], fake["env"]).returncode == 3
     r = run_cli(["--timeout", "5", "true"], fake["env"])
     assert r.returncode == 2 and "claude calls only" in r.stderr
+
+
+def test_row_keeps_the_pinned_model_when_a_small_model_costs_more(fake):
+    env = dict(fake["env"], FAKE_MODEL="claude-sonnet-5")
+    r = run_cli(["--caller", "w", "--model", "claude-sonnet-5", "--effort", "medium", "--", "-p", "x"], env)
+    assert r.returncode == 0, r.stderr
+    [row] = rows(fake["data"])
+    assert row["model"] == "claude-sonnet-5"
+    assert row["models_cost_usd"] == {"claude-sonnet-5": 0.0023, "claude-haiku-4-5-20251001": 0.01}
+    assert "model=claude-sonnet-5 +claude-haiku-4-5-20251001=$0.0100" in r.stderr

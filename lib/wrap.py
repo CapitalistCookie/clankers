@@ -336,7 +336,11 @@ def build_row(plan: dict, result: dict | None, *, rc: int, timed_out: bool, wall
     result = result or {}
     u = result.get("usage") or {}
     model_usage = result.get("modelUsage") or {}
-    models = sorted(model_usage, key=lambda m: -float((model_usage[m] or {}).get("costUSD") or 0))
+    by_cost = {m: round(float((v or {}).get("costUSD") or 0), 6) for m, v in model_usage.items()}
+    # The pinned model is the session's model; Claude Code may also bill a small
+    # model inside a run (seen: Haiku next to a pinned Sonnet during WebSearch).
+    main_model = plan["model"] if (plan["model"] in by_cost or not by_cost) else \
+        max(by_cost, key=by_cost.get)
     cost = result.get("total_cost_usd")
     if timed_out:
         outcome = "timeout"
@@ -355,8 +359,9 @@ def build_row(plan: dict, result: dict | None, *, rc: int, timed_out: bool, wall
         "entrypoint": "sdk-cli",
         "wrap": True,
         "caller": plan["caller"],
-        "model": models[0] if models else plan["model"],
+        "model": main_model,
         "model_requested": plan["model"],
+        "models_cost_usd": by_cost,
         "effort": plan["effort"],
         "user_layer": plan["user_layer"],
         "duration_s": int(round(wall_s)),
@@ -568,7 +573,9 @@ def run_wrap(*, tokens: list[str], model=None, effort=None, max_cost=None, max_t
         print(f"[clanker wrap] telemetry row not written: {e}", file=err)
     if not quiet:
         cost_s = f"${float(cost):.4f}" if cost is not None else "n/a"
-        print(f"[clanker wrap] caller={plan['caller']} model={row['model']} "
+        others = {m: c for m, c in row["models_cost_usd"].items() if m != row["model"]}
+        extra = "".join(f" +{m}=${c:.4f}" for m, c in sorted(others.items()))
+        print(f"[clanker wrap] caller={plan['caller']} model={row['model']}{extra} "
               f"effort={plan['effort']} rc={rc} turns={row['num_turns']} cost={cost_s} "
               f"wall={wall:.1f}s", file=err)
     return rc

@@ -1044,7 +1044,9 @@ def main():
             '  clanker wrap --caller nightly --model claude-haiku-4-5-20251001 --effort low -- -p "Reply with exactly: OK"\n'
             '  clanker wrap --caller batch --model claude-sonnet-5 --effort medium --timeout 900 \\\n'
             '      -- claude -p --output-format json --tools "" < prompt.txt\n'
-            '  clanker wrap make test          # generic: session tracking only'))
+            '  clanker wrap make test          # generic: session tracking only\n'
+            'note: put the prompt right after -p, or on stdin. claude list options (--allowedTools,\n'
+            '--tools, --add-dir) take every word after them, a prompt included.'))
     p.add_argument('--caller', help='caller name: telemetry tag, CLANKER_WRAP_CALLER, and the run dir $CLANKER_DATA/run/<caller> (default: current dir name)')
     p.add_argument('--model', help='model to pin (required for claude, here or as claude --model)')
     p.add_argument('--effort', choices=['low', 'medium', 'high', 'xhigh', 'max'],
