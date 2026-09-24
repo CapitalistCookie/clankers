@@ -208,7 +208,7 @@ def load_registry(path):
 
 
 def project_roots():
-    """CLANKER_PROJECT_ROOTS, colon-separated, default ~/projects (lib/projects.py)."""
+    """CLANKER_PROJECT_ROOTS, colon-separated, default ~/projects, as the CLI reads it."""
     out = []
     for r in os.environ.get("CLANKER_PROJECT_ROOTS", "~/projects").split(":"):
         r = r.strip()
@@ -254,8 +254,8 @@ def git_checkout(real):
 
 def discovered_repos():
     """{main repo real path: name} for the git repos directly under each project
-    root (a root that is itself a repo counts as one): lib/projects.py
-    scan_projects, which clanker's Registry.projects unions with the yaml."""
+    root (a root that is itself a repo counts as one): the CLI's scan_projects,
+    which clanker's Registry.projects unions with the yaml."""
     found = {}
     for root in project_roots():
         if not os.path.isdir(root):

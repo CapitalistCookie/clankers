@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SessionEnd metrics hook. Fail-OPEN: a telemetry failure must never surface
-# as a session error, so no `set -e` — guards on every fallible substitution.
+# as a session error, so no `set -e`; every substitution that can fail is guarded.
 #
 # Telemetry truth (2026-09-24, design audit proposal 1):
 # - Claude Code writes one transcript line per content block, each carrying the
@@ -15,17 +15,21 @@
 # - The project comes from the registry the way session-start.sh resolves it:
 #   `projects:` paths, then git repos directly under the project roots, then the
 #   git checkout's name. The old `from projects import` never resolved in the
-#   installed copy (hooks/lib does not exist there), so every session outside
-#   ~/projects was logged as "global": 274 rows from one registered build
-#   repo that lives on a data volume behind a ~/projects symlink.
+#   installed copy, beside which no module directory was ever installed, so
+#   every session outside ~/projects was logged as "global": 274 rows from one
+#   registered build repo that lives on a data volume behind a ~/projects symlink.
 # - A scripted `claude -p` run (CLAUDE_CODE_ENTRYPOINT=sdk-cli, in the env or
 #   on the transcript's lines) is tagged nested: true.
-# - The hook reads no other file of this repo. The limit-signature catalog is
+# - The hook imports no module of this repo. The limit-signature catalog is
 #   inlined: its source, the subagent auto-resume detector, was retired the
 #   same day, and the fallback the installed copy used held 7 of its 17
 #   signatures. The handoff writer is gone: its import of the handoff module
-#   pointed at a lib directory that never existed on the installed side, so
-#   it had not run since 07-19.
+#   pointed at a module directory that never existed on the installed side,
+#   so it had not run since 07-19.
+# - last_assistant_line comes from last-assistant-msg.py, the helper the Stop
+#   gates share. sync installs it in ~/.claude/hooks, the parent of this
+#   hook's clanker-dist directory. Without it, this hook's own transcript pass
+#   supplies the line.
 set -uo pipefail
 
 CLANKER_DATA="${CLANKER_DATA:-/data/clanker}"
@@ -63,11 +67,15 @@ find /tmp -maxdepth 1 -name "clanker-session-*" -mmin +5 -delete 2>/dev/null || 
 # Extract metrics using Python
 OUTFILE="$SESSIONS_DIR/$(date -u +%Y-%m-%d).jsonl"
 
-export TRANSCRIPT SESSION_ID CWD END_REASON
+# The helper the Stop gates share, one level up: for this hook in
+# ~/.claude/hooks/clanker-dist that is ~/.claude/hooks/last-assistant-msg.py.
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LAST_MSG_HELPER="$HOOK_DIR/../last-assistant-msg.py"
+export TRANSCRIPT SESSION_ID CWD END_REASON LAST_MSG_HELPER
 
-# -I: isolated (no user site, no PYTHON* env); the block imports stdlib only.
+# -I: isolated (no user site, no PYTHON* env); the block imports standard modules only.
 python3 -I -u << 'PYEOF' | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null
-import itertools, json, sys, os, re
+import itertools, json, os, re, subprocess, sys
 from datetime import datetime, timezone
 from collections import Counter, deque
 
@@ -160,7 +168,7 @@ def load_registry(path):
 
 
 def project_roots():
-    """CLANKER_PROJECT_ROOTS, colon-separated, default ~/projects (lib/projects.py)."""
+    """CLANKER_PROJECT_ROOTS, colon-separated, default ~/projects, as the CLI reads it."""
     out = []
     for r in os.environ.get("CLANKER_PROJECT_ROOTS", "~/projects").split(":"):
         r = r.strip()
@@ -206,8 +214,8 @@ def git_checkout(real):
 
 def discovered_repos():
     """{main repo real path: name} for the git repos directly under each project
-    root (a root that is itself a repo counts as one): lib/projects.py
-    scan_projects, which clanker's Registry.projects unions with the yaml."""
+    root (a root that is itself a repo counts as one): the CLI's scan_projects,
+    which clanker's Registry.projects unions with the yaml."""
     found = {}
     for root in project_roots():
         if not os.path.isdir(root):
@@ -529,6 +537,19 @@ tokens, main_cost, api_calls = totals(calls)
 ctx = [calls[k][1] + calls[k][3] + calls[k][4] for k in ctx_per_call if k in calls]
 first_call_ctx = ctx[0] if ctx else None
 peak_ctx = max(ctx) if ctx else None
+
+# The last assistant line: from the helper the Stop gates share when it is
+# installed, else from the pass above.
+_helper = os.environ.get("LAST_MSG_HELPER", "")
+if _helper and os.path.isfile(_helper):
+    try:
+        _out = subprocess.run([sys.executable, "-I", _helper, transcript_path],
+                              capture_output=True, encoding="utf-8", errors="replace",
+                              timeout=10).stdout
+        if _out.strip():
+            last_assistant_text = _out.strip()
+    except Exception:
+        pass
 
 # ---- subagent transcripts --------------------------------------------------------
 # <transcript dir>/<session>/subagents/, nested levels included (workflow runs

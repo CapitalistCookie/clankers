@@ -143,10 +143,10 @@ def test_duration_capped_at_write_wall_clock_raw(tmp_path):
     assert rec2["duration_s"] == rec2["wall_clock_s"] == 600
 
 
-def test_no_handoff_and_no_lib_or_sibling_file(tmp_path):
+def test_no_handoff_and_no_lib(tmp_path):
     """The handoff writer imported lib/handoff.py from a lib directory that
     never existed on the installed side (dead since 07-19) and is removed. The
-    hook reads no other file of the repo, so `clanker sync` ships it alone."""
+    hook names no lib at all, so `clanker sync` ships it without the lib set."""
     name = f"p9repo-{uuid.uuid4().hex[:8]}"
     repo = tmp_path / name
     repo.mkdir()
@@ -160,9 +160,40 @@ def test_no_handoff_and_no_lib_or_sibling_file(tmp_path):
                            f"{name}-handoff.md")
     assert not os.path.exists(handoff)
     src = open(HOOK).read()
-    for gone in ("../lib", "CLANKER_LIB", "HOOK_DIR", "handoff import", "generate_handoff",
-                 "subagent-resume-detect", "importlib"):
+    for gone in ("lib", "handoff import", "generate_handoff", "subagent-resume-detect",
+                 "importlib"):
         assert gone not in src, gone
+
+
+def test_last_assistant_line_comes_from_the_helper_one_level_up(tmp_path):
+    """sync installs last-assistant-msg.py (the helper the Stop gates share) in
+    ~/.claude/hooks and this hook in ~/.claude/hooks/clanker-dist, so the hook
+    finds it one level up. The helper also reads an assistant record whose
+    content is a plain string, which the hook's own pass skips: the last line
+    of this transcript shows which of the two answered."""
+    import shutil
+    hooks = tmp_path / "hooks"
+    dist = hooks / "clanker-dist"
+    dist.mkdir(parents=True)
+    shutil.copy(HOOK, dist / "session-end.sh")
+    text = _transcript_lines() + json.dumps(
+        {"type": "assistant", "timestamp": "2026-07-22T05:12:00Z",
+         "message": {"role": "assistant", "content": "Plain string reply."}}) + "\n"
+
+    def last_line():
+        sid = _sid("helper")
+        tp = tmp_path / f"{sid}.jsonl"
+        tp.write_text(text)
+        r = subprocess.run(["bash", str(dist / "session-end.sh")], capture_output=True,
+                           text=True, timeout=60, env=_hook_env(tmp_path),
+                           input=json.dumps({"session_id": sid, "transcript_path": str(tp),
+                                             "cwd": str(tmp_path), "reason": "other"}))
+        assert r.returncode == 0, r.stderr
+        return _read_rows(sid)[-1]["last_assistant_line"]
+
+    assert last_line() == "Fixed the auth test and pushed."    # no helper: own pass
+    shutil.copy(os.path.join(os.path.dirname(HOOK), "harness", "last-assistant-msg.py"), hooks)
+    assert last_line() == "Plain string reply."                # the installed helper
 
 
 # ── Telemetry truth + nested tag + registry attribution (2026-09-24) ─────────
