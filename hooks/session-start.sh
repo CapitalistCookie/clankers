@@ -5,7 +5,11 @@
 #   clanker: <project> · <archetype> · <branch>@<short-sha> · <N> dirty
 #   NOW: <STATUS.md "## NOW" section: first ≤800 B, cut at a line boundary;
 #        no NOW heading -> first ≤600 B of the file; no STATUS.md -> no line>
-#   state: STATUS.md (<bytes> B) · index: <first router file> · alerts: <N> open for this project (`clanker alert list`)
+#   state: STATUS.md (<bytes> B) · NOW edited <N> commits / <age> ago · index: <first router file> · alerts: <N> open for this project (`clanker alert list`)
+#          (the NOW part: git's last commit that touched STATUS.md, how many
+#          commits HEAD is past it and how long ago it was; "+ uncommitted
+#          edits" when the file changed since; "NOW never committed" when no
+#          commit has it; nothing outside git)
 #   git: <git log --oneline -3, one per line>
 # Over budget: the NOW block is cut first, then git drops to one line.
 # Registered: a `projects:` entry in the registry, or a git repo directly under
@@ -32,8 +36,9 @@
 # CLANKER_PROJECT (read by skill-tracker.sh) and CLANKER_ARCHETYPE.
 #
 # PERF: one python3 interpreter started with -I (isolated: skips the user
-# site's .pth files, the bulk of interpreter start-up here), no jq, two git
-# calls, and a single pass over the alert dir for the count.
+# site's .pth files, the bulk of interpreter start-up here), no jq, four git
+# calls (status, log -3, and log -1 + rev-list --count for STATUS.md), and a
+# single pass over the alert dir for the count.
 # FAIL-OPEN: every piece is guarded; whatever lines succeeded are emitted and
 # the script always exits 0.
 # FAIL-VISIBLE (2026-09-24): a guarded step that fails, and a python run that
@@ -585,9 +590,11 @@ if quiet:
     sys.exit(0)
 clanker_line = "clanker: " + (f"{project} · {archetype}" if project
                               else f"unregistered · {base or '?'}")
-log3 = []
+log3, st = [], None
 try:
-    st = git(root, "status", "--porcelain=v2", "--branch")
+    # relativePaths off: porcelain v2 paths are then relative to the repo top
+    # (the NOW staleness check below finds STATUS.md by that path)
+    st = git(root, "-c", "status.relativePaths=false", "status", "--porcelain=v2", "--branch")
     if st is not None:
         branch, sha, dirty = "?", "?", 0
         for ln in st.splitlines():
@@ -623,6 +630,30 @@ try:
 except Exception as e:
     hook_err(1, "STATUS.md NOW", e)
 
+# NOW staleness (design audit proposal 10): the last commit that touched
+# STATUS.md, how many commits HEAD is past it, and how long ago it was.
+now_age = ""
+try:
+    if status_size is not None and st is not None:
+        rel = os.path.relpath(os.path.join(root, "STATUS.md"), top or root)
+        st_lines = st.splitlines()
+        if "? " + rel in st_lines:                        # untracked
+            now_age = "NOW never committed"
+        else:
+            lg1 = git(root, "log", "-1", "--format=%H%x09%cr", "--", "STATUS.md")
+            if lg1 is not None and not lg1.strip():
+                now_age = "NOW never committed"
+            elif lg1:
+                h, cr = lg1.strip().split("\t", 1)
+                n = (git(root, "rev-list", "--count", f"{h}..HEAD") or "").strip()
+                if n.isdigit():
+                    now_age = f"NOW edited {n} commit{'' if n == '1' else 's'} / {cr}"
+                    if any(ln[:2] in ("1 ", "2 ", "u ")
+                           and ln.split("\t")[0].rsplit(" ", 1)[-1] == rel for ln in st_lines):
+                        now_age += " + uncommitted edits"
+except Exception as e:
+    hook_err(1, "NOW staleness (git log / rev-list)", e)
+
 index = "none"
 try:
     index = next((f for f in INDEX_FILES if os.path.isfile(os.path.join(root, f))), "none")
@@ -635,6 +666,7 @@ except Exception as e:
     n_alerts = "? (unreadable)"
 state_line = ("state: " + (f"STATUS.md ({status_size} B)" if status_size is not None
                            else "no STATUS.md")
+              + (f" · {now_age}" if now_age else "")
               + f" · index: {index} · alerts: {n_alerts} (`clanker alert list`)")
 
 

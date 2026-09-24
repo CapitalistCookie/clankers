@@ -94,6 +94,7 @@
   "lib/schedules.py",
   "lib/serve.py",
   "lib/serve_user.py",
+  "lib/skills_audit.py",
   "lib/synccmd.py",
   "lib/sysmon_sampler.py",
   "lib/tmux_manager.py",
@@ -159,6 +160,7 @@
   "tests/test_session_end.py",
   "tests/test_session_registry.py",
   "tests/test_session_start.py",
+  "tests/test_skills_audit.py",
   "tests/test_spa_js.py",
   "tests/test_synccmd.py",
   "tests/test_tmux_manager.py",
@@ -167,5 +169,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "9b0a89f"
+ "source_commit": "404b8d2"
 }

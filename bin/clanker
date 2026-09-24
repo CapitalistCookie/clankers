@@ -537,6 +537,39 @@ def cmd_skills(args):
     from advanced import skill_effectiveness
     skill_effectiveness(last_days=args.last)
 
+def cmd_skills_audit(args):
+    """Skill listing cost (description bytes) against use, per repo; verdict never/stale/active."""
+    import json as _json
+    import harness_lint
+    from skills_audit import audit, render, default_claude_json
+    projects = harness_lint.load_projects(harness_lint.default_registry_path())
+    if args.repos:
+        unknown = [r for r in args.repos if r not in projects and r != 'user']
+        if unknown:
+            print(f"skills audit: unknown repo(s): {', '.join(unknown)} (clanker registry list)", file=sys.stderr)
+            return 1
+        projects = {n: p for n, p in projects.items() if n in args.repos}
+    rows = audit(harness_lint.default_claude_dir(), projects, harness_lint.default_data_dir(),
+                 default_claude_json(), stale_days=args.stale_days)
+    if args.repos and 'user' not in args.repos:
+        rows = [r for r in rows if r['repo'] != '(user)']
+    if args.verdict:
+        rows = [r for r in rows if r['verdict'] == args.verdict]
+    print(_json.dumps(rows, indent=1) if args.json else render(rows, args.stale_days))
+    return 0
+
+def cmd_skills_hide(args):
+    """Write skillOverrides into <repo>/.claude/settings.local.json."""
+    import harness_lint
+    from skills_audit import hide
+    projects = harness_lint.load_projects(harness_lint.default_registry_path())
+    path = projects.get(args.repo) or (os.path.abspath(os.path.expanduser(args.repo))
+                                       if os.path.isdir(os.path.expanduser(args.repo)) else None)
+    if not path:
+        print(f"skills hide: unknown repo {args.repo!r} (a registry name or a directory)", file=sys.stderr)
+        return 1
+    return hide(path, args.skills, mode=args.mode, dry_run=args.dry_run)
+
 def cmd_export(args):
     from advanced import export_harness
     export_harness(args.output)
@@ -950,9 +983,28 @@ def main():
     p = sub.add_parser('snapshot', help='Harness version snapshot')
     p.set_defaults(func=cmd_harness_snapshot)
 
-    p = sub.add_parser('skills', help='Skill effectiveness analysis')
-    p.add_argument('--last', type=int, default=30)
+    p = sub.add_parser('skills', help='Skill usage (default); `skills audit`: listing cost vs use per repo; `skills hide`: skillOverrides in a repo')
+    p.add_argument('--last', type=int, default=30, help='usage report: days to look back')
     p.set_defaults(func=cmd_skills)
+    ssub = p.add_subparsers(dest='skills_action')
+    sp = ssub.add_parser('audit', help='per repo: skill, description bytes, uses (tracker + Claude Code), last use, verdict never/stale/active',
+                         description='Join the skill inventory (~/.claude/skills and every repo .claude/skills) to '
+                                     '$CLANKER_DATA/raw/skills and ~/.claude.json skillUsage. Verdict: never (no use), '
+                                     'stale (last use > --stale-days), active.')
+    sp.add_argument('repos', nargs='*', help='limit to these registry projects (and `user` for ~/.claude/skills)')
+    sp.add_argument('--stale-days', type=int, default=90, help='days without use before a skill is stale (default 90)')
+    sp.add_argument('--verdict', choices=['never', 'stale', 'active'], help='show only this verdict')
+    sp.add_argument('--json', action='store_true')
+    sp.set_defaults(func=cmd_skills_audit)
+    sp = ssub.add_parser('hide', help='write skillOverrides {"<skill>": "off"} into <repo>/.claude/settings.local.json (merge; create)',
+                         description='Hide skills from the listing in one repo. Modes (Claude Code 2.1.280): off = hidden from '
+                                     'model and /name; user-invocable-only = hidden from the model, /name works; name-only = '
+                                     'listed without description; on = default. Warns when settings.local.json is not gitignored.')
+    sp.add_argument('repo', help='registry project name or repo directory')
+    sp.add_argument('skills', nargs='+', help='skill name(s)')
+    sp.add_argument('--mode', choices=['off', 'user-invocable-only', 'name-only', 'on'], default='off')
+    sp.add_argument('--dry-run', action='store_true', help='print the merged file; write nothing')
+    sp.set_defaults(func=cmd_skills_hide)
 
     p = sub.add_parser('export', help='Export harness state')
     p.add_argument('--output', help='Output tarball path')

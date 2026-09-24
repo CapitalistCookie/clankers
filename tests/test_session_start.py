@@ -14,6 +14,7 @@ payload's cwd decides, and CLAUDE_CODE_ENTRYPOINT so the run is interactive.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -107,8 +108,10 @@ def test_real_oversized_status_is_capped(env):
     assert lines[0].endswith(" · 0 dirty")
     assert lines[1].startswith("NOW: ")
     size = os.path.getsize(REAL_STATUS)
-    assert (f"state: STATUS.md ({size} B) · index: none · "
-            "alerts: 0 open for this project (`clanker alert list`)") in lines
+    state = [ln for ln in lines if ln.startswith("state: ")]
+    assert len(state) == 1 and re.fullmatch(
+        rf"state: STATUS\.md \({size} B\) · NOW edited 0 commits / \d+ seconds? ago · "
+        r"index: none · alerts: 0 open for this project \(`clanker alert list`\)", state[0])
     assert lines[-1].startswith("git: ") and "add status" in lines[-1]
 
 
@@ -333,3 +336,57 @@ def test_linked_worktree_briefs_its_project_from_its_own_tree(env, tmp_path):
     assert lines[0].startswith("clanker: alpha · research · feature@")
     assert lines[0].endswith(" · 1 dirty")
     assert lines[1] == "NOW: - worktree tree"
+
+
+def _state(ctx):
+    return next(ln for ln in ctx.splitlines() if ln.startswith("state: "))
+
+
+def test_state_line_says_how_stale_now_is(env, tmp_path):
+    """Proposal 10: the state line names the last commit that touched
+    STATUS.md, how many commits HEAD is past it, and how long ago it was."""
+    proj = _repo(env.projects / "alpha", subjects=("init",))
+    (proj / "STATUS.md").write_text("# STATUS\n\n## NOW\n- first\n")
+    ctx, _ = _run(env, proj)                                     # untracked
+    assert " · NOW never committed · index: " in _state(ctx)
+    _git(proj, "add", "STATUS.md")
+    _git(proj, "commit", "-q", "-m", "status")
+    for s in ("a", "b", "c"):
+        _git(proj, "commit", "-q", "--allow-empty", "-m", s)
+    ctx, _ = _run(env, proj)
+    assert re.search(r" · NOW edited 3 commits / \d+ seconds? ago · index: ", _state(ctx)), ctx
+    _git(proj, "commit", "-q", "--allow-empty", "-m", "d")
+    (proj / "STATUS.md").write_text("# STATUS\n\n## NOW\n- second\n")    # edited, not committed
+    ctx, _ = _run(env, proj)
+    assert re.search(r" · NOW edited 4 commits / \d+ seconds? ago \+ uncommitted edits · ",
+                     _state(ctx)), ctx
+    _git(proj, "commit", "-q", "-am", "status again")
+    ctx, _ = _run(env, proj)
+    assert re.search(r" · NOW edited 0 commits / ", _state(ctx)), ctx
+    _git(proj, "commit", "-q", "--allow-empty", "-m", "e")
+    ctx, _ = _run(env, proj)
+    assert " · NOW edited 1 commit / " in _state(ctx)             # singular
+    plain = env.projects / "plain"                                # not a git repo
+    plain.mkdir()
+    (plain / "STATUS.md").write_text("# STATUS\n\n## NOW\n- x\n")
+    ctx, _ = _run(env, plain)
+    assert "NOW edited" not in ctx and "never committed" not in ctx
+    assert _state(ctx).startswith("state: STATUS.md (")
+
+
+def test_state_line_for_a_project_inside_a_bigger_repo(env, tmp_path):
+    """A registry path below the repo top: STATUS.md is found by its path
+    from the top in `git status`, and git log runs from the project dir."""
+    outer = _repo(tmp_path / "outer", subjects=("init",))
+    inner = outer / "sub" / "alpha"
+    inner.mkdir(parents=True)
+    env.reg.write_text("projects:\n  alpha:\n    archetype: research\n"
+                       f"    path: {inner}\n")
+    (inner / "STATUS.md").write_text("# STATUS\n\n## NOW\n- inner\n")
+    _git(outer, "add", "-A")
+    _git(outer, "commit", "-q", "-m", "inner status")
+    _git(outer, "commit", "-q", "--allow-empty", "-m", "later")
+    (inner / "STATUS.md").write_text("# STATUS\n\n## NOW\n- inner, edited\n")
+    ctx, _ = _run(env, inner)
+    assert re.search(r" · NOW edited 1 commit / \d+ seconds? ago \+ uncommitted edits · ",
+                     _state(ctx)), ctx
