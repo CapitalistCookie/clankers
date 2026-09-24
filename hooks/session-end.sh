@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 # SessionEnd metrics hook. Fail-OPEN: a telemetry failure must never surface
 # as a session error, so no `set -e` — guards on every fallible substitution.
+#
+# Telemetry truth (2026-09-24, design audit proposal 1):
+# - Claude Code writes one transcript line per content block, each carrying the
+#   whole message's usage, so summing every line counted tokens ~2.15x. Usage
+#   now counts once per assistant message id (the largest value of each field:
+#   subagent transcripts carry partial output_tokens on all but the last line).
+# - Subagent transcripts (<transcript dir>/<session>/subagents/**/agent-*.jsonl)
+#   are read into subagent_tokens / subagent_cost_usd, beside the main figures
+#   rather than folded into them.
+# - Each message is priced at its own model's rate (table below), with 1-hour
+#   cache writes at 2x input and 5-minute writes at 1.25x.
+# - The project comes from the registry the way session-start.sh resolves it:
+#   `projects:` paths, then git repos directly under the project roots, then the
+#   git checkout's name. The old `from projects import` never resolved in the
+#   installed copy (hooks/lib does not exist there), so every session outside
+#   ~/projects was logged as "global": 274 rows from one registered build
+#   repo that lives on a data volume behind a ~/projects symlink.
+# - A scripted `claude -p` run (CLAUDE_CODE_ENTRYPOINT=sdk-cli, in the env or
+#   on the transcript's lines) is tagged nested: true.
 set -uo pipefail
 
 CLANKER_DATA="${CLANKER_DATA:-/data/clanker}"
@@ -30,7 +49,7 @@ if [ -f "$DEDUP_FILE" ]; then
         exit 0
     fi
 fi
-touch "$DEDUP_FILE"
+touch "$DEDUP_FILE" 2>/dev/null
 
 # Clean up old dedup files (>5 min)
 find /tmp -maxdepth 1 -name "clanker-session-*" -mmin +5 -delete 2>/dev/null || true
@@ -38,15 +57,15 @@ find /tmp -maxdepth 1 -name "clanker-session-*" -mmin +5 -delete 2>/dev/null || 
 # Extract metrics using Python
 OUTFILE="$SESSIONS_DIR/$(date -u +%Y-%m-%d).jsonl"
 
-# Expose the repo's lib/ so the hook resolves a session's project the SAME way
-# the dashboard does (git-aware: worktrees collapse, repos outside ~/projects work).
+# CLANKER_LIB serves the handoff import below; the metrics block needs no lib.
 HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLANKER_LIB="$HOOK_DIR/../lib"
 export TRANSCRIPT SESSION_ID CWD CLANKER_LIB HOOK_DIR END_REASON
 
-python3 -u << 'PYEOF' | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null
-import json, sys, os
-from datetime import datetime
+# -I: isolated (no user site, no PYTHON* env); the block imports stdlib only.
+python3 -I -u << 'PYEOF' | flock "$OUTFILE.lock" tee -a "$OUTFILE" > /dev/null
+import itertools, json, sys, os, re
+from datetime import datetime, timezone
 from collections import Counter, deque
 
 transcript_path = os.environ.get("TRANSCRIPT", "")
@@ -57,18 +76,304 @@ cwd = os.environ.get("CWD", "")
 if not transcript_path:
     sys.exit(0)
 
-# Determine project from cwd via the shared git-aware resolver. Falls back to the
-# legacy ~/projects-only rule if lib/ isn't importable, so logging never breaks.
+HOME = os.path.expanduser("~")
+REGISTRY = os.environ.get("CLANKER_REGISTRY") or os.path.join(HOME, "projects", ".clanker.yaml")
+
+# ---- project resolution -------------------------------------------------------
+# Byte-identical in session-start.sh and session-end.sh: the stub row and the
+# final row must name one project (tests/test_session_end.py compares them).
+KEY_RE = re.compile(r"""^(['"]?)(.+?)\1:(?:[ \t]+(.*))?$""")
+
+
+def unquote(v):
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1]
+    return v
+
+
+def load_registry(path):
+    """({name: {archetype, path}}, {alias: name}) from the registry's `projects:`
+    and `aliases:` blocks; (None, {}) when there is no registry file. registry.py
+    writes block-style YAML, read here line by line: no PyYAML (python3 -I keeps
+    the user site out), and far cheaper. An alias whose value is a mapping
+    rather than a name is ignored."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None, {}
+    projects, aliases = {}, {}
+    sec, cur, name_ind, key_ind = None, None, None, None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        ind = len(raw) - len(raw.lstrip(" "))
+        if ind == 0:
+            sec = s[:-1] if s in ("projects:", "aliases:") else None
+            cur, name_ind, key_ind = None, None, None
+            continue
+        if sec is None:
+            continue
+        if name_ind is None:
+            name_ind = ind
+        if ind < name_ind:
+            continue
+        if ind == name_ind:
+            m = KEY_RE.match(s)
+            cur, key_ind = (m.group(2) if m else None), None
+            if cur is None:
+                continue
+            if sec == "projects":
+                projects[cur] = {}
+            else:
+                v = unquote(m.group(3))
+                if v and v not in ("null", "~") and v[0] not in "{[|>&*!":
+                    aliases[cur] = v
+            continue
+        if sec != "projects" or cur is None:
+            continue
+        if key_ind is None:
+            key_ind = ind
+        if ind != key_ind:
+            continue                                  # continuation of a long value
+        m = re.match(r"^(archetype|path):\s*(.*)$", s)
+        if m:
+            v = unquote(m.group(2))
+            if v and v not in ("null", "~"):
+                projects[cur][m.group(1)] = v
+    if not projects and re.search(r"(?m)^projects:[ \t]*\S", text):
+        try:                                          # flow style: needs PyYAML
+            import site
+            sys.path.append(site.getusersitepackages())
+            import yaml
+            for k, v in ((yaml.safe_load(text) or {}).get("projects") or {}).items():
+                v = v if isinstance(v, dict) else {}
+                projects[str(k)] = {kk: str(v[kk]) for kk in ("archetype", "path") if v.get(kk)}
+        except Exception:
+            pass
+    return projects, aliases
+
+
+def project_roots():
+    """CLANKER_PROJECT_ROOTS, colon-separated, default ~/projects (lib/projects.py)."""
+    out = []
+    for r in os.environ.get("CLANKER_PROJECT_ROOTS", "~/projects").split(":"):
+        r = r.strip()
+        if r:
+            out.append(os.path.abspath(os.path.expanduser(r)))
+    return out
+
+
+def git_checkout(real):
+    """(top, main) for a real path inside a git checkout: top holds the `.git`
+    entry, main is the main repository's directory (a linked worktree resolves
+    to the repository it belongs to). (None, None) outside git. Reads the
+    filesystem only: no git process."""
+    p = real
+    while p:
+        g = os.path.join(p, ".git")
+        if os.path.isdir(g):
+            return p, p
+        if os.path.isfile(g):
+            main = p
+            try:
+                with open(g, encoding="utf-8", errors="replace") as f:
+                    first = f.readline().strip()
+                if first.startswith("gitdir:"):
+                    gd = os.path.realpath(os.path.join(p, first[len("gitdir:"):].strip()))
+                    common = gd
+                    try:
+                        with open(os.path.join(gd, "commondir"), encoding="utf-8") as f:
+                            common = os.path.realpath(os.path.join(gd, f.read().strip()))
+                    except OSError:
+                        pass
+                    if os.path.basename(common) == ".git":
+                        main = os.path.dirname(common)
+            except OSError:
+                pass
+            return p, main
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return None, None
+
+
+def discovered_repos():
+    """{main repo real path: name} for the git repos directly under each project
+    root (a root that is itself a repo counts as one): lib/projects.py
+    scan_projects, which clanker's Registry.projects unions with the yaml."""
+    found = {}
+    for root in project_roots():
+        if not os.path.isdir(root):
+            continue
+        if os.path.isdir(os.path.join(root, ".git")):
+            kids = [root]
+        else:
+            try:
+                kids = [os.path.join(root, c) for c in sorted(os.listdir(root))]
+            except OSError:
+                continue
+        for k in kids:
+            if os.path.isdir(os.path.join(k, ".git")):
+                main = os.path.realpath(k)
+                found.setdefault(main, os.path.basename(main))
+    return found
+
+
+def resolve_project(cwd, reg, aliases):
+    """(name, kind, path, top, main) for a working directory. kind:
+      registry   - inside a `projects:` entry's path (its `path:`, else
+                   ~/projects/<name>), or in a linked worktree of that repo
+      discovered - inside a git repo directly under a project root, or in a
+                   linked worktree of one
+      name       - no path matched, but the directory's name is a registry name
+      repo       - any other git checkout, named after its main repository
+      dir        - a non-git directory directly under a project root that is not $HOME
+      global     - none of these
+    The innermost matching path wins; registry beats discovered on a tie. path
+    is the matched project's real path (registry/discovered), top and main come
+    from git_checkout. Registry aliases apply to the returned name."""
+    if not cwd:
+        return "global", "global", None, None, None
+    real = os.path.realpath(cwd)
+    top, main = git_checkout(real)
+    reg = reg or {}
+    cands = []
+
+    def consider(rp, prio, name, kind):
+        if real == rp or real.startswith(rp.rstrip(os.sep) + os.sep):
+            cands.append((len(rp), prio, name, rp, kind))
+        elif main and top and main == rp:
+            cands.append((len(top), prio, name, rp, kind))
+
+    for n, meta in reg.items():
+        consider(os.path.realpath(os.path.expanduser(
+            meta.get("path") or os.path.join(HOME, "projects", n))), 2, n, "registry")
+    for rp, n in discovered_repos().items():
+        consider(rp, 1, n, "discovered")
+    path = None
+    if cands:
+        _, _, name, path, kind = max(cands)
+    elif os.path.basename(os.path.normpath(cwd)) in reg:
+        name, kind = os.path.basename(os.path.normpath(cwd)), "name"
+    elif main:
+        name, kind = os.path.basename(main), "repo"
+    else:
+        name, kind = "global", "global"
+        ab = os.path.abspath(os.path.expanduser(cwd))
+        for root in project_roots():
+            if root == HOME or ab == root:
+                continue
+            if ab.startswith(root + os.sep):
+                seg = ab[len(root):].lstrip(os.sep).split(os.sep)[0]
+                if seg:
+                    name, kind = seg, "dir"
+                    break
+    hops = 0
+    while name in aliases and hops < 5:
+        name, hops = aliases[name], hops + 1
+    return name, kind, path, top, main
+# ---- end of project resolution ------------------------------------------------
+
 project = "global"
 try:
-    sys.path.insert(0, os.environ.get("CLANKER_LIB", ""))
-    from projects import resolve_project
-    project = resolve_project(cwd)
+    _reg, _aliases = load_registry(REGISTRY)
+    project = resolve_project(cwd, _reg, _aliases)[0]
 except Exception:
-    _projects_root = os.path.expanduser("~/projects/")
-    if _projects_root in cwd:
-        project = cwd.split(_projects_root)[-1].split("/")[0]
+    pass
 
+# ---- pricing ------------------------------------------------------------------
+# $/MTok: (input, output, cache read, 5-minute cache write, 1-hour cache write).
+# Source: the claude-api skill bundled with Claude Code 2.1.280, read
+# 2026-09-24 (shared/models.md, shared/model-migration.md,
+# shared/prompt-caching.md). 5-minute writes are 1.25x input and 1-hour writes
+# 2x input on every model. Reads are 0.1x input, except Fable 5.1 ($0.25,
+# 0.025x) and Opus 5.5 ($0.20, 0.05x). The table this replaced priced every
+# write at 1.25x, Fable 5.1 reads at $1.00, Sonnet 5 at $3/$15, and a whole
+# session at its dominant model's rate.
+PRICES = {
+    "claude-fable-5-1":  (10.0, 50.0, 0.25, 12.50, 20.0),
+    "claude-fable-5":    (10.0, 50.0, 1.00, 12.50, 20.0),
+    "claude-opus-5-5":   (4.0, 20.0, 0.20, 5.00, 8.0),
+    "claude-opus-5":     (5.0, 25.0, 0.50, 6.25, 10.0),
+    "claude-opus-4-8":   (5.0, 25.0, 0.50, 6.25, 10.0),
+    "claude-opus-4-7":   (5.0, 25.0, 0.50, 6.25, 10.0),
+    "claude-opus-4-6":   (5.0, 25.0, 0.50, 6.25, 10.0),
+    "claude-sonnet-5":   (2.0, 10.0, 0.20, 2.50, 4.0),
+    "claude-sonnet-4-6": (3.0, 15.0, 0.30, 3.75, 6.0),
+    "claude-haiku-4-5":  (1.0, 5.0, 0.10, 1.25, 2.0),
+}
+# An id outside the table is priced by family; the Mythos 5.1 cache-read rate
+# is unconfirmed, so Mythos takes Fable 5.1's. Anything else: Sonnet 5.
+FAMILY = (("fable", "claude-fable-5-1"), ("mythos", "claude-fable-5-1"),
+          ("opus", "claude-opus-5"), ("sonnet", "claude-sonnet-5"),
+          ("haiku", "claude-haiku-4-5"))
+
+
+def price_for(model):
+    m = (model or "").lower().split("[")[0].strip()
+    i = m.find("claude-")
+    m = m[i:] if i >= 0 else m
+    keys = [k for k in PRICES if m == k or m.startswith(k + "-")]
+    if keys:
+        return PRICES[max(keys, key=len)]
+    for fam, k in FAMILY:
+        if fam in m:
+            return PRICES[k]
+    return PRICES["claude-sonnet-5"]
+
+
+def _n(v):
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def note_usage(calls, key, model, usage):
+    """Record one transcript line's usage under its message key. Lines of one
+    message repeat its usage; keep each field's largest value."""
+    cc = usage.get("cache_creation")
+    cc = cc if isinstance(cc, dict) else {}
+    vals = [_n(usage.get("input_tokens")), _n(usage.get("output_tokens")),
+            _n(usage.get("cache_read_input_tokens")),
+            _n(usage.get("cache_creation_input_tokens")),
+            _n(cc.get("ephemeral_1h_input_tokens"))]
+    row = calls.get(key)
+    if row is None:
+        calls[key] = [model] + vals
+    else:
+        for i, v in enumerate(vals, 1):
+            if v > row[i]:
+                row[i] = v
+
+
+SEQ = itertools.count()
+
+
+def message_key(obj, msg):
+    """The API message id; the request id or line uuid when a line has none."""
+    return msg.get("id") or obj.get("requestId") or obj.get("uuid") or ("line", next(SEQ))
+
+
+def totals(calls):
+    """(tokens dict, cost USD, api calls) over deduplicated calls."""
+    t = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+    cost = 0.0
+    for model, i, o, cr, cc, cc1h in calls.values():
+        t["input"] += i
+        t["output"] += o
+        t["cache_read"] += cr
+        t["cache_create"] += cc
+        pin, pout, pcr, p5m, p1h = price_for(model)
+        cc1h = min(cc1h, cc)
+        cost += (i * pin + o * pout + cr * pcr + (cc - cc1h) * p5m + cc1h * p1h) / 1e6
+    return t, cost, len(calls)
+
+# ---- main transcript -----------------------------------------------------------
 tool_uses = Counter()
 error_tools = Counter()
 errors = 0
@@ -78,13 +383,13 @@ subagent_count = 0
 first_ts = None
 last_ts = None
 claude_version = None
+entrypoint = None
 model_counter = Counter()
 flags = []
 last_assistant_text = None
 tail_lines = deque(maxlen=40)   # raw tail for failure-signature scan (P6)
-
-# Token tracking
-tokens = {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}
+calls = {}                      # message key -> [model, in, out, cache_read, cache_create, 1h part]
+ctx_per_call = []               # context size of each API call, in transcript order
 
 # Track tool_use IDs for error attribution
 tool_id_to_name = {}
@@ -101,6 +406,8 @@ try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(obj, dict):
+                continue
 
             ts = obj.get("timestamp")
             if ts and not first_ts:
@@ -110,6 +417,8 @@ try:
 
             if not claude_version:
                 claude_version = obj.get("version")
+            if not entrypoint and obj.get("entrypoint"):
+                entrypoint = obj.get("entrypoint")
 
             msg_type = obj.get("type")
 
@@ -117,15 +426,16 @@ try:
                 msg = obj.get("message", {})
                 if isinstance(msg, dict):
                     m = msg.get("model")
-                    if m:
-                        model_counter[m] += 1
-                    # Extract token usage
                     usage = msg.get("usage")
-                    if isinstance(usage, dict):
-                        tokens["input"] += usage.get("input_tokens", 0)
-                        tokens["output"] += usage.get("output_tokens", 0)
-                        tokens["cache_read"] += usage.get("cache_read_input_tokens", 0)
-                        tokens["cache_create"] += usage.get("cache_creation_input_tokens", 0)
+                    # One API call per message id; "<synthetic>" lines are
+                    # Claude Code's own notices, not calls.
+                    if isinstance(usage, dict) and m != "<synthetic>":
+                        mkey = message_key(obj, msg)
+                        if mkey not in calls:
+                            if m:
+                                model_counter[m] += 1
+                            ctx_per_call.append(mkey)
+                        note_usage(calls, mkey, m, usage)
 
                     for item in msg.get("content", []):
                         if isinstance(item, dict) and item.get("type") == "tool_use":
@@ -212,6 +522,52 @@ except Exception as e:
     # Log error but don't fail the hook
     sys.stderr.write(f"clanker session-end: {e}\n")
 
+tokens, main_cost, api_calls = totals(calls)
+ctx = [calls[k][1] + calls[k][3] + calls[k][4] for k in ctx_per_call if k in calls]
+first_call_ctx = ctx[0] if ctx else None
+peak_ctx = max(ctx) if ctx else None
+
+# ---- subagent transcripts --------------------------------------------------------
+# <transcript dir>/<session>/subagents/, nested levels included (workflow runs
+# keep theirs under subagents/workflows/<run>/). Only agent-*.jsonl are agent
+# transcripts; a workflow's journal.jsonl carries no usage. Lines without
+# "usage" and "assistant" are skipped unparsed: 308 MB of subagent transcripts
+# (the largest session on 2026-09-24) read in about 2 s.
+sub_calls = {}
+try:
+    sub_dir = os.path.join(os.path.splitext(transcript_path)[0], "subagents")
+    if os.path.isdir(sub_dir):
+        for dp, _dn, fns in os.walk(sub_dir):
+            for fn in fns:
+                if not (fn.startswith("agent-") and fn.endswith(".jsonl")):
+                    continue
+                try:
+                    with open(os.path.join(dp, fn), "rb") as sf:
+                        for raw in sf:
+                            if b'"usage"' not in raw or b'"assistant"' not in raw:
+                                continue
+                            try:
+                                obj = json.loads(raw)
+                            except ValueError:
+                                continue
+                            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                                continue
+                            msg = obj.get("message")
+                            if not isinstance(msg, dict):
+                                continue
+                            usage, m = msg.get("usage"), msg.get("model")
+                            if isinstance(usage, dict) and m != "<synthetic>":
+                                note_usage(sub_calls, message_key(obj, msg), m, usage)
+                except OSError:
+                    continue
+except Exception as e:
+    sys.stderr.write(f"clanker session-end (subagents): {e}\n")
+subagent_tokens, sub_cost, subagent_api_calls = totals(sub_calls)
+
+if not entrypoint:
+    entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT") or None
+nested = (os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "sdk-cli") or (entrypoint == "sdk-cli")
+
 # Calculate duration
 duration_s = 0
 if first_ts and last_ts:
@@ -255,34 +611,14 @@ elif sum(tool_uses.values()) == 0:
 elif errors > sum(tool_uses.values()) * 0.5:
     outcome = "abandoned"
 
-# Resolve dominant model + per-model pricing ($/M tokens: in, out, cache_read, cache_write)
-# Rates re-verified 2026-07-05 against the claude-api reference: Fable 5 $10/$50,
-# Opus 4.8 $5/$25, Sonnet 5 $3/$15, Haiku 4.5 $1/$5; cache read ~0.1x input,
-# cache write ~1.25x input. (Old table had Opus-4.1-era $15/$75, Haiku-3.5-era
-# $0.8/$4, and priced Fable at sonnet rates — a 3-10x cost underestimate.)
+# Dominant model: the one that served the most API calls.
 model = model_counter.most_common(1)[0][0] if model_counter else None
-_PRICING = {"fable": (10.0, 50.0, 1.00, 12.50),
-            "opus": (5.0, 25.0, 0.50, 6.25),
-            "sonnet": (3.0, 15.0, 0.30, 3.75),
-            "haiku": (1.0, 5.0, 0.10, 1.25)}
-_ml = (model or "").lower()
-if "fable" in _ml or "mythos" in _ml:
-    _pin, _pout, _pcr, _pcw = _PRICING["fable"]
-elif "opus" in _ml:
-    _pin, _pout, _pcr, _pcw = _PRICING["opus"]
-elif "haiku" in _ml:
-    _pin, _pout, _pcr, _pcw = _PRICING["haiku"]
-else:  # sonnet + unknown -> sonnet-tier mid estimate
-    _pin, _pout, _pcr, _pcw = _PRICING["sonnet"]
-estimated_cost = round(
-    tokens["input"] / 1e6 * _pin + tokens["output"] / 1e6 * _pout +
-    tokens["cache_read"] / 1e6 * _pcr + tokens["cache_create"] / 1e6 * _pcw, 2)
 
 # Build output
 top_files = [f for f, _ in files_touched.most_common(50)]
 
 record = {
-    "timestamp": datetime.now(tz=__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "timestamp": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "session_id": session_id,
     "project": project,
     "cwd": cwd,
@@ -305,8 +641,17 @@ record = {
     "failure_reason": failure_reason,
     "last_assistant_line": " ".join(last_assistant_text.split())[:200] if last_assistant_text else None,
     "flags": flags,
+    # Main transcript only, one count per API call; subagents are below.
     "tokens": tokens,
-    "estimated_cost_usd": estimated_cost,
+    "estimated_cost_usd": round(main_cost, 2),
+    "api_calls": api_calls,
+    "first_call_ctx": first_call_ctx,
+    "peak_ctx": peak_ctx,
+    "subagent_tokens": subagent_tokens,
+    "subagent_cost_usd": round(sub_cost, 2),
+    "subagent_api_calls": subagent_api_calls,
+    "entrypoint": entrypoint,
+    "nested": nested,
 }
 
 print(json.dumps(record))

@@ -113,35 +113,45 @@ def test_weekly_digest_prints_memory_debt_even_with_no_sessions(monkeypatch, cap
     assert "Memory debt" not in capsys.readouterr().out
 
 
-def test_gc_expires_alerts_on_their_own_age_not_mtime(gc_env):
+def _iso_ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _put_alert(adir, name, alert, mtime_days_ago=0.0, raw=None):
+    p = adir / f"{name}.json"
+    p.write_text(raw if raw is not None else json.dumps(alert))
+    t = time.time() - mtime_days_ago * 86400
+    os.utime(p, (t, t))
+    return p
+
+
+def test_gc_expires_alerts_on_their_newest_raise(gc_env):
     """2026-09-24: gc expired on mtime alone while the escalation pass rewrote
-    every alert every 15 minutes, so nothing ever expired. Age now comes from
-    first_seen, else created, else ts; mtime only when none exists."""
+    every alert every 15 minutes, so nothing ever expired. Then it keyed on
+    first_seen, which expired standing alerts their producers re-raise every
+    15 minutes. Expiry now keys on the newest raise: timestamp, else ts, else
+    first_seen; mtime only when none exists. `created` is a birth time."""
     _write_lint(gc_env["lint"])
     adir = gc_env["alerts"]
     os.makedirs(adir, exist_ok=True)
-    now = datetime.now(timezone.utc)
+    put, iso = (lambda *a, **k: _put_alert(adir, *a, **k)), _iso_ago
 
-    def iso(days):
-        return (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    def put(name, alert, mtime_days_ago=0.0, raw=None):
-        p = adir / f"{name}.json"
-        p.write_text(raw if raw is not None else json.dumps(alert))
-        t = time.time() - mtime_days_ago * 86400
-        os.utime(p, (t, t))
-
+    put("standing-reraised", {"first_seen": iso(20), "timestamp": iso(0.01)})
+    put("stale-raise", {"first_seen": iso(20), "timestamp": iso(8)})
+    put("timestamp-beats-ts-and-first", {"timestamp": iso(1), "ts": time.time() - 30 * 86400,
+                                         "first_seen": iso(30)}, 30)
+    put("ts-beats-first", {"ts": time.time() - 86400, "first_seen": iso(30)}, 30)
     put("old-first-fresh-mtime", {"first_seen": iso(10)})
     put("fresh-first-old-mtime", {"first_seen": iso(1)}, 30)
-    put("first-beats-created", {"first_seen": iso(1), "created": iso(30)}, 30)
-    put("created-old", {"created": iso(9)})
+    put("created-is-not-a-raise", {"created": iso(9)})          # falls through to mtime
     put("ts-epoch-old", {"ts": time.time() - 8 * 86400})
     put("no-fields-old-mtime", {"message": "x"}, 10)
     put("no-fields-fresh", {"message": "x"}, 1)
     put("corrupt-old", None, 10, raw="{nope")
-    expire = {"old-first-fresh-mtime", "created-old", "ts-epoch-old",
+    expire = {"stale-raise", "old-first-fresh-mtime", "ts-epoch-old",
               "no-fields-old-mtime", "corrupt-old"}
-    keep = {"fresh-first-old-mtime", "first-beats-created", "no-fields-fresh"}
+    keep = {"standing-reraised", "timestamp-beats-ts-and-first", "ts-beats-first",
+            "fresh-first-old-mtime", "created-is-not-a-raise", "no-fields-fresh"}
 
     dry = cleanup.run_gc(dry_run=True)
     assert dry["alerts_expired"] == len(expire)
@@ -151,3 +161,26 @@ def test_gc_expires_alerts_on_their_own_age_not_mtime(gc_env):
     left = {p.stem for p in adir.glob("*.json")}
     assert results["alerts_expired"] == len(expire)
     assert keep <= left and not (left & expire)
+
+    # the escalation clock is still first_seen: 20 ignored days, not 0
+    alerts._escalate_ignored(days=999)
+    standing = json.loads((adir / "standing-reraised.json").read_text())
+    assert standing["ignored_days"] == 20
+
+
+def test_gc_judges_its_own_weekly_raise_after_raising_it(gc_env):
+    """gc re-raises memory-doctor (and schedules-orphaned) once a week, in a
+    step after the old expiry step: the week-old raise expired first and the
+    re-raise came back as a new alert, first_seen reset. Expiry now runs last."""
+    _write_lint(gc_env["lint"], fail_pattern="projA")
+    adir = gc_env["alerts"]
+    os.makedirs(adir, exist_ok=True)
+    born = _iso_ago(30)
+    _put_alert(adir, "memory-doctor", {"id": "memory-doctor", "severity": "warning",
+                                       "first_seen": born, "timestamp": _iso_ago(7.01),
+                                       "message": "memory doctor FAILING"}, 7.01)
+    results = cleanup.run_gc()
+    assert results["alerts_expired"] == 0
+    a = json.loads((adir / "memory-doctor.json").read_text())
+    assert a["first_seen"] == born                 # the same alert, not a reborn one
+    assert a["timestamp"] > _iso_ago(0.01)         # raised by this run

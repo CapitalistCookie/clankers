@@ -159,3 +159,204 @@ def test_handoff_carries_last_activity_line(tmp_path):
     text = open(handoff).read()
     assert "**Last activity:** Fixed the auth test and pushed." in text
     assert "**Branch:**" in text                     # git section still present
+
+
+# ── Telemetry truth + nested tag + registry attribution (2026-09-24) ─────────
+
+def _asst(mid, model, usage, block, entrypoint="cli"):
+    """One transcript line of an assistant message: Claude Code writes a line
+    per content block, every line carrying the whole message's usage."""
+    return json.dumps({"type": "assistant", "timestamp": "2026-09-24T00:00:00Z",
+                       "entrypoint": entrypoint, "uuid": uuid.uuid4().hex,
+                       "requestId": "req_" + mid,
+                       "message": {"id": mid, "model": model, "role": "assistant",
+                                   "usage": usage, "content": [block]}})
+
+
+def _txt(s):
+    return {"type": "text", "text": s}
+
+
+def _usage(i, o, cr, cc, split=None):
+    u = {"input_tokens": i, "output_tokens": o, "cache_read_input_tokens": cr,
+         "cache_creation_input_tokens": cc}
+    if split:
+        u["cache_creation"] = {"ephemeral_5m_input_tokens": split.get("5m", 0),
+                               "ephemeral_1h_input_tokens": split.get("1h", 0)}
+    return u
+
+
+def _hook_env(tmp_path, **extra):
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDE_CODE_ENTRYPOINT", "CLANKER_INJECT_NESTED", "CLAUDE_PROJECT_DIR",
+                        "CLAUDE_ENV_FILE", "CLANKER_REGISTRY", "CLANKER_PROJECT_ROOTS")}
+    env["HOME"] = str(tmp_path)
+    env.update(extra)
+    return env
+
+
+def _end(tmp_path, sid, transcript_text, cwd, env, subagents=None):
+    """Run session-end.sh on a transcript (plus files under its subagents dir)
+    and return the row it wrote."""
+    tp = tmp_path / f"{sid}.jsonl"
+    tp.write_text(transcript_text)
+    for rel, text in (subagents or {}).items():
+        p = tmp_path / sid / "subagents" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+    payload = json.dumps({"session_id": sid, "transcript_path": str(tp), "cwd": str(cwd),
+                          "reason": "other"})
+    r = subprocess.run(["bash", HOOK], input=payload, capture_output=True, text=True,
+                       env=env, timeout=60)
+    assert r.returncode == 0, r.stderr
+    rows = _read_rows(sid)
+    assert rows, f"no row for {sid}: {r.stderr}"
+    return rows[-1]
+
+
+def test_usage_counts_once_per_message_and_subagents_apart(tmp_path):
+    """Two content-block lines per message used to count every token twice; a
+    message is now counted once, priced at its own model's rate, and subagent
+    transcripts (subagents/**/agent-*.jsonl) land in their own fields."""
+    A = _usage(10_000, 200_000, 1_000_000, 3_000_000, {"1h": 3_000_000})
+    B = _usage(20_000, 300_000, 5_000_000, 400_000, {"5m": 400_000})
+    C = _usage(5_000, 100_000, 2_000_000, 1_000_000)             # no split: 5-minute
+    main = [
+        _asst("msg_A", "claude-fable-5-1", A, {"type": "thinking", "thinking": ""}),
+        _asst("msg_A", "claude-fable-5-1", A, _txt("reading the repo")),
+        _asst("msg_B", "claude-fable-5-1", B, _txt("running the suite")),
+        _asst("msg_B", "claude-fable-5-1", B, {"type": "tool_use", "id": "toolu_1",
+                                               "name": "Bash", "input": {"command": "ls"}}),
+        *[_asst("msg_C", "claude-opus-5-5", C, _txt(f"part {n}")) for n in range(5)],
+        json.dumps({"type": "assistant", "timestamp": "2026-09-24T00:00:01Z",
+                    "message": {"id": "msg_syn", "model": "<synthetic>",
+                                "usage": _usage(0, 0, 0, 0), "content": [_txt("No response requested.")]}}),
+    ]
+    s1 = [_asst("msg_S1", "claude-opus-5-5", _usage(200, o, 0, 3_711_700, {"5m": 3_711_700}), _txt("x"))
+          for o in (700, 700, 119_000)]                          # partial output until the last line
+    s2 = [_asst("msg_S2", "claude-sonnet-5", _usage(10_000, 100_000, 1_000_000, 200_000,
+                                                    {"1h": 200_000}), _txt("y"))] * 2
+    decoy = [_asst("msg_J", "claude-fable-5-1", _usage(9, 9, 9, 9), _txt("journal"))]
+    rec = _end(tmp_path, _sid("dedupe"), "\n".join(main) + "\n", tmp_path, _hook_env(tmp_path),
+               subagents={"agent-a1.jsonl": "\n".join(s1) + "\n",
+                          "agent-a1.meta.json": "{}",
+                          "workflows/wf_1/agent-a2.jsonl": "\n".join(s2) + "\n",
+                          "workflows/wf_1/journal.jsonl": "\n".join(decoy) + "\n"})
+    assert rec["tokens"] == {"input": 35_000, "output": 600_000,
+                             "cache_read": 8_000_000, "cache_create": 4_400_000}
+    assert rec["api_calls"] == 3
+    # A 70.35 (1h writes at $20) + B 21.45 (5m at $12.50) + C 7.42 (Opus 5.5 rates)
+    assert rec["estimated_cost_usd"] == 99.22
+    assert rec["model"] == "claude-fable-5-1"          # 2 calls beat 1 call on 5 lines
+    assert rec["first_call_ctx"] == 4_010_000 and rec["peak_ctx"] == 5_420_000
+    assert rec["subagent_tokens"] == {"input": 10_200, "output": 219_000,
+                                      "cache_read": 1_000_000, "cache_create": 3_911_700}
+    assert rec["subagent_api_calls"] == 2
+    assert rec["subagent_cost_usd"] == 22.96           # S1 20.9393 + S2 2.02
+    assert rec["tool_uses"] == {"Bash": 1} and rec["subagent_count"] == 0
+
+
+def _exec_block(start_marker, end_marker, hook=HOOK):
+    """The hook's own python between two markers, executed into a namespace."""
+    text = open(hook).read()
+    body = text[text.index(start_marker):text.index(end_marker)]
+    ns = {}
+    exec(compile("import itertools, os, re, sys\n" + body, hook, "exec"), ns)
+    return ns
+
+
+def test_price_table_is_the_documented_one():
+    """$/MTok (input, output, cache read, 5-minute write, 1-hour write) from the
+    claude-api skill bundled with Claude Code 2.1.280 (shared/models.md,
+    model-migration.md, prompt-caching.md): writes 1.25x / 2x input; reads
+    0.1x input except Fable 5.1 ($0.25) and Opus 5.5 ($0.20)."""
+    price_for = _exec_block("# ---- pricing", "# ---- main transcript")["price_for"]
+    assert price_for("claude-fable-5-1") == (10.0, 50.0, 0.25, 12.50, 20.0)
+    assert price_for("claude-fable-5") == (10.0, 50.0, 1.00, 12.50, 20.0)
+    assert price_for("claude-opus-5-5") == (4.0, 20.0, 0.20, 5.00, 8.0)
+    assert price_for("claude-opus-5-5[1m]") == (4.0, 20.0, 0.20, 5.00, 8.0)
+    assert price_for("claude-opus-5") == (5.0, 25.0, 0.50, 6.25, 10.0)
+    assert price_for("claude-opus-4-8") == (5.0, 25.0, 0.50, 6.25, 10.0)
+    assert price_for("claude-sonnet-5") == (2.0, 10.0, 0.20, 2.50, 4.0)
+    assert price_for("claude-haiku-4-5-20251001") == (1.0, 5.0, 0.10, 1.25, 2.0)
+    assert price_for("us.anthropic.claude-sonnet-4-6") == (3.0, 15.0, 0.30, 3.75, 6.0)
+    assert price_for("claude-fable-6") == price_for("claude-fable-5-1")    # family
+    assert price_for("something-else") == price_for("claude-sonnet-5")
+
+
+def test_nested_tag_from_env_or_transcript(tmp_path):
+    """Every scripted `claude -p` runs with CLAUDE_CODE_ENTRYPOINT=sdk-cli and
+    writes that entrypoint on its transcript lines; either marks the row."""
+    def rec(env_entry, line_entry):
+        line = json.loads(_asst("msg_n", "claude-sonnet-5", _usage(1, 1, 0, 0), _txt("ok")))
+        if line_entry is None:
+            line.pop("entrypoint")
+        else:
+            line["entrypoint"] = line_entry
+        extra = {"CLAUDE_CODE_ENTRYPOINT": env_entry} if env_entry else {}
+        return _end(tmp_path, _sid("nested"), json.dumps(line) + "\n", tmp_path,
+                    _hook_env(tmp_path, **extra))
+    r = rec("sdk-cli", "cli")
+    assert r["nested"] is True and r["entrypoint"] == "cli"
+    r = rec("cli", "sdk-cli")
+    assert r["nested"] is True and r["entrypoint"] == "sdk-cli"
+    r = rec("cli", "cli")
+    assert r["nested"] is False and r["entrypoint"] == "cli"
+    r = rec(None, None)
+    assert r["nested"] is False and r["entrypoint"] is None
+
+
+def test_resolution_block_is_identical_in_both_hooks():
+    start = open(START_HOOK).read()
+    end = open(HOOK).read()
+
+    def block(t):
+        a = t.index("# ---- project resolution ---")
+        b = t.index("# ---- end of project resolution ---")
+        return t[a:b]
+    assert block(start) == block(end)
+
+
+def _git_init(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True, capture_output=True)
+    return path
+
+
+def test_start_and_end_name_the_same_project_the_registry_way(tmp_path):
+    """211 of 268 "global" rows were one registered repo living on a data
+    volume behind a ~/projects symlink: the hook's lib import never resolved
+    in the installed copy. Both hooks now resolve like the registry does."""
+    home = tmp_path / "home"
+    root = home / "projects"
+    root.mkdir(parents=True)
+    build = _git_init(tmp_path / "vol" / "build" / "bigrepo")          # the data-volume repo
+    (root / "bigrepo").symlink_to(build)
+    _git_init(root / "newrepo")                                        # discovered only
+    outer = _git_init(home / "outer")                                  # a repo holding a registered subdir
+    (outer / "sub" / "inner").mkdir(parents=True)
+    oldname = _git_init(tmp_path / "elsewhere" / "Old-Name")           # aliased git repo
+    (root / "plain" / "deep").mkdir(parents=True)                      # non-git dir under the root
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    reg = tmp_path / "registry.yaml"
+    reg.write_text("projects:\n"
+                   "  bigrepo:\n    archetype: tool\n"
+                   f"  inner:\n    archetype: research\n    path: {outer / 'sub' / 'inner'}\n"
+                   "aliases:\n  Old-Name: bigrepo\n"
+                   "  mapping-by-mistake:\n    archetype: tool\n")
+    env = _hook_env(tmp_path, HOME=str(home), CLANKER_REGISTRY=str(reg),
+                    CLANKER_PROJECT_ROOTS=str(root))
+    cases = {build / "src": "bigrepo", root / "bigrepo": "bigrepo", root / "newrepo": "newrepo",
+             outer / "sub" / "inner": "inner", outer: "outer", oldname: "bigrepo",
+             root / "plain" / "deep": "plain", loose: "global"}
+    (build / "src").mkdir()
+    for cwd, want in cases.items():
+        sid = _sid("attr")
+        subprocess.run(["bash", START_HOOK], env=env, capture_output=True, text=True, timeout=60,
+                       input=json.dumps({"session_id": sid, "cwd": str(cwd), "source": "startup"}))
+        line = _asst("msg_r", "claude-sonnet-5", _usage(1, 1, 0, 0), _txt("ok"))
+        final = _end(tmp_path, sid, line + "\n", cwd, env)
+        rows = _read_rows(sid)
+        assert rows[0]["outcome"] == "open", rows
+        assert (rows[0]["project"], final["project"]) == (want, want), (str(cwd), rows)

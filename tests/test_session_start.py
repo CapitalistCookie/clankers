@@ -8,8 +8,9 @@ additionalContext is at most 1,200 bytes, shaped
 The hook it replaced pasted `head -30 STATUS.md` (19.9 KB on one repo) and
 spawned two jq per alert file (9.8 s per start over ~1,100 alerts).
 
-Hermetic: HOME, CLANKER_DATA, CLANKER_REGISTRY and CLAUDE_ENV_FILE all point
-into tmp_path; CLAUDE_PROJECT_DIR is dropped so the payload's cwd decides.
+Hermetic: HOME, CLANKER_DATA, CLANKER_REGISTRY, CLANKER_PROJECT_ROOTS and
+CLAUDE_ENV_FILE all point into tmp_path; CLAUDE_PROJECT_DIR is dropped so the
+payload's cwd decides, and CLAUDE_CODE_ENTRYPOINT so the run is interactive.
 """
 import json
 import os
@@ -59,11 +60,14 @@ def env(tmp_path):
                    "    notes: a long note that wraps\n      path: not-a-key\n"
                    "  hl-aster-arb:\n    archetype: research\n"
                    "aliases:\n  Alpha-Old: alpha\n")
+    # CLAUDE_CODE_ENTRYPOINT is dropped too: a suite run from a scripted
+    # `claude -p` inherits sdk-cli, which (by design) silences the brief.
     e = {k: v for k, v in os.environ.items()
-         if k not in ("CLAUDE_PROJECT_DIR", "CLAUDE_ENV_FILE")}
+         if k not in ("CLAUDE_PROJECT_DIR", "CLAUDE_ENV_FILE", "CLAUDE_CODE_ENTRYPOINT",
+                      "CLANKER_INJECT_NESTED")}
     envfile = tmp_path / "claude-env"
     e.update(HOME=str(home), CLANKER_DATA=str(data), CLANKER_REGISTRY=str(reg),
-             CLAUDE_ENV_FILE=str(envfile))
+             CLAUDE_ENV_FILE=str(envfile), CLANKER_PROJECT_ROOTS=str(home / "projects"))
     return SimpleNamespace(home=home, data=data, reg=reg, env=e, envfile=envfile,
                            projects=home / "projects")
 
@@ -257,3 +261,75 @@ def test_clear_hands_previous_transcript_to_session_end(env, tmp_path):
     assert finals and finals[-1]["outcome"] != "open"       # session-end's full row
     stubs = [r for r in rows if r.get("session_id") == new_id]
     assert stubs and stubs[0]["outcome"] == "open" and stubs[0]["source"] == "clear"
+
+
+# ── 2026-09-24: registry discovery, nested runs, linked worktrees ────────────
+
+def _stub_rows(env, sid):
+    rows = []
+    for f in (env.data / "raw" / "sessions").glob("*.jsonl"):
+        rows += [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+    return [r for r in rows if r.get("session_id") == sid]
+
+
+def test_git_repo_directly_under_a_root_is_registered_as_discovered(env, tmp_path):
+    """clanker's Registry.projects unions the yaml with the git repos directly
+    under each project root; the brief called those "unregistered"."""
+    proj = _repo(env.projects / "newproj")
+    ctx, _ = _run(env, proj)
+    first = ctx.splitlines()[0]
+    assert first.startswith("clanker: newproj · discovered · main@") and first.endswith(" · 0 dirty")
+    assert "export CLANKER_ARCHETYPE=discovered\n" in env.envfile.read_text()
+    # a repo on another volume, linked into the root, entered by its real path
+    real = _repo(tmp_path / "vol" / "linked")
+    (env.projects / "linked").symlink_to(real)
+    ctx, _ = _run(env, real)
+    assert ctx.splitlines()[0].startswith("clanker: linked · discovered · main@")
+    # a yaml entry keeps its declared archetype
+    ctx, _ = _run(env, _repo(env.projects / "alpha"))
+    assert ctx.splitlines()[0].startswith("clanker: alpha · research · main@")
+    # a git repo outside every root and path stays unregistered
+    ctx, _ = _run(env, _repo(tmp_path / "loose"))
+    assert ctx.splitlines()[0].startswith("clanker: unregistered · loose · main@")
+
+
+def test_nested_run_prints_no_brief_and_tags_its_stub(env):
+    """Every scripted `claude -p` carries CLAUDE_CODE_ENTRYPOINT=sdk-cli; it
+    gets no brief (exit 0, empty stdout) and a stub row tagged nested: true.
+    CLANKER_INJECT_NESTED=1 brings the brief back."""
+    proj = _repo(env.projects / "alpha")
+    for inject in ("", "1"):
+        sid = f"nested-{uuid.uuid4().hex[:10]}"
+        e = dict(env.env, CLAUDE_CODE_ENTRYPOINT="sdk-cli")
+        if inject:
+            e["CLANKER_INJECT_NESTED"] = inject
+        r = subprocess.run(["bash", HOOK], capture_output=True, text=True, env=e, timeout=60,
+                           input=json.dumps({"session_id": sid, "cwd": str(proj),
+                                             "source": "startup"}))
+        assert r.returncode == 0, r.stderr
+        if inject:
+            ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+            assert ctx.startswith("clanker: alpha · research")
+        else:
+            assert r.stdout == ""
+        stub = _stub_rows(env, sid)
+        assert len(stub) == 1 and stub[0]["nested"] is True
+        assert stub[0]["entrypoint"] == "sdk-cli" and stub[0]["project"] == "alpha"
+    sid = f"inter-{uuid.uuid4().hex[:10]}"
+    _run(env, proj, sid=sid)
+    assert _stub_rows(env, sid)[0]["nested"] is False
+
+
+def test_linked_worktree_briefs_its_project_from_its_own_tree(env, tmp_path):
+    proj = _repo(env.projects / "alpha")
+    (proj / "STATUS.md").write_text("# STATUS\n\n## NOW\n- main tree\n")
+    _git(proj, "add", "STATUS.md")
+    _git(proj, "commit", "-q", "-m", "status")
+    wt = tmp_path / "wt-alpha"
+    _git(proj, "worktree", "add", "-q", "-b", "feature", str(wt))
+    (wt / "STATUS.md").write_text("# STATUS\n\n## NOW\n- worktree tree\n")
+    ctx, _ = _run(env, wt)
+    lines = ctx.splitlines()
+    assert lines[0].startswith("clanker: alpha · research · feature@")
+    assert lines[0].endswith(" · 1 dirty")
+    assert lines[1] == "NOW: - worktree tree"

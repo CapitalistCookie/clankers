@@ -49,15 +49,21 @@ def _parse_when(v):
     return None
 
 
-def alert_birth(alert, path=None):
-    """When an alert was born: its first_seen, else created, else ts (a field
-    that does not parse counts as absent); the file's mtime only when none of
-    them gives a time. None when nothing does."""
+# When an alert was last RAISED, for gc's expiry (2026-09-24): _create_alert
+# stamps `timestamp` on every raise and keeps first_seen, so a standing alert
+# that its producer re-raises every 15 minutes stays fresh here while
+# first_seen keeps counting ignored days. `created` is a birth time, not a raise.
+RAISE_FIELDS = ("timestamp", "ts", "first_seen")
+
+
+def _time_from(alert, fields, path=None):
+    """The first of `fields` that parses (one that does not parse counts as
+    absent); the file's mtime only when none does. None when nothing does."""
     if isinstance(alert, dict):
-        for key in BIRTH_FIELDS:
-            born = _parse_when(alert.get(key))
-            if born is not None:
-                return born
+        for key in fields:
+            when = _parse_when(alert.get(key))
+            if when is not None:
+                return when
     if path:
         try:
             return datetime.fromtimestamp(os.path.getmtime(path),
@@ -65,6 +71,19 @@ def alert_birth(alert, path=None):
         except OSError:
             return None
     return None
+
+
+def alert_birth(alert, path=None):
+    """When an alert was born: its first_seen, else created, else ts (a field
+    that does not parse counts as absent); the file's mtime only when none of
+    them gives a time. None when nothing does. _escalate_ignored's clock."""
+    return _time_from(alert, BIRTH_FIELDS, path)
+
+
+def alert_last_raised(alert, path=None):
+    """When an alert was last raised: its timestamp, else ts, else first_seen;
+    the file's mtime only when none of them gives a time. gc's expiry clock."""
+    return _time_from(alert, RAISE_FIELDS, path)
 
 
 def _write_alert(path, alert):

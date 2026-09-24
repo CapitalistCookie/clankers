@@ -8,8 +8,18 @@
 #   state: STATUS.md (<bytes> B) · index: <first router file> · alerts: <N> open for this project (`clanker alert list`)
 #   git: <git log --oneline -3, one per line>
 # Over budget: the NOW block is cut first, then git drops to one line.
-# Unregistered cwd: "clanker: unregistered · <basename>". NOW/state key on
-# file existence, not on registration.
+# Registered: a `projects:` entry in the registry, or a git repo directly under
+# a project root (CLANKER_PROJECT_ROOTS, default ~/projects), which is how
+# clanker's Registry.projects discovers repos; a discovered repo takes its yaml
+# archetype when it has one, else "discovered". Anything else:
+# "clanker: unregistered · <basename>". NOW/state key on file existence, not
+# on registration.
+#
+# Nested runs (2026-09-24): every scripted `claude -p` carries
+# CLAUDE_CODE_ENTRYPOINT=sdk-cli (Claude Code sets it for any non-interactive
+# run, even one an interactive session launched), and hooks inherit it. Such a
+# run gets its stub row tagged nested: true and no brief at all;
+# CLANKER_INJECT_NESTED=1 prints the brief anyway.
 #
 # What this replaced: head -30 STATUS.md + git log -5 + alert lines (19.9 KB
 # on one repo), a briefing import whose module never shipped, a memory
@@ -121,35 +131,60 @@ def now_section(text):
     return ([suffix] if suffix else []) + body, (1 if suffix else 0)
 
 
+# ---- project resolution -------------------------------------------------------
+# Byte-identical in session-start.sh and session-end.sh: the stub row and the
+# final row must name one project (tests/test_session_end.py compares them).
+KEY_RE = re.compile(r"""^(['"]?)(.+?)\1:(?:[ \t]+(.*))?$""")
+
+
+def unquote(v):
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1]
+    return v
+
+
 def load_registry(path):
-    """{name: {archetype, path}} from the registry's `projects:` block, or None
-    when there is no registry file. registry.py writes block-style YAML, read
-    here line by line: -I keeps PyYAML (user site) out, and this is far cheaper."""
+    """({name: {archetype, path}}, {alias: name}) from the registry's `projects:`
+    and `aliases:` blocks; (None, {}) when there is no registry file. registry.py
+    writes block-style YAML, read here line by line: no PyYAML (python3 -I keeps
+    the user site out), and far cheaper. An alias whose value is a mapping
+    rather than a name is ignored."""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
     except OSError:
-        return None
-    projects, in_proj, cur, name_ind, key_ind = {}, False, None, None, None
+        return None, {}
+    projects, aliases = {}, {}
+    sec, cur, name_ind, key_ind = None, None, None, None
     for raw in text.splitlines():
         s = raw.strip()
         if not s or s.startswith("#"):
             continue
         ind = len(raw) - len(raw.lstrip(" "))
         if ind == 0:
-            in_proj, cur, name_ind, key_ind = (s == "projects:"), None, None, None
+            sec = s[:-1] if s in ("projects:", "aliases:") else None
+            cur, name_ind, key_ind = None, None, None
             continue
-        if not in_proj:
+        if sec is None:
             continue
         if name_ind is None:
             name_ind = ind
-        if ind == name_ind:
-            m = re.match(r"""^(['"]?)(.+?)\1:(?:\s+.*)?$""", s)
-            cur, key_ind = (m.group(2) if m else None), None
-            if cur is not None:
-                projects[cur] = {}
+        if ind < name_ind:
             continue
-        if cur is None or ind < name_ind:
+        if ind == name_ind:
+            m = KEY_RE.match(s)
+            cur, key_ind = (m.group(2) if m else None), None
+            if cur is None:
+                continue
+            if sec == "projects":
+                projects[cur] = {}
+            else:
+                v = unquote(m.group(3))
+                if v and v not in ("null", "~") and v[0] not in "{[|>&*!":
+                    aliases[cur] = v
+            continue
+        if sec != "projects" or cur is None:
             continue
         if key_ind is None:
             key_ind = ind
@@ -157,9 +192,7 @@ def load_registry(path):
             continue                                  # continuation of a long value
         m = re.match(r"^(archetype|path):\s*(.*)$", s)
         if m:
-            v = m.group(2).strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-                v = v[1:-1]
+            v = unquote(m.group(2))
             if v and v not in ("null", "~"):
                 projects[cur][m.group(1)] = v
     if not projects and re.search(r"(?m)^projects:[ \t]*\S", text):
@@ -172,26 +205,130 @@ def load_registry(path):
                 projects[str(k)] = {kk: str(v[kk]) for kk in ("archetype", "path") if v.get(kk)}
         except Exception:
             pass
-    return projects
+    return projects, aliases
 
 
-def match_project(reg, project_dir):
-    """(name, root) of the registered project containing project_dir: the longest
-    registered path (explicit `path:` or ~/projects/<name>) wins; else a name
-    equal to the dir's basename, root unknown; else (None, None)."""
-    real = os.path.realpath(project_dir)
-    best, best_root = None, None
-    for name, meta in reg.items():
-        rp = os.path.realpath(os.path.expanduser(
-            meta.get("path") or os.path.join(HOME, "projects", name)))
+def project_roots():
+    """CLANKER_PROJECT_ROOTS, colon-separated, default ~/projects (lib/projects.py)."""
+    out = []
+    for r in os.environ.get("CLANKER_PROJECT_ROOTS", "~/projects").split(":"):
+        r = r.strip()
+        if r:
+            out.append(os.path.abspath(os.path.expanduser(r)))
+    return out
+
+
+def git_checkout(real):
+    """(top, main) for a real path inside a git checkout: top holds the `.git`
+    entry, main is the main repository's directory (a linked worktree resolves
+    to the repository it belongs to). (None, None) outside git. Reads the
+    filesystem only: no git process."""
+    p = real
+    while p:
+        g = os.path.join(p, ".git")
+        if os.path.isdir(g):
+            return p, p
+        if os.path.isfile(g):
+            main = p
+            try:
+                with open(g, encoding="utf-8", errors="replace") as f:
+                    first = f.readline().strip()
+                if first.startswith("gitdir:"):
+                    gd = os.path.realpath(os.path.join(p, first[len("gitdir:"):].strip()))
+                    common = gd
+                    try:
+                        with open(os.path.join(gd, "commondir"), encoding="utf-8") as f:
+                            common = os.path.realpath(os.path.join(gd, f.read().strip()))
+                    except OSError:
+                        pass
+                    if os.path.basename(common) == ".git":
+                        main = os.path.dirname(common)
+            except OSError:
+                pass
+            return p, main
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return None, None
+
+
+def discovered_repos():
+    """{main repo real path: name} for the git repos directly under each project
+    root (a root that is itself a repo counts as one): lib/projects.py
+    scan_projects, which clanker's Registry.projects unions with the yaml."""
+    found = {}
+    for root in project_roots():
+        if not os.path.isdir(root):
+            continue
+        if os.path.isdir(os.path.join(root, ".git")):
+            kids = [root]
+        else:
+            try:
+                kids = [os.path.join(root, c) for c in sorted(os.listdir(root))]
+            except OSError:
+                continue
+        for k in kids:
+            if os.path.isdir(os.path.join(k, ".git")):
+                main = os.path.realpath(k)
+                found.setdefault(main, os.path.basename(main))
+    return found
+
+
+def resolve_project(cwd, reg, aliases):
+    """(name, kind, path, top, main) for a working directory. kind:
+      registry   - inside a `projects:` entry's path (its `path:`, else
+                   ~/projects/<name>), or in a linked worktree of that repo
+      discovered - inside a git repo directly under a project root, or in a
+                   linked worktree of one
+      name       - no path matched, but the directory's name is a registry name
+      repo       - any other git checkout, named after its main repository
+      dir        - a non-git directory directly under a project root that is not $HOME
+      global     - none of these
+    The innermost matching path wins; registry beats discovered on a tie. path
+    is the matched project's real path (registry/discovered), top and main come
+    from git_checkout. Registry aliases apply to the returned name."""
+    if not cwd:
+        return "global", "global", None, None, None
+    real = os.path.realpath(cwd)
+    top, main = git_checkout(real)
+    reg = reg or {}
+    cands = []
+
+    def consider(rp, prio, name, kind):
         if real == rp or real.startswith(rp.rstrip(os.sep) + os.sep):
-            if best_root is None or len(rp) > len(best_root):
-                best, best_root = name, rp
-    if best is None:
-        base = os.path.basename(os.path.normpath(project_dir))
-        if base in reg:
-            best = base
-    return best, best_root
+            cands.append((len(rp), prio, name, rp, kind))
+        elif main and top and main == rp:
+            cands.append((len(top), prio, name, rp, kind))
+
+    for n, meta in reg.items():
+        consider(os.path.realpath(os.path.expanduser(
+            meta.get("path") or os.path.join(HOME, "projects", n))), 2, n, "registry")
+    for rp, n in discovered_repos().items():
+        consider(rp, 1, n, "discovered")
+    path = None
+    if cands:
+        _, _, name, path, kind = max(cands)
+    elif os.path.basename(os.path.normpath(cwd)) in reg:
+        name, kind = os.path.basename(os.path.normpath(cwd)), "name"
+    elif main:
+        name, kind = os.path.basename(main), "repo"
+    else:
+        name, kind = "global", "global"
+        ab = os.path.abspath(os.path.expanduser(cwd))
+        for root in project_roots():
+            if root == HOME or ab == root:
+                continue
+            if ab.startswith(root + os.sep):
+                seg = ab[len(root):].lstrip(os.sep).split(os.sep)[0]
+                if seg:
+                    name, kind = seg, "dir"
+                    break
+    hops = 0
+    while name in aliases and hops < 5:
+        name, hops = aliases[name], hops + 1
+    return name, kind, path, top, main
+# ---- end of project resolution ------------------------------------------------
 
 
 def count_alerts(name):
@@ -248,6 +385,9 @@ cwd = str(hook_in.get("cwd") or "")
 source = str(hook_in.get("source") or "")
 session_id = str(hook_in.get("session_id") or "")
 project_dir = E.get("CLAUDE_PROJECT_DIR") or cwd
+entrypoint = E.get("CLAUDE_CODE_ENTRYPOINT") or ""
+nested = entrypoint == "sdk-cli"
+quiet = nested and not E.get("CLANKER_INJECT_NESTED")
 if not project_dir:
     try:
         project_dir = os.getcwd()
@@ -281,28 +421,32 @@ if source == "clear":
         pass
 
 # --- 1. project + archetype -----------------------------------------------------
-reg, project, root = None, None, None
+reg, aliases = None, {}
+resolved, kind, path, top, main = "global", "global", None, None, None
 try:
-    reg = load_registry(REGISTRY)
-    if reg:
-        project, root = match_project(reg, project_dir)
+    reg, aliases = load_registry(REGISTRY)
+    resolved, kind, path, top, main = resolve_project(project_dir, reg, aliases)
 except Exception:
-    project, root = None, None
+    pass
 base = os.path.basename(os.path.normpath(project_dir)) if project_dir else ""
+project = resolved if kind in ("registry", "discovered", "name") else None
 name = project or base
 archetype = "unknown"
 if project:
-    archetype = (reg.get(project) or {}).get("archetype") or "unknown"
-root = root or project_dir
+    archetype = ((reg or {}).get(project) or {}).get("archetype") or (
+        "discovered" if kind == "discovered" else "unknown")
+if path and top and main == path:
+    root = top            # the project's own checkout: a linked worktree keeps its tree
+elif path:
+    root = path
+else:
+    root = top or project_dir
 
 # --- 2. heartbeat stub row (P7): a session must exist in telemetry before it
 # ends; SessionEnd's full row supersedes it (last write wins in consumers). ---
 if session_id:
     try:
-        stub_project = project
-        if not stub_project:
-            pr = os.path.join(HOME, "projects") + os.sep
-            stub_project = cwd.split(pr)[-1].split(os.sep)[0] if pr in cwd else "global"
+        stub_project = resolved          # session-end.sh names the final row the same way
         sdir = os.path.join(DATA, "raw", "sessions")
         os.makedirs(sdir, exist_ok=True)
         out = os.path.join(sdir, time.strftime("%Y-%m-%d", time.gmtime()) + ".jsonl")
@@ -325,6 +469,8 @@ if session_id:
                     "cwd": cwd,
                     "outcome": "open",
                     "source": source or None,
+                    "entrypoint": entrypoint or None,
+                    "nested": nested,
                 }) + "\n")
     except Exception:
         pass
@@ -339,7 +485,9 @@ if envf and name and os.path.isfile(REGISTRY):
     except Exception:
         pass
 
-# --- 4. the brief ---------------------------------------------------------------
+# --- 4. the brief (none for a nested run) ---------------------------------------
+if quiet:
+    sys.exit(0)
 clanker_line = "clanker: " + (f"{project} · {archetype}" if project
                               else f"unregistered · {base or '?'}")
 log3 = []

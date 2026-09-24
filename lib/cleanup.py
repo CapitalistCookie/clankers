@@ -31,37 +31,7 @@ def run_gc(dry_run=False):
                 archived += 1
     results["sessions_archived"] = archived
 
-    # 2. Expire alerts older than 7 days (alerts are deleted on dismiss, so this
-    # catches stale ones). Age comes from the alert's OWN first_seen, else
-    # created, else ts; the file mtime only when none of them exists
-    # (2026-09-24). mtime alone never expired anything: the 15-minute escalation
-    # pass rewrote every alert on every run.
-    alerts_dir = os.path.join(DATA_DIR, "alerts")
-    expired = 0
-    if os.path.isdir(alerts_dir):
-        import sys as _sys
-        _lib = os.path.dirname(os.path.abspath(__file__))
-        if _lib not in _sys.path:
-            _sys.path.insert(0, _lib)
-        from alerts import alert_birth, _utcnow
-        cutoff_7 = _utcnow() - timedelta(days=7)
-        for f in os.listdir(alerts_dir):
-            if f.endswith(".json"):
-                path = os.path.join(alerts_dir, f)
-                try:
-                    with open(path) as fh:
-                        alert = json.load(fh)
-                except (OSError, ValueError):
-                    alert = {}                  # unreadable: only the mtime is left
-                born = alert_birth(alert, path)
-                if born is not None and born < cutoff_7:
-                    if not dry_run:
-                        try:
-                            os.remove(path)
-                        except FileNotFoundError:
-                            continue            # dismissed meanwhile
-                    expired += 1
-    results["alerts_expired"] = expired
+    # 2. Alert expiry runs last: see the end of this function.
 
     # 3. Archive health check logs older than 30 days
     health_dir = os.path.join(DATA_DIR, "raw/health")
@@ -206,5 +176,42 @@ def run_gc(dry_run=False):
                 pass
         except Exception as e:
             results["schedules_orphaned"] = f"error: {e}"
+
+    # 6. Expire alerts 7 days after their NEWEST raise (alerts are deleted on
+    # dismiss, so this catches stale ones): timestamp, else ts, else
+    # first_seen; the file mtime only when none of them exists (2026-09-24).
+    # mtime alone never expired anything (the 15-minute escalation pass rewrote
+    # every alert), and first_seen expired the standing alerts producers
+    # re-raise every 15 minutes: each came back the next pass with first_seen,
+    # ignored_days and escalated_at reset, and escalated again 3 days later.
+    # _escalate_ignored keeps first_seen as its clock. This step runs last so
+    # an alert raised by this run (step 5 re-raises memory-doctor and
+    # schedules-orphaned weekly) is judged on that raise, not last week's.
+    alerts_dir = os.path.join(DATA_DIR, "alerts")
+    expired = 0
+    if os.path.isdir(alerts_dir):
+        import sys as _sys
+        _lib = os.path.dirname(os.path.abspath(__file__))
+        if _lib not in _sys.path:
+            _sys.path.insert(0, _lib)
+        from alerts import alert_last_raised, _utcnow
+        cutoff_7 = _utcnow() - timedelta(days=7)
+        for f in os.listdir(alerts_dir):
+            if f.endswith(".json"):
+                path = os.path.join(alerts_dir, f)
+                try:
+                    with open(path) as fh:
+                        alert = json.load(fh)
+                except (OSError, ValueError):
+                    alert = {}                  # unreadable: only the mtime is left
+                raised = alert_last_raised(alert, path)
+                if raised is not None and raised < cutoff_7:
+                    if not dry_run:
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            continue            # dismissed meanwhile
+                    expired += 1
+    results["alerts_expired"] = expired
 
     return results
