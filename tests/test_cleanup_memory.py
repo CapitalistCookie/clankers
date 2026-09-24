@@ -8,6 +8,8 @@ the swept lint script is a planted fake; registry+roots pinned to tmp."""
 import json
 import os
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -109,3 +111,43 @@ def test_weekly_digest_prints_memory_debt_even_with_no_sessions(monkeypatch, cap
     # daily mode must NOT carry the section
     analyze.run_analysis("daily")
     assert "Memory debt" not in capsys.readouterr().out
+
+
+def test_gc_expires_alerts_on_their_own_age_not_mtime(gc_env):
+    """2026-09-24: gc expired on mtime alone while the escalation pass rewrote
+    every alert every 15 minutes, so nothing ever expired. Age now comes from
+    first_seen, else created, else ts; mtime only when none exists."""
+    _write_lint(gc_env["lint"])
+    adir = gc_env["alerts"]
+    os.makedirs(adir, exist_ok=True)
+    now = datetime.now(timezone.utc)
+
+    def iso(days):
+        return (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def put(name, alert, mtime_days_ago=0.0, raw=None):
+        p = adir / f"{name}.json"
+        p.write_text(raw if raw is not None else json.dumps(alert))
+        t = time.time() - mtime_days_ago * 86400
+        os.utime(p, (t, t))
+
+    put("old-first-fresh-mtime", {"first_seen": iso(10)})
+    put("fresh-first-old-mtime", {"first_seen": iso(1)}, 30)
+    put("first-beats-created", {"first_seen": iso(1), "created": iso(30)}, 30)
+    put("created-old", {"created": iso(9)})
+    put("ts-epoch-old", {"ts": time.time() - 8 * 86400})
+    put("no-fields-old-mtime", {"message": "x"}, 10)
+    put("no-fields-fresh", {"message": "x"}, 1)
+    put("corrupt-old", None, 10, raw="{nope")
+    expire = {"old-first-fresh-mtime", "created-old", "ts-epoch-old",
+              "no-fields-old-mtime", "corrupt-old"}
+    keep = {"fresh-first-old-mtime", "first-beats-created", "no-fields-fresh"}
+
+    dry = cleanup.run_gc(dry_run=True)
+    assert dry["alerts_expired"] == len(expire)
+    assert {p.stem for p in adir.glob("*.json")} >= expire | keep   # dry run deletes nothing
+
+    results = cleanup.run_gc()
+    left = {p.stem for p in adir.glob("*.json")}
+    assert results["alerts_expired"] == len(expire)
+    assert keep <= left and not (left & expire)

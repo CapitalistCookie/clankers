@@ -329,24 +329,4 @@ generate_handoff(os.environ.get("SESSION_ID", ""), os.path.basename(cwd), cwd,
 HEOF
 fi
 
-# ── Memory safety net (2026-07-05, memory hardening): autocommit every memory
-# change so a weak model clobbering/deleting memories is one `git revert` away.
-# flock-guarded (45 sessions can end concurrently); push is best-effort with a
-# hard timeout so SessionEnd never hangs; everything || true — fail-open.
-(
-  flock -n 9 || exit 0
-  cd "$HOME/.claude" 2>/dev/null || exit 0
-  # shell-expanded literal dirs (git wildcard pathspecs don't recurse here);
-  # each add separate — one missing path must not abort the rest
-  for d in projects/*/memory memory; do
-      [ -d "$d" ] && git add -A -- "$d" 2>/dev/null || true
-  done
-  if ! git diff --cached --quiet 2>/dev/null; then
-      git commit -q -m "memory: session autocommit (${SESSION_ID:-unknown})" 2>/dev/null || true
-      for r in $(git remote 2>/dev/null); do
-          timeout 10 git push -q "$r" HEAD 2>/dev/null || true
-      done
-  fi
-) 9>/tmp/.claude-memory-autocommit.lock 2>/dev/null || true
-
 exit 0

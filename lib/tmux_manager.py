@@ -12,6 +12,11 @@ Rewritten 2026-07-05 (fleet-regression postmortem):
   - startup_entries()/write_startup() expose the mapping for fleet tooling.
   - 2026-09-03: session creation goes through newsession.tmux_new_session(),
     which guarantees the LOGIN shell (a cron-born server handed out dash).
+  - 2026-09-24: boot is claude-free (operator rule). The generated script only
+    recreates a missing mapped session as a PLAIN SHELL at its mapped dir: it
+    never types a claude launch line and runs no trust acceptor. Claude starts
+    on demand only: `clanker work <project>` (which also starts claude in a
+    mapped session that boot left as a plain shell) or `clanker tmux add`.
 """
 
 import os
@@ -25,13 +30,12 @@ _HEADER = """#!/bin/bash
 # Tmux session startup — runs on boot via systemd; also the canonical
 # session→path map (managed by clanker lib/tmux_manager.py — edit via
 # `clanker tmux add/remove`, not by hand).
-# Resurrect+continuum restore saved state first; this ensures sessions exist
-# as a fallback. Claude is launched with an explicit cd so panes always land
-# in the project dir (fleet-regression law, 2026-07-05).
+# Resurrect+continuum restore saved state first; this ensures every mapped
+# session exists as a fallback, as a PLAIN SHELL at its mapped dir. It never
+# launches Claude (operator rule, 2026-09-24): Claude starts only on demand,
+# via `clanker work <project>` or `clanker tmux add`.
 
 sleep 2
-
-LAUNCH='CLAUDE_CODE_DISABLE_SANDBOX=1 claude --dangerously-skip-permissions'
 
 sessions=(
 """
@@ -44,18 +48,8 @@ for entry in "${sessions[@]}"; do
     [ -d "$dir" ] || dir="$HOME"
     if ! tmux has-session -t "$name" 2>/dev/null; then
         tmux new-session -d -s "$name" -c "$dir" -x 220 -y 50
-        tmux send-keys -t "$name" -l -- "cd '$dir' && $LAUNCH"
-        tmux send-keys -t "$name" Enter
     fi
 done
-
-# 2026-09-07: Claude Code shows its workspace-trust dialog on launch — even with
-# --dangerously-skip-permissions, and never remembered for $HOME — so after the
-# 09-06 reboot 37 of 63 mapped sessions sat at "❯ No, exit" for a day, with no
-# session behind them. This map IS the operator's trust declaration for these
-# repos: answer YES in every mapped pane that shows the dialog (cursor-aware;
-# a bare Enter would EXIT). Runs until every REPL is registered or 120 s.
-python3 "{CLANKER}" tmux accept-trust --timeout 120 >/dev/null 2>&1 || true
 """
 
 
@@ -90,11 +84,9 @@ def startup_entries():
 def write_startup(entries):
     """Regenerate the whole startup script from {name: path} (sorted)."""
     body = "".join(f'    "{n}:{p}"\n' for n, p in sorted(entries.items()))
-    clanker = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "bin", "clanker")
     tmp = STARTUP_SCRIPT + ".tmp"
     with open(tmp, "w") as f:
-        f.write(_HEADER + body + _FOOTER.replace("{CLANKER}", clanker))
+        f.write(_HEADER + body + _FOOTER)
     os.chmod(tmp, 0o755)
     os.replace(tmp, STARTUP_SCRIPT)
 
@@ -154,7 +146,8 @@ def _alive_sessions():
 def resurrect(dry_run=False, sync_registry=False):
     """One-command fleet recovery (audit P10, born of the 07-22 host-OOM):
     refresh the boot map, then execute the map script itself, whose per-entry
-    has-session guard relaunches ONLY the missing sessions. That is the exact
+    has-session guard recreates ONLY the missing sessions, as plain shells
+    (claude starts on demand via `clanker work`, 2026-09-24). That is the exact
     code path systemd runs at boot, so resurrect can never drift from proven
     boot behavior. By DEFAULT recovery is map-scoped — the registry only
     refreshes the paths of names already mapped, it never grows the fleet
@@ -185,7 +178,7 @@ def resurrect(dry_run=False, sync_registry=False):
           f"{len(kept)} non-registry kept")
     if unmapped:
         print(f"[resurrect] {len(unmapped)} registered project(s) have no boot entry — "
-              f"left alone (add + launch them with --sync-registry): {', '.join(unmapped)}")
+              f"left alone (map them with --sync-registry): {', '.join(unmapped)}")
     print(f"[resurrect] tmux now: {len(merged) - len(missing)} of {len(merged)} mapped "
           f"sessions alive" + (f"; missing: {', '.join(missing)}" if missing else ""))
     if dry_run:
@@ -193,7 +186,8 @@ def resurrect(dry_run=False, sync_registry=False):
         return 0
     write_startup(merged)
     if missing:
-        print(f"[resurrect] relaunching {len(missing)} session(s) via {STARTUP_SCRIPT} …")
+        print(f"[resurrect] recreating {len(missing)} session(s) as plain shells via "
+              f"{STARTUP_SCRIPT} … (claude on demand: clanker work <project>)")
         r = subprocess.run(["bash", STARTUP_SCRIPT], capture_output=True, text=True)
         if r.returncode != 0:
             print(f"[resurrect] startup script exited {r.returncode}: "

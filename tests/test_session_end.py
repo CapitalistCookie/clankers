@@ -4,9 +4,9 @@ failure_reason (limit/API-error signature in the transcript tail, same catalog
 as the subagent auto-resume detector), last_assistant_line — and the handoff
 must carry a "Last activity" line so post-crash briefings aren't git-state-blind.
 
-Hermetic: HOME→tmp (the memory-autocommit block cd's to $HOME/.claude and
-exits — the live ~/.claude repo is never touched), CLANKER_DATA→conftest tmp,
-unique session ids (the hook's /tmp dedup marker is per-session-id)."""
+Hermetic: HOME→tmp, CLANKER_DATA→conftest tmp, unique session ids (the
+hook's /tmp dedup marker is per-session-id). The memory-autocommit block that
+cd'd to $HOME/.claude is gone (2026-09-24: the memory dir is disabled)."""
 import json
 import os
 import subprocess

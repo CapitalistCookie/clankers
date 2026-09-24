@@ -106,6 +106,18 @@ def _session_exists(name):
                           capture_output=True).returncode == 0
 
 
+SHELLS = ("bash", "zsh", "sh", "dash", "fish")
+
+
+def _pane_command(name):
+    """Foreground command of the active pane of the session named EXACTLY
+    `name` ('' when there is no such session). The `=` target never
+    prefix-matches, so `web` can never resolve to `web-2`."""
+    p = subprocess.run(["tmux", "display-message", "-p", "-t", f"={name}:",
+                        "#{pane_current_command}"], capture_output=True, text=True)
+    return (p.stdout or "").strip() if p.returncode == 0 else ""
+
+
 def _unique_name(base):
     name = base
     n = 2
@@ -255,8 +267,14 @@ def accept_trust_prompts(names, timeout=120.0, interval=2.0):
     return answered
 
 
-def spawn(name=None, cwd=None, shell=False, resume=None):
+def spawn(name=None, cwd=None, shell=False, resume=None, start_claude_in_shell=False):
     """Create a detached tmux session and launch Claude (or a bare shell) in it.
+    start_claude_in_shell (the `clanker work` path): when the named session
+    already exists and its active pane is a bare shell, start Claude there
+    instead of only pointing at it. Boot and fleet-heal recreate mapped
+    sessions as plain shells (Claude is on demand only, 2026-09-24), so this is
+    how a mapped session gets its Claude. A pane running anything else is
+    never typed into.
     Returns (name, message). Never raises for the expected failure modes."""
     if not _tmux():
         return None, "tmux is not installed (required for `clanker new`)."
@@ -273,6 +291,16 @@ def spawn(name=None, cwd=None, shell=False, resume=None):
     requested = bool(name)
     base = _slug(name) if name else "claude"
     if requested and _session_exists(base):
+        if not shell and start_claude_in_shell and _pane_command(base) in SHELLS:
+            _wait_shell_prompt(base)
+            subprocess.run(["tmux", "send-keys", "-t", f"={base}:", "-l", "--",
+                            launch_cmd(cwd, resume=resume)], capture_output=True)
+            subprocess.run(["tmux", "send-keys", "-t", f"={base}:", "Enter"],
+                           capture_output=True)
+            accept_trust_prompt(base)
+            _record_last(base)
+            return base, (f"started claude in existing session '{base}' (was a plain shell) "
+                          f"in {cwd}\nopen it with:  clanker open {base}")
         return base, (f"session '{base}' already exists — attach with: clanker open {base}")
     name = base if requested else _unique_name(base)
 

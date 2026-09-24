@@ -251,3 +251,46 @@ def test_work_registers_boot_entry_end_to_end(tmp_path):
                        capture_output=True, text=True, env=env, timeout=30)
     assert r.returncode == 0, r.stdout + r.stderr
     assert not boot.exists(), "--no-boot still wrote the boot map"
+
+
+# ── 2026-09-24: boot is claude-free — mapped sessions come back as PLAIN SHELLS ─
+
+def test_boot_script_never_launches_claude(startup):
+    """Operator rule 2026-09-24: boot, fleet-heal and resurrect recreate missing
+    mapped sessions as plain shells; Claude starts only on demand (`clanker
+    work` / `clanker tmux add`). No executable line may type or launch it."""
+    tmux_manager.write_startup({"alpha": "/p/alpha", "beta": "/p/beta"})
+    code = [ln for ln in startup.read_text().splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+    body = "\n".join(code)
+    assert "tmux new-session -d" in body
+    for banned in ("claude", "send-keys", "--resume", "accept-trust", "LAUNCH"):
+        assert banned not in body, f"boot script still carries {banned!r}"
+
+
+def test_boot_script_creates_only_missing_sessions_as_shells(tmp_path, monkeypatch):
+    """Execute the GENERATED script against a fake tmux: the missing session is
+    created at its dir, the live one is left alone, and no key is ever sent."""
+    import subprocess
+    script = tmp_path / "tmux-startup.sh"
+    monkeypatch.setattr(tmux_manager, "STARTUP_SCRIPT", str(script))
+    tmux_manager.write_startup({"alive": str(tmp_path), "gone": str(tmp_path)})
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    log = tmp_path / "tmux.log"
+    (fakebin / "tmux").write_text(
+        "#!/bin/bash\n"
+        f'echo "$*" >> "{log}"\n'
+        'if [ "$1" = has-session ]; then [ "$3" = alive ] && exit 0; exit 1; fi\n'
+        "exit 0\n")
+    (fakebin / "sleep").write_text("#!/bin/bash\nexit 0\n")
+    for f in ("tmux", "sleep"):
+        (fakebin / f).chmod(0o755)
+    env = {**os.environ, "PATH": f"{fakebin}:{os.environ['PATH']}", "HOME": str(tmp_path)}
+    r = subprocess.run(["bash", str(script)], capture_output=True, text=True,
+                       env=env, timeout=30)
+    assert r.returncode == 0, r.stderr
+    lines = log.read_text().splitlines()
+    assert f"new-session -d -s gone -c {tmp_path} -x 220 -y 50" in lines
+    assert not any("-s alive" in ln for ln in lines)
+    assert not any(ln.startswith("send-keys") for ln in lines)

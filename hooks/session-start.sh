@@ -1,212 +1,435 @@
 #!/usr/bin/env bash
-# SessionStart briefing hook. Fail-OPEN by design: a briefing failure must
-# never break session start, so no `set -e` — every substitution is guarded.
+# SessionStart hook: the cold-start brief (contract of 2026-09-24).
 #
-# PERF (P11, 2026-07-22): everything python runs in ONE interpreter at the end
-# (stub row, archetype, env-file exports, alerts, briefing, final JSON) —
-# the old shape spawned 4+ serial interpreters plus one jq PER alert file.
-# Measured with the hook-tax harness: 338ms → see commit for the after number.
-# Each piece is individually try/except'd inside the block, so per-piece
-# degradation matches the old one-process-per-piece behavior.
+# additionalContext is at most 1,200 bytes of plain text, in this shape:
+#   clanker: <project> · <archetype> · <branch>@<short-sha> · <N> dirty
+#   NOW: <STATUS.md "## NOW" section: first ≤800 B, cut at a line boundary;
+#        no NOW heading -> first ≤600 B of the file; no STATUS.md -> no line>
+#   state: STATUS.md (<bytes> B) · index: <first router file> · alerts: <N> open for this project (`clanker alert list`)
+#   git: <git log --oneline -3, one per line>
+# Over budget: the NOW block is cut first, then git drops to one line.
+# Unregistered cwd: "clanker: unregistered · <basename>". NOW/state key on
+# file existence, not on registration.
+#
+# What this replaced: head -30 STATUS.md + git log -5 + alert lines (19.9 KB
+# on one repo), a briefing import whose module never shipped, a memory
+# self-heal for the memory dir disabled 2026-08-08, a backgrounded codebase
+# indexer that wrote into that dir with its stdout still on this hook's JSON
+# channel, and one jq per alert file (9.8 s per start over ~1,100 alerts).
+#
+# Kept: the /clear hand-off of the previous transcript to session-end.sh
+# (telemetry), the P7 heartbeat stub row, and the CLAUDE_ENV_FILE exports of
+# CLANKER_PROJECT (read by prompt-check.sh and skill-tracker.sh) and
+# CLANKER_ARCHETYPE.
+#
+# PERF: one python3 interpreter started with -I (isolated: skips the user
+# site's .pth files, the bulk of interpreter start-up here), no jq, two git
+# calls, and a single pass over the alert dir for the count.
+# FAIL-OPEN: every piece is guarded; whatever lines succeeded are emitted and
+# the script always exits 0.
 set -uo pipefail
 
-CLANKER_DATA="${CLANKER_DATA:-/data/clanker}"
-CLANKER_REGISTRY="${CLANKER_REGISTRY:-$HOME/projects/.clanker.yaml}"
-# Claude Code's namespace slug for $HOME (slashes/dots become dashes)
-HOME_SLUG="${HOME//[\/.]/-}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLANKER_HOOK_INPUT="$(cat 2>/dev/null || true)"
+CLANKER_HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+export CLANKER_HOOK_INPUT CLANKER_HOOK_DIR
 
-# Read hook input from stdin — ONE jq pass for all fields (was one per field)
-INPUT=$(cat)
-IFS=$'\t' read -r CWD SOURCE SESSION_ID < <(
-    echo "$INPUT" | jq -r '[.cwd // "", .source // "", .session_id // ""] | @tsv' 2>/dev/null
-) || true
-CWD="${CWD:-}"; SOURCE="${SOURCE:-}"; SESSION_ID="${SESSION_ID:-}"
-PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$CWD}"
+python3 -I - <<'PY' 2>/dev/null || true
+import json, os, re, shlex, subprocess, sys, time
 
-# --- 0. On /clear, extract metrics from the PREVIOUS session ---
-if [ "$SOURCE" = "clear" ]; then
-    # /clear was invoked — the session_id and transcript_path are for the NEW session
-    # The OLD session's transcript is the most recently modified .jsonl in this project dir.
-    # KNOWN HEURISTIC (audit L3): with CONCURRENT sessions in one project dir,
-    # "2nd-most-recent transcript" can pick a live sibling's file — its metrics
-    # row is then written early (harmless: SessionEnd re-fires at its real end
-    # and last-write-wins dedup keeps the final row). Accepted; a real fix
-    # needs Claude Code to hand us the predecessor id.
-    PROJECT_DIR_FOR_CLEAR="${CLAUDE_PROJECT_DIR:-$CWD}"
-    CLAUDE_PROJ_DIR=$(echo "$PROJECT_DIR_FOR_CLEAR" | sed 's|/|-|g')
-    OLD_TRANSCRIPT=$(ls -t "$HOME/.claude/projects/$CLAUDE_PROJ_DIR/"*.jsonl 2>/dev/null | head -2 | tail -1 || true)
+BUDGET, NOW_MAX, HEAD_MAX, NOW_MIN = 1200, 800, 600, 120
+INDEX_FILES = ("INDEX.md", "00-START-HERE.md", "START-HERE.md", "ROUTER.md",
+               "RESUME.md", "docs/ROUTING.md", "docs/INDEX.md", "docs/README.md",
+               "STATE.md")
+ELL = " …"
+E = os.environ
+HOME = os.path.expanduser("~")
+DATA = E.get("CLANKER_DATA") or "/data/clanker"
+REGISTRY = E.get("CLANKER_REGISTRY") or os.path.join(HOME, "projects", ".clanker.yaml")
+HOOK_DIR = E.get("CLANKER_HOOK_DIR") or ""
+NOW_RE = re.compile(r"^##[ \t]+NOW\b[ \t]*(.*)$", re.I)
+H12_RE = re.compile(r"^#{1,2}[ \t]")
+DATE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:[ T]+(\d{1,2}):(\d{2}))?")
 
-    if [ -n "$OLD_TRANSCRIPT" ] && [ -f "$OLD_TRANSCRIPT" ]; then
-        OLD_SESSION_ID=$(basename "$OLD_TRANSCRIPT" .jsonl)
-        export TRANSCRIPT="$OLD_TRANSCRIPT" SESSION_ID="$OLD_SESSION_ID" CWD="$CWD"
-        bash "$(dirname "${BASH_SOURCE[0]}")/session-end.sh" < <(
-            echo "{\"session_id\":\"$OLD_SESSION_ID\",\"transcript_path\":\"$OLD_TRANSCRIPT\",\"cwd\":\"$CWD\"}"
-        ) 2>/dev/null &
-        SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null || true)
-    fi
-fi
 
-# --- 1. Run codebase indexer if project has one (backgrounded) ---
-if [ -n "$PROJECT_DIR" ] && [ -d "$PROJECT_DIR" ]; then
-    if [ -f "$PROJECT_DIR/docs/codebase-index/generate.py" ]; then
-        python3 "$PROJECT_DIR/docs/codebase-index/generate.py" \
-            --routing-table "$HOME/.claude/projects/$HOME_SLUG/memory/CODEBASE_INDEX.md" \
-            2>/dev/null &
-    fi
-    if [ -f "$PROJECT_DIR/docs/codebase-index/generate-sdk-reference.sh" ]; then
-        bash "$PROJECT_DIR/docs/codebase-index/generate-sdk-reference.sh" 2>/dev/null &
-    fi
-fi
+def nbytes(s):
+    return len(s.encode("utf-8"))
 
-# --- 2. Memory index self-heal (memory hardening 2026-07-05): if MEMORY.md
-# changed since INDEX_ALL.md was generated (e.g. a bash-path write slipped past
-# the lint hook, or a file was rm'd), regenerate the inventory and surface the
-# orphan count. Covers BOTH the global router dir and this session's namespace.
-MEM_NOTE=""
-LINT="$HOME/.claude/hooks/memory-lint.sh"
-if [ -x "$LINT" ] || [ -f "$LINT" ]; then
-    NS_SLUG=$(printf '%s' "${CWD:-}" | sed 's|[/.]|-|g')
-    for MDIR in "$HOME/.claude/projects/$HOME_SLUG/memory" "$HOME/.claude/projects/$NS_SLUG/memory"; do
-        [ -f "$MDIR/MEMORY.md" ] || continue
-        if [ ! -f "$MDIR/INDEX_ALL.md" ] || [ "$MDIR/MEMORY.md" -nt "$MDIR/INDEX_ALL.md" ]; then
-            ORPH=$(bash "$LINT" --regen "$MDIR" 2>/dev/null | sed -n 's/^orphans=//p' || true)
-            if [ -n "$ORPH" ] && [ "$ORPH" -gt 0 ] 2>/dev/null; then
-                MEM_NOTE="memory: $ORPH orphaned file(s) unreachable from the router indexes — see $MDIR/INDEX_ALL.md §ORPHANS"
-            fi
-        fi
-        # Index-budget warn band (sharded-router 2026-07-19): surface ≥80% at
-        # session start so a filling index is heard about BEFORE the 16KB wall.
-        for IDX in "$MDIR/MEMORY.md" "$MDIR"/*-POINTERS.md; do
-            [ -f "$IDX" ] || continue
-            SZ=$(wc -c < "$IDX" 2>/dev/null || echo 0)
-            if [ "$SZ" -gt 13107 ] 2>/dev/null; then
-                MEM_NOTE="${MEM_NOTE:+$MEM_NOTE · }memory: $(basename "$IDX") at $((SZ * 100 / 16384))% of its 16KB index budget — split the shard (law: MEMORY.md header)"
-            fi
-        done
-    done
-fi
 
-# --- 3. STATUS.md + recent git log injection (harness overhaul M4, 2026-07-05) ---
-# The cold-start contract: a session launched in a repo sees the repo's live state
-# without any pasted handoff. Cheap + bounded (head -30 / log -5).
-STATUS_MSG=""
-if [ -n "$PROJECT_DIR" ] && [ -f "$PROJECT_DIR/STATUS.md" ]; then
-    STATUS_MSG="=== STATUS.md (repo state — update it as part of finishing work) ===
-$(head -30 "$PROJECT_DIR/STATUS.md")"
-    if [ -d "$PROJECT_DIR/.git" ]; then
-        STATUS_MSG="$STATUS_MSG
-=== git log -5 ===
-$(git -C "$PROJECT_DIR" log --oneline -5 2>/dev/null)"
-    fi
-fi
+def clip(s, limit):
+    """s cut to <= limit bytes, at a word boundary when one is near, plus an ellipsis."""
+    if nbytes(s) <= limit:
+        return s
+    room = limit - nbytes(ELL)
+    if room <= 0:
+        return ""
+    cut = s.encode("utf-8")[:room].decode("utf-8", "ignore")
+    sp = cut.rfind(" ")
+    if sp > len(cut) // 2:
+        cut = cut[:sp]
+    return cut.rstrip() + ELL
 
-# --- 4. The single python pass: heartbeat stub (P7), archetype, env-file
-# exports, alerts, briefing, assembly, final hook JSON. ---
-export CWD SOURCE SESSION_ID PROJECT_DIR SCRIPT_DIR CLANKER_DATA CLANKER_REGISTRY MEM_NOTE STATUS_MSG
-export CLAUDE_ENV_FILE="${CLAUDE_ENV_FILE:-}"
-python3 - <<'PY' 2>/dev/null || true
-import json, os, sys, time
 
-cwd = os.environ.get("CWD", "")
-session_id = os.environ.get("SESSION_ID", "")
-project_dir = os.environ.get("PROJECT_DIR", "")
-data_dir = os.environ.get("CLANKER_DATA", "/data/clanker")
-registry = os.environ.get("CLANKER_REGISTRY", "")
-sys.path.insert(0, os.path.join(os.environ.get("SCRIPT_DIR", "."), "..", "lib"))
+def fit(lines, limit, first_body=0):
+    """Whole lines while they fit in `limit` bytes (newline-joined). The first
+    line that does not fit ends the block; only when no body line has made it in
+    yet is that line clipped instead (a single 1.1 KB paragraph would otherwise
+    leave the block empty)."""
+    out, used = [], 0
+    for ln in lines:
+        sep = 1 if out else 0
+        if used + sep + nbytes(ln) <= limit:
+            out.append(ln)
+            used += sep + nbytes(ln)
+            continue
+        if len(out) <= first_body and limit - used - sep >= 40:
+            c = clip(ln, limit - used - sep)
+            if c:
+                out.append(c)
+        break
+    return out
 
-# 4a. Heartbeat stub row (P7, audit M4): a long-lived session must EXIST in
-# telemetry before it dies — 07-20/21 had ~49 live sessions and ZERO rows.
-# SessionEnd's full record supersedes this via consumers' last-write-wins
-# dedup (analyze.load_sessions); a stub with no final row = still running.
+
+def now_section(text):
+    """(lines, first_body) of the `## NOW` section, or None when there is no such
+    heading. Several stacked NOW headings: the one whose heading carries the
+    latest date wins (ties and undated headings: the first). The heading's own
+    suffix, usually its date, leads the block."""
+    lines = text.splitlines()
+    fence, heads, h12 = False, [], []
+    for i, ln in enumerate(lines):
+        s = ln.lstrip()
+        if s.startswith("```") or s.startswith("~~~"):
+            fence = not fence
+            continue
+        if fence or not H12_RE.match(ln):
+            continue
+        h12.append(i)
+        m = NOW_RE.match(ln)
+        if m:
+            heads.append((i, m.group(1)))
+    if not heads:
+        return None
+    dated = []
+    for n, (i, suffix) in enumerate(heads):
+        m = DATE_RE.search(suffix)
+        if m:
+            dated.append((tuple(int(x) if x else -1 for x in m.groups()), -n, i, suffix))
+    start, suffix = (max(dated)[2:] if dated else heads[0])
+    end = next((j for j in h12 if j > start), len(lines))
+    suffix = suffix.strip().lstrip(":—–- \t").strip()
+    body = [ln.rstrip() for ln in lines[start + 1:end] if ln.strip()]
+    return ([suffix] if suffix else []) + body, (1 if suffix else 0)
+
+
+def load_registry(path):
+    """{name: {archetype, path}} from the registry's `projects:` block, or None
+    when there is no registry file. registry.py writes block-style YAML, read
+    here line by line: -I keeps PyYAML (user site) out, and this is far cheaper."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return None
+    projects, in_proj, cur, name_ind, key_ind = {}, False, None, None, None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        ind = len(raw) - len(raw.lstrip(" "))
+        if ind == 0:
+            in_proj, cur, name_ind, key_ind = (s == "projects:"), None, None, None
+            continue
+        if not in_proj:
+            continue
+        if name_ind is None:
+            name_ind = ind
+        if ind == name_ind:
+            m = re.match(r"""^(['"]?)(.+?)\1:(?:\s+.*)?$""", s)
+            cur, key_ind = (m.group(2) if m else None), None
+            if cur is not None:
+                projects[cur] = {}
+            continue
+        if cur is None or ind < name_ind:
+            continue
+        if key_ind is None:
+            key_ind = ind
+        if ind != key_ind:
+            continue                                  # continuation of a long value
+        m = re.match(r"^(archetype|path):\s*(.*)$", s)
+        if m:
+            v = m.group(2).strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            if v and v not in ("null", "~"):
+                projects[cur][m.group(1)] = v
+    if not projects and re.search(r"(?m)^projects:[ \t]*\S", text):
+        try:                                          # flow style: needs PyYAML
+            import site
+            sys.path.append(site.getusersitepackages())
+            import yaml
+            for k, v in ((yaml.safe_load(text) or {}).get("projects") or {}).items():
+                v = v if isinstance(v, dict) else {}
+                projects[str(k)] = {kk: str(v[kk]) for kk in ("archetype", "path") if v.get(kk)}
+        except Exception:
+            pass
+    return projects
+
+
+def match_project(reg, project_dir):
+    """(name, root) of the registered project containing project_dir: the longest
+    registered path (explicit `path:` or ~/projects/<name>) wins; else a name
+    equal to the dir's basename, root unknown; else (None, None)."""
+    real = os.path.realpath(project_dir)
+    best, best_root = None, None
+    for name, meta in reg.items():
+        rp = os.path.realpath(os.path.expanduser(
+            meta.get("path") or os.path.join(HOME, "projects", name)))
+        if real == rp or real.startswith(rp.rstrip(os.sep) + os.sep):
+            if best_root is None or len(rp) > len(best_root):
+                best, best_root = name, rp
+    if best is None:
+        base = os.path.basename(os.path.normpath(project_dir))
+        if base in reg:
+            best = base
+    return best, best_root
+
+
+def count_alerts(name):
+    """Open alerts of this project — `project` field, or a message starting with
+    "<name>:" — in ONE pass; files that never mention the name are not parsed."""
+    adir = os.path.join(DATA, "alerts")
+    if not os.path.isdir(adir):
+        return 0
+    needle, n = name.encode("utf-8"), 0
+    with os.scandir(adir) as it:
+        for e in it:
+            if not e.name.endswith(".json"):
+                continue
+            try:
+                with open(e.path, "rb") as f:
+                    raw = f.read(1 << 16)
+            except OSError:
+                continue
+            if needle not in raw:
+                continue
+            try:
+                a = json.loads(raw)
+            except ValueError:
+                continue
+            if not isinstance(a, dict):
+                continue
+            if str(a.get("status") or "active").lower() in ("resolved", "dismissed", "closed"):
+                continue
+            if a.get("project") == name or str(a.get("message") or "").startswith(name + ":"):
+                n += 1
+    return n
+
+
+GIT_ENV = {k: v for k, v in E.items() if k not in (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR", "GIT_NAMESPACE", "CLANKER_HOOK_INPUT")}
+GIT_ENV["GIT_OPTIONAL_LOCKS"] = "0"      # status must never take index.lock from a live repo
+
+
+def git(where, *args):
+    r = subprocess.run(["git", "-C", where, *args], capture_output=True, timeout=3,
+                       encoding="utf-8", errors="replace", env=GIT_ENV,
+                       stdin=subprocess.DEVNULL)
+    return r.stdout if r.returncode == 0 else None
+
+
+# --- hook input -------------------------------------------------------------
+try:
+    hook_in = json.loads(E.get("CLANKER_HOOK_INPUT") or "{}")
+    hook_in = hook_in if isinstance(hook_in, dict) else {}
+except ValueError:
+    hook_in = {}
+cwd = str(hook_in.get("cwd") or "")
+source = str(hook_in.get("source") or "")
+session_id = str(hook_in.get("session_id") or "")
+project_dir = E.get("CLAUDE_PROJECT_DIR") or cwd
+if not project_dir:
+    try:
+        project_dir = os.getcwd()
+    except OSError:
+        project_dir = ""
+
+# --- 0. /clear: hand the PREVIOUS session's transcript to session-end.sh -----
+# The input's session_id/transcript are the NEW session's; the old transcript
+# is the second-newest .jsonl in this project's Claude Code dir. KNOWN
+# HEURISTIC (audit L3): with concurrent sessions in one dir it can pick a live
+# sibling (harmless: its SessionEnd rewrites the row, last write wins).
+if source == "clear":
+    try:
+        tdir = os.path.join(HOME, ".claude", "projects",
+                            re.sub(r"[^A-Za-z0-9]", "-", project_dir))
+        ts = sorted((os.path.join(tdir, f) for f in os.listdir(tdir) if f.endswith(".jsonl")),
+                    key=os.path.getmtime, reverse=True)
+        old = ts[1] if len(ts) >= 2 else (ts[0] if ts else "")
+        end_hook = os.path.join(HOOK_DIR, "session-end.sh")
+        if old and os.path.isfile(end_hook):
+            old_id = os.path.basename(old)[:-len(".jsonl")]
+            env = {k: v for k, v in E.items() if k != "CLANKER_HOOK_INPUT"}
+            env.update(TRANSCRIPT=old, SESSION_ID=old_id, CWD=cwd)
+            p = subprocess.Popen(["bash", end_hook], stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env=env, start_new_session=True)
+            p.stdin.write(json.dumps({"session_id": old_id, "transcript_path": old,
+                                      "cwd": cwd}).encode())
+            p.stdin.close()
+    except Exception:
+        pass
+
+# --- 1. project + archetype -----------------------------------------------------
+reg, project, root = None, None, None
+try:
+    reg = load_registry(REGISTRY)
+    if reg:
+        project, root = match_project(reg, project_dir)
+except Exception:
+    project, root = None, None
+base = os.path.basename(os.path.normpath(project_dir)) if project_dir else ""
+name = project or base
+archetype = "unknown"
+if project:
+    archetype = (reg.get(project) or {}).get("archetype") or "unknown"
+root = root or project_dir
+
+# --- 2. heartbeat stub row (P7): a session must exist in telemetry before it
+# ends; SessionEnd's full row supersedes it (last write wins in consumers). ---
 if session_id:
     try:
-        project = "global"
-        try:
-            from projects import resolve_project
-            project = resolve_project(cwd)
-        except Exception:
-            _root = os.path.expanduser("~/projects/")
-            if _root in cwd:
-                project = cwd.split(_root)[-1].split("/")[0]
-        sdir = os.path.join(data_dir, "raw", "sessions")
+        stub_project = project
+        if not stub_project:
+            pr = os.path.join(HOME, "projects") + os.sep
+            stub_project = cwd.split(pr)[-1].split(os.sep)[0] if pr in cwd else "global"
+        sdir = os.path.join(DATA, "raw", "sessions")
         os.makedirs(sdir, exist_ok=True)
         out = os.path.join(sdir, time.strftime("%Y-%m-%d", time.gmtime()) + ".jsonl")
         import fcntl
-        with open(out + ".lock", "a") as lk:          # same lock file session-end flocks
-            fcntl.flock(lk, fcntl.LOCK_EX)
+        with open(out + ".lock", "a") as lk:          # the lock file session-end flocks
+            deadline = time.monotonic() + 1.0         # bounded: session-end holds it while it parses
+            while True:
+                try:
+                    fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.02)
             with open(out, "a") as f:
                 f.write(json.dumps({
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     "session_id": session_id,
-                    "project": project,
+                    "project": stub_project,
                     "cwd": cwd,
                     "outcome": "open",
-                    "source": os.environ.get("SOURCE", "") or None,
+                    "source": source or None,
                 }) + "\n")
     except Exception:
         pass
 
-# 4b. Project + archetype from the registry yaml
-project_name, archetype = "", ""
-if project_dir and registry and os.path.isfile(registry):
-    project_name = os.path.basename(project_dir)
-    archetype = "unknown"
-    try:
-        import yaml
-        reg = yaml.safe_load(open(registry)) or {}
-        archetype = (reg.get("projects", {}).get(project_name, {}) or {}).get("archetype", "unknown")
-    except Exception:
-        pass
-
-# 4c. Env vars for downstream hooks
-envf = os.environ.get("CLAUDE_ENV_FILE", "")
-if envf:
+# --- 3. env vars for downstream hooks -------------------------------------------
+envf = E.get("CLAUDE_ENV_FILE")
+if envf and name and os.path.isfile(REGISTRY):
     try:
         with open(envf, "a") as f:
-            if project_name:
-                f.write(f"export CLANKER_PROJECT={project_name}\n")
-            if archetype:
-                f.write(f"export CLANKER_ARCHETYPE={archetype}\n")
+            f.write(f"export CLANKER_PROJECT={shlex.quote(name)}\n")
+            f.write(f"export CLANKER_ARCHETYPE={shlex.quote(archetype)}\n")
     except Exception:
         pass
 
-# 4d. Active alerts (was one jq spawn per alert file)
-alert_msg = ""
+# --- 4. the brief ---------------------------------------------------------------
+clanker_line = "clanker: " + (f"{project} · {archetype}" if project
+                              else f"unregistered · {base or '?'}")
+log3 = []
 try:
-    adir = os.path.join(data_dir, "alerts")
-    files = sorted(fn for fn in os.listdir(adir) if fn.endswith(".json")) if os.path.isdir(adir) else []
-    if files:
-        lines = [f"CLANKER ALERTS ({len(files)} active):"]
-        for fn in files:
-            try:
-                a = json.load(open(os.path.join(adir, fn)))
-                lines.append(f"  [{a.get('severity') or 'info'}] {a.get('message') or 'unknown alert'}")
-            except Exception:
-                lines.append("  [info] unknown alert")
-        alert_msg = "\n".join(lines)
+    st = git(root, "status", "--porcelain=v2", "--branch")
+    if st is not None:
+        branch, sha, dirty = "?", "?", 0
+        for ln in st.splitlines():
+            if ln.startswith("# branch.oid "):
+                oid = ln[len("# branch.oid "):].strip()
+                sha = "initial" if oid.startswith("(") else oid[:7]
+            elif ln.startswith("# branch.head "):
+                h = ln[len("# branch.head "):].strip()
+                branch = "detached" if h.startswith("(") else h
+            elif ln and not ln.startswith("#"):
+                dirty += 1
+        clanker_line += f" · {branch}@{sha} · {dirty} dirty"
+        lg = git(root, "log", "--oneline", "--no-decorate", "--no-color", "-3")
+        log3 = [ln.rstrip() for ln in (lg or "").splitlines() if ln.strip()][:3]
 except Exception:
     pass
 
-# 4e. Project briefing
-briefing = ""
-if project_name and project_name != "unknown" and os.path.isdir(project_dir):
-    try:
-        from briefing import generate_briefing
-        briefing = generate_briefing(project_name, project_dir) or ""
-    except Exception:
-        pass
+now_src, first_body, now_limit, now_lines, status_size = [], 0, 0, [], None
+try:
+    sp = os.path.join(root, "STATUS.md")
+    if os.path.isfile(sp):
+        with open(sp, "rb") as f:
+            raw = f.read()
+        status_size = len(raw)
+        text = raw.decode("utf-8", "replace")
+        sec = now_section(text)
+        if sec is not None:
+            (now_src, first_body), now_limit = sec, NOW_MAX
+        else:
+            now_src = [ln.rstrip() for ln in text.splitlines() if ln.strip()]
+            now_limit = HEAD_MAX
+        now_lines = fit(now_src, now_limit, first_body)
+except Exception:
+    pass
 
-# 4f. Assemble + emit (REAL newlines — the old bash literal "\\n" joins
-# rendered as backslash-n in the injected context)
-parts = [p.strip() for p in (alert_msg, briefing, os.environ.get("MEM_NOTE", ""),
-                             os.environ.get("STATUS_MSG", "")) if p and p.strip()]
-full = "\n".join(parts)
-if not full and project_name:
-    full = f"Clanker: project={project_name} archetype={archetype}"
-if full:
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "SessionStart", "additionalContext": full}}))
+index = "none"
+try:
+    index = next((f for f in INDEX_FILES if os.path.isfile(os.path.join(root, f))), "none")
+except Exception:
+    pass
+try:
+    n_alerts = f"{count_alerts(name)} open for this project" if name else "0 open for this project"
+except Exception:
+    n_alerts = "? (unreadable)"
+state_line = ("state: " + (f"STATUS.md ({status_size} B)" if status_size is not None
+                           else "no STATUS.md")
+              + f" · index: {index} · alerts: {n_alerts} (`clanker alert list`)")
+
+
+def render(now, git_lines):
+    out = [clanker_line]
+    if now:
+        out.append("NOW: " + "\n".join(now))
+    out.append(state_line)
+    if git_lines:
+        out.append("git: " + "\n".join(git_lines))
+    return "\n".join(out)
+
+
+def now_in(git_lines):
+    """The NOW block cut to what `git_lines` leave of the budget; [] below a
+    useful minimum (a heading and a sentence)."""
+    room = BUDGET - nbytes(render(None, git_lines)) - len("\nNOW: ")
+    return fit(now_src, min(room, now_limit), first_body) if room >= NOW_MIN else []
+
+
+try:
+    ctx = render(now_lines, log3)
+    if nbytes(ctx) > BUDGET and now_lines:            # 1st: cut the NOW block
+        now_lines = now_in(log3)
+        ctx = render(now_lines, log3)
+    if nbytes(ctx) > BUDGET or (now_src and not now_lines and len(log3) > 1):
+        # 2nd: git to one line. NOW, already cut to nothing, takes back the
+        # room this frees: paragraph-long commit subjects (one repo's run to
+        # ~480 B each) must not leave a brief with git and no NOW.
+        now_lines = now_in(log3[:1]) if now_src else []
+        ctx = render(now_lines, log3[:1])
+    if nbytes(ctx) > BUDGET:                          # last resort: hard cap
+        cut = ctx.encode("utf-8")[:BUDGET].decode("utf-8", "ignore")
+        ctx = cut[:cut.rfind("\n")] if "\n" in cut else clip(ctx, BUDGET)
+except Exception:
+    ctx = clip("\n".join(x for x in (clanker_line, state_line) if x), BUDGET)
+
+print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                         "additionalContext": ctx}}))
 PY
 
 exit 0

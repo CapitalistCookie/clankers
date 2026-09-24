@@ -420,7 +420,10 @@ def cmd_work(args):
     if args.print_path:
         print(path)
         return 0
-    sess, msg = spawn(name=name, cwd=path, shell=args.shell, resume=getattr(args, 'resume', None))
+    # Boot and fleet-heal leave mapped sessions as plain shells (Claude is on
+    # demand only, 2026-09-24): `work` starts Claude in one that exists.
+    sess, msg = spawn(name=name, cwd=path, shell=args.shell, resume=getattr(args, 'resume', None),
+                      start_claude_in_shell=True)
     print(msg)
     if not sess:
         return 1
@@ -438,8 +441,9 @@ def cmd_work(args):
 
 def cmd_resurrect(args):
     """`clanker resurrect` — post-OOM/reboot fleet recovery: merge the registry
-    into the boot map, then relaunch every mapped session that isn't running
-    (via the boot script itself, so behavior can't drift from systemd's path)."""
+    into the boot map, then recreate every mapped session that isn't running,
+    as a plain shell (via the boot script itself, so behavior can't drift from
+    systemd's path). Claude starts on demand: `clanker work <project>`."""
     from tmux_manager import resurrect
     return resurrect(dry_run=args.dry_run, sync_registry=args.sync_registry)
 
@@ -954,8 +958,8 @@ def main():
                    help="resume a past conversation in this repo: bare --resume opens the picker (this repo's sessions only); with an id, resumes it directly")
     p.set_defaults(func=cmd_work)
 
-    p = sub.add_parser('resurrect', help='Fleet recovery: relaunch missing boot-mapped tmux sessions (post-OOM/reboot; watchdog-callable)')
-    p.add_argument('--dry-run', action='store_true', help='report what would change/launch; write and launch nothing')
+    p = sub.add_parser('resurrect', help='Fleet recovery: recreate missing boot-mapped tmux sessions as plain shells (post-OOM/reboot; watchdog-callable; claude starts on demand via work)')
+    p.add_argument('--dry-run', action='store_true', help='report what would change/create; write and create nothing')
     p.add_argument('--sync-registry', action='store_true',
                    help='also add registered projects missing from the boot map (default: recovery never grows the fleet)')
     p.set_defaults(func=cmd_resurrect)

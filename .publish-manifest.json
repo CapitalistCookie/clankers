@@ -165,6 +165,7 @@
   "tests/test_serve_ws.py",
   "tests/test_session_end.py",
   "tests/test_session_registry.py",
+  "tests/test_session_start.py",
   "tests/test_spa_js.py",
   "tests/test_synccmd.py",
   "tests/test_tmux_manager.py",
@@ -172,5 +173,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "0aab3c9"
+ "source_commit": "b868d25"
 }

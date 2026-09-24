@@ -31,17 +31,35 @@ def run_gc(dry_run=False):
                 archived += 1
     results["sessions_archived"] = archived
 
-    # 2. Expire resolved alerts older than 7 days (alerts are deleted on dismiss, so this catches stale ones)
+    # 2. Expire alerts older than 7 days (alerts are deleted on dismiss, so this
+    # catches stale ones). Age comes from the alert's OWN first_seen, else
+    # created, else ts; the file mtime only when none of them exists
+    # (2026-09-24). mtime alone never expired anything: the 15-minute escalation
+    # pass rewrote every alert on every run.
     alerts_dir = os.path.join(DATA_DIR, "alerts")
     expired = 0
-    cutoff_7 = (datetime.utcnow() - timedelta(days=7)).timestamp()
     if os.path.isdir(alerts_dir):
+        import sys as _sys
+        _lib = os.path.dirname(os.path.abspath(__file__))
+        if _lib not in _sys.path:
+            _sys.path.insert(0, _lib)
+        from alerts import alert_birth, _utcnow
+        cutoff_7 = _utcnow() - timedelta(days=7)
         for f in os.listdir(alerts_dir):
             if f.endswith(".json"):
                 path = os.path.join(alerts_dir, f)
-                if os.path.getmtime(path) < cutoff_7:
+                try:
+                    with open(path) as fh:
+                        alert = json.load(fh)
+                except (OSError, ValueError):
+                    alert = {}                  # unreadable: only the mtime is left
+                born = alert_birth(alert, path)
+                if born is not None and born < cutoff_7:
                     if not dry_run:
-                        os.remove(path)
+                        try:
+                            os.remove(path)
+                        except FileNotFoundError:
+                            continue            # dismissed meanwhile
                     expired += 1
     results["alerts_expired"] = expired
 

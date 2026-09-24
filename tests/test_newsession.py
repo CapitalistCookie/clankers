@@ -345,3 +345,91 @@ def test_accept_trust_prompts_skips_registered_and_missing_panes(monkeypatch, tm
     monkeypatch.setattr(newsession.subprocess, "run", run)
     assert newsession.accept_trust_prompts(["up", "parked", "gone"], timeout=5) == ["parked"]
     assert keys == [("parked", "Enter")]
+
+
+# ── 2026-09-24: `work` starts claude in a mapped session boot left as a shell ──
+
+def _run_existing(pane_cmd):
+    def run(argv, **kw):
+        calls.append(list(argv))
+        if "has-session" in argv:
+            return FakeProc(rc=0)                        # the session exists
+        if "display-message" in argv:
+            return FakeProc(rc=0, out=pane_cmd + "\n")   # its active pane runs this
+        if "capture-pane" in argv:
+            return FakeProc(rc=0, out="$ ")
+        return FakeProc(rc=0)
+    return run
+
+
+def test_work_starts_claude_in_existing_plain_shell_session(monkeypatch):
+    """Boot and fleet-heal recreate mapped sessions as plain shells (Claude only
+    on demand), so the `work` path must start Claude in one: cd-prefixed,
+    resumed when asked, exact-match target, trust dialog still handled."""
+    trusted = []
+    monkeypatch.setattr(newsession.subprocess, "run", _run_existing("bash"))
+    monkeypatch.setattr(newsession, "accept_trust_prompt", lambda n: trusted.append(n))
+    name, msg = newsession.spawn(name="proj", cwd="/tmp/proj", resume="abc-123",
+                                 start_claude_in_shell=True)
+    assert name == "proj" and "started claude" in msg
+    typed = [c for c in calls if "send-keys" in c and "-l" in c]
+    assert len(typed) == 1
+    assert typed[0][-1] == newsession.launch_cmd("/tmp/proj", resume="abc-123")
+    assert "=proj:" in typed[0]
+    assert trusted == ["proj"]
+    assert not any("new-session" in c for c in calls)
+
+
+def test_work_never_types_into_an_existing_busy_session(monkeypatch):
+    monkeypatch.setattr(newsession.subprocess, "run", _run_existing("claude"))
+    name, msg = newsession.spawn(name="proj", cwd="/tmp/proj", start_claude_in_shell=True)
+    assert "already exists" in msg
+    assert not any("send-keys" in c for c in calls)
+
+
+def test_new_on_existing_plain_shell_session_only_points_at_it(monkeypatch):
+    """`clanker new <name>` keeps its contract: an existing name is never typed into."""
+    monkeypatch.setattr(newsession.subprocess, "run", _run_existing("bash"))
+    name, msg = newsession.spawn(name="proj", shell=False)
+    assert "already exists" in msg
+    assert not any("send-keys" in c for c in calls)
+
+
+def test_work_cli_starts_claude_in_existing_plain_shell_end_to_end(tmp_path):
+    """The real `clanker work X` entry point against a fake tmux whose session X
+    exists as a bare shell: Claude is typed in exactly once (cd-prefixed,
+    exact-match target) and the trust dialog is confirmed on Yes."""
+    proj = tmp_path / "bootproj"
+    proj.mkdir()
+    reg = tmp_path / "registry.yaml"
+    reg.write_text("projects:\n  bootproj:\n    archetype: tool\n"
+                   f"    path: {proj}\n")
+    log, state = tmp_path / "tmux.log", tmp_path / "capture.n"
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "tmux").write_text(
+        "#!/bin/bash\n"
+        f'echo "$*" >> "{log}"\n'
+        'case "$1" in\n'
+        "  has-session) exit 0;;\n"
+        "  display-message) echo bash;;\n"
+        "  capture-pane)\n"
+        f'    n=$(cat "{state}" 2>/dev/null || echo 0); echo $((n+1)) > "{state}"\n'
+        "    if [ \"$n\" = 0 ]; then echo '$ '; else\n"
+        "      printf 'Do you trust the files in this folder?\\n❯ Yes, I trust this folder\\n  No, exit\\n'; fi;;\n"
+        "esac\nexit 0\n")
+    (fakebin / "tmux").chmod(0o755)
+    env = {**os.environ, "HOME": str(tmp_path), "CLANKER_REGISTRY": str(reg),
+           "CLANKER_PROJECT_ROOTS": str(tmp_path), "CLANKER_DATA": str(tmp_path / "data"),
+           "PATH": f"{fakebin}:{os.environ['PATH']}"}
+    env.pop("TMUX", None)
+    r = _REAL_RUN([os.path.join(_REPO, "bin", "clanker"), "work", "bootproj", "--no-attach"],
+                  capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "started claude in existing session 'bootproj'" in r.stdout
+    lines = log.read_text().splitlines()
+    typed = [ln for ln in lines if ln.startswith("send-keys") and " -l -- " in ln]
+    assert len(typed) == 1 and "-t =bootproj:" in typed[0]
+    assert typed[0].endswith(f"cd {proj} && {newsession.LAUNCH}")
+    assert sum(1 for ln in lines if ln.startswith("send-keys") and ln.endswith("Enter")) == 2
+    assert not any(ln.startswith("new-session") for ln in lines)

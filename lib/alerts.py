@@ -2,8 +2,9 @@
 
 import json
 import os
+import shutil
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
 ALERTS_DIR = os.path.join(DATA_DIR, "alerts")
@@ -15,6 +16,75 @@ def count_alerts():
     if not os.path.isdir(ALERTS_DIR):
         return 0
     return len([f for f in os.listdir(ALERTS_DIR) if f.endswith(".json")])
+
+
+# An alert's age comes from its OWN fields, in this order; the file mtime is
+# the last resort because every rewrite moves it (see _escalate_ignored).
+BIRTH_FIELDS = ("first_seen", "created", "ts")
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_when(v):
+    """An alert time field (ISO-8601 with Z or an offset, or epoch seconds/ms)
+    as a naive-UTC datetime; None when absent or unparseable."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        try:
+            secs = float(v) / (1000.0 if v > 1e11 else 1.0)   # epoch ms vs s
+            return datetime.fromtimestamp(secs, tz=timezone.utc).replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(v, str) and v.strip():
+        try:
+            d = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if d.tzinfo is not None:
+            d = d.astimezone(timezone.utc).replace(tzinfo=None)
+        return d
+    return None
+
+
+def alert_birth(alert, path=None):
+    """When an alert was born: its first_seen, else created, else ts (a field
+    that does not parse counts as absent); the file's mtime only when none of
+    them gives a time. None when nothing does."""
+    if isinstance(alert, dict):
+        for key in BIRTH_FIELDS:
+            born = _parse_when(alert.get(key))
+            if born is not None:
+                return born
+    if path:
+        try:
+            return datetime.fromtimestamp(os.path.getmtime(path),
+                                          tz=timezone.utc).replace(tzinfo=None)
+        except OSError:
+            return None
+    return None
+
+
+def _write_alert(path, alert):
+    """Replace an alert file atomically (a reader never sees half a file);
+    the temp name does not end in .json, so listings skip it."""
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(alert, f, indent=2)
+        try:
+            shutil.copymode(path, tmp)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _create_alert(alert_id, severity, source, message, details=None, project=None):
@@ -87,11 +157,19 @@ def _escalate_ignored(days=3):
     alert file. Every cron pass stamps ignored_days on active alerts; when a
     warning/critical crosses the threshold it earns ONE high-priority ntfy
     (escalated_at marks it fired; escalation_delivered records whether ntfy
-    was configured/reachable). Returns the ids escalated this pass."""
+    was configured/reachable). Returns the ids escalated this pass.
+
+    A file is rewritten ONLY when its content changes (2026-09-24). Rewriting
+    every alert on every 15-minute pass kept every mtime fresh, and gc expired
+    on mtime, so nothing ever aged out: 1,154 files, all stamped in the same
+    second. Now a file changes at most once a day (ignored_days) plus once on
+    escalation. An alert with no first_seen gets one on that first write, from
+    its own created/ts, else the file's mtime; an unparseable first_seen is
+    left exactly as it is."""
     escalated = []
     if not os.path.isdir(ALERTS_DIR):
         return escalated
-    now = datetime.utcnow()
+    now = _utcnow()
     for fn in sorted(os.listdir(ALERTS_DIR)):
         if not fn.endswith(".json"):
             continue
@@ -99,9 +177,18 @@ def _escalate_ignored(days=3):
         try:
             with open(path) as f:
                 a = json.load(f)
-            first = datetime.fromisoformat(
-                (a.get("first_seen") or "").replace("Z", "+00:00")).replace(tzinfo=None)
-        except (OSError, json.JSONDecodeError, ValueError):
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(a, dict):
+            continue
+        before = dict(a)
+        if a.get("first_seen") in (None, ""):
+            born = alert_birth(a, path)
+            if born is None:
+                continue
+            a["first_seen"] = born.strftime("%Y-%m-%dT%H:%M:%SZ")
+        first = _parse_when(a.get("first_seen"))
+        if first is None:
             continue
         a["ignored_days"] = max(0, (now - first).days)
         if (a.get("severity") in ("warning", "critical")
@@ -111,8 +198,11 @@ def _escalate_ignored(days=3):
                 a.get("message", ""), priority="high", tags="warning")
             a["escalated_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             escalated.append(a.get("id", fn))
-        with open(path, "w") as f:
-            json.dump(a, f, indent=2)
+        if a != before:
+            try:
+                _write_alert(path, a)
+            except OSError:
+                continue
     return escalated
 
 
