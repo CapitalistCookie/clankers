@@ -1,8 +1,10 @@
 """Archetype settings templates (lib/settings_templates.py, `clanker settings`).
 
 Temp repos only; git runs with an empty global config (no templateDir hooks,
-no excludes) and a fixed identity. The real templates/settings files are
-checked for the connector key.
+no excludes) and a fixed identity. The behaviour tests use one-key
+templates in a temp dir (CLANKER_SETTINGS_TEMPLATES); the real
+templates/settings files are checked for the connector key and the tool set
+policy on their own.
 """
 
 import json
@@ -20,6 +22,7 @@ sys.path.insert(0, os.path.join(REPO, "lib"))
 import settings_templates as st  # noqa: E402
 
 ARCHETYPES = ["research", "production", "tool", "infra", "frontend"]
+FIXED_TEMPLATES = {"build": {}, **{a: {"disableClaudeAiConnectors": True} for a in ARCHETYPES}}
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +34,16 @@ def isolated_git(tmp_path, monkeypatch):
     for k, v in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@example.invalid"),
                  ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@example.invalid")):
         monkeypatch.setenv(k, v)
+
+
+@pytest.fixture(autouse=True)
+def fixed_templates(tmp_path, monkeypatch):
+    """One-key templates for the behaviour tests, so they do not follow the shipped files."""
+    d = tmp_path / "templates"
+    d.mkdir()
+    for name, body in FIXED_TEMPLATES.items():
+        (d / f"{name}.json").write_text(json.dumps(body))
+    monkeypatch.setenv("CLANKER_SETTINGS_TEMPLATES", str(d))
 
 
 def repo(tmp_path, name, settings=None, git=True, text=None):
@@ -54,11 +67,15 @@ def git(path, *args):
 CFG = {"overrides": {"docs-user": "build"}}
 
 
-def test_shipped_templates_carry_the_connector_key_except_build():
+def test_shipped_templates_carry_the_connector_key_and_tool_set_policy_except_build(monkeypatch):
+    monkeypatch.delenv("CLANKER_SETTINGS_TEMPLATES", raising=False)
     assert set(ARCHETYPES) | {"build"} <= set(st.template_names())
     for a in ARCHETYPES:
-        assert st.load_template(a)["disableClaudeAiConnectors"] is True
-    assert "disableClaudeAiConnectors" not in st.load_template("build")
+        t = st.load_template(a)
+        assert t["disableClaudeAiConnectors"] is True
+        assert t["enableArtifact"] is False
+        assert t["permissions"] == {"deny": ["ScheduleWakeup"]}
+    assert not {"disableClaudeAiConnectors", "enableArtifact", "permissions"} & set(st.load_template("build"))
 
 
 def test_with_key_inserts_one_line_and_keeps_every_other_byte():

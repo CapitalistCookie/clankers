@@ -1,3 +1,9 @@
 {
-  "disableClaudeAiConnectors": true
+  "disableClaudeAiConnectors": true,
+  "enableArtifact": false,
+  "permissions": {
+    "deny": [
+      "ScheduleWakeup"
+    ]
+  }
 }
