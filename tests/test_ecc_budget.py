@@ -1,80 +1,113 @@
 """Hermetic tests for lib/ecc/budget.py — per-model cost (with cache tiers),
 the budget alert ladder, and the gauge-colour gradient.
 
-No I/O, no env, no network — pure arithmetic against known Anthropic rates.
+Prices come from the single price table (lib/pricing.py, 2026-09-24), the one
+the session-end hook prices session rows with; the ECC table (Opus $15/$75)
+is gone. No I/O, no env, no network — pure arithmetic against that table.
 Run: python3 -m pytest tests/test_ecc_budget.py -v   (or: python3 tests/test_ecc_budget.py)
 """
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from ecc import budget  # noqa: E402
+import pricing  # noqa: E402
 
 M = 1_000_000  # 1M tokens
 
 
-def test_pricing_table_matches_anthropic_public_rates():
-    assert budget.PRICING["opus"] == (15.00, 75.0, 18.75, 1.50)
-    assert budget.PRICING["sonnet"] == (3.00, 15.0, 3.75, 0.30)
-    assert budget.PRICING["haiku"] == (0.80, 4.0, 1.00, 0.08)
+def test_rates_come_from_the_single_price_table():
+    # (input, output, cache_write = 5-minute rate, cache_read), $/MTok
+    assert budget.rates_for("claude-opus-5-5") == (4.0, 20.0, 5.0, 0.20)
+    assert budget.rates_for("claude-sonnet-5") == (2.0, 10.0, 2.5, 0.20)
+    assert budget.rates_for("claude-haiku-4-5-20251001") == (1.0, 5.0, 1.25, 0.10)
+    assert budget.rates_for("claude-fable-5-1") == (10.0, 50.0, 12.5, 0.25)
+    for model, (pin, pout, pcr, p5m, _p1h) in pricing.PRICES.items():
+        assert budget.rates_for(model) == (pin, pout, p5m, pcr), model
+    assert not hasattr(budget, "PRICING")          # no second table
 
 
-def test_rates_for_substring_match_and_opus_default():
-    # exact family ids
-    assert budget.rates_for("claude-opus-4-8") == budget.PRICING["opus"]
-    assert budget.rates_for("claude-3-5-sonnet-20241022") == budget.PRICING["sonnet"]
-    assert budget.rates_for("claude-3-5-haiku") == budget.PRICING["haiku"]
-    # case-insensitive
-    assert budget.rates_for("CLAUDE-OPUS-4-8") == budget.PRICING["opus"]
-    # unknown / None / "" -> opus (clanker default; NOT sonnet like the JS hook)
-    assert budget.rates_for("gpt-4o") == budget.PRICING["opus"]
-    assert budget.rates_for(None) == budget.PRICING["opus"]
-    assert budget.rates_for("") == budget.PRICING["opus"]
+def test_rates_for_substring_family_and_sonnet_default():
+    assert budget.rates_for("claude-opus-4-8") == budget.rates_for("claude-opus-4-8[1m]")
+    assert budget.rates_for("CLAUDE-OPUS-5-5") == budget.rates_for("claude-opus-5-5")
+    assert budget.rates_for("us.anthropic.claude-sonnet-4-6") == (3.0, 15.0, 3.75, 0.30)
+    # the table's rule: unknown / None / "" -> Sonnet 5 (not ECC's opus default)
+    sonnet5 = budget.rates_for("claude-sonnet-5")
+    assert budget.rates_for("gpt-4o") == sonnet5
+    assert budget.rates_for(None) == sonnet5
+    assert budget.rates_for("") == sonnet5
 
 
 def test_known_cost_computations():
-    # 1M opus cache_read -> $1.50
-    assert budget.session_cost({"cache_read": M}, "opus") == 1.50
-    # 1M sonnet output -> $15
-    assert budget.session_cost({"output": M}, "claude-sonnet") == 15.0
-    # 1M opus input -> $15 ; 1M opus output -> $75
-    assert budget.session_cost({"input": M}, "opus") == 15.0
-    assert budget.session_cost({"output": M}, "opus") == 75.0
-    # 1M haiku input -> $0.80
-    assert budget.session_cost({"input": M}, "haiku") == 0.80
+    assert budget.session_cost({"cache_read": M}, "claude-opus-5-5") == 0.20
+    assert budget.session_cost({"output": M}, "claude-sonnet-5") == 10.0
+    assert budget.session_cost({"input": M}, "claude-opus-5-5") == 4.0
+    assert budget.session_cost({"output": M}, "claude-opus-5-5") == 20.0
+    assert budget.session_cost({"input": M}, "claude-haiku-4-5") == 1.0
+    assert budget.session_cost({"cache_read": M}, "claude-fable-5-1") == 0.25
 
 
 def test_cache_tier_rates():
-    # cache_write ~1.25x input; cache_read ~0.1x input — verify per family.
-    assert budget.session_cost({"cache_create": M}, "opus") == 18.75   # 1.25 * 15
-    assert budget.session_cost({"cache_read": M}, "opus") == 1.50      # 0.10 * 15
-    assert budget.session_cost({"cache_create": M}, "sonnet") == 3.75  # 1.25 * 3
-    assert budget.session_cost({"cache_read": M}, "sonnet") == 0.30    # 0.10 * 3
-    assert budget.session_cost({"cache_create": M}, "haiku") == 1.00
-    assert budget.session_cost({"cache_read": M}, "haiku") == 0.08
+    # 5-minute writes 1.25x input, 1-hour writes 2x input; reads per the table
+    assert budget.session_cost({"cache_create": M}, "claude-opus-5-5") == 5.0
+    assert budget.session_cost({"cache_create": M, "cache_create_1h": M},
+                               "claude-opus-5-5") == 8.0
+    assert budget.session_cost({"cache_create": M, "cache_create_1h": M // 4},
+                               "claude-opus-5-5") == 5.75
+    assert budget.session_cost({"cache_create": M}, "claude-sonnet-5") == 2.5
+    assert budget.session_cost({"cache_read": M}, "claude-sonnet-5") == 0.20
+    assert budget.session_cost({"cache_create": M}, "claude-haiku-4-5") == 1.25
 
 
 def test_cache_create_and_cache_write_are_aliases():
-    a = budget.session_cost({"cache_create": M}, "opus")
-    b = budget.session_cost({"cache_write": M}, "opus")
-    assert a == b == 18.75
+    a = budget.session_cost({"cache_create": M}, "claude-opus-5-5")
+    b = budget.session_cost({"cache_write": M}, "claude-opus-5-5")
+    assert a == b == 5.0
 
 
 def test_session_cost_sums_all_four_buckets():
-    # 1M each of input/output/cache_create/cache_read on opus.
     cost = budget.session_cost(
-        {"input": M, "output": M, "cache_create": M, "cache_read": M}, "opus"
-    )
-    assert cost == 15.0 + 75.0 + 18.75 + 1.50  # 110.25
+        {"input": M, "output": M, "cache_create": M, "cache_read": M}, "claude-opus-5-5")
+    assert cost == pytest.approx(4.0 + 20.0 + 5.0 + 0.20)
 
 
 def test_session_cost_defaults_and_garbage():
-    assert budget.session_cost({}, "opus") == 0.0
-    assert budget.session_cost(None, "opus") == 0.0
-    # unparseable token value -> treated as 0
-    assert budget.session_cost({"input": "lots"}, "opus") == 0.0
-    # default model (None) prices at opus
-    assert budget.session_cost({"output": M}) == 75.0
+    assert budget.session_cost({}, "claude-opus-5-5") == 0.0
+    assert budget.session_cost(None, "claude-opus-5-5") == 0.0
+    assert budget.session_cost({"input": "lots"}, "claude-opus-5-5") == 0.0
+    assert budget.session_cost({"output": M}) == 10.0      # no model: Sonnet 5
+
+
+def test_row_cost_adds_subagents_and_keeps_write_time_prices():
+    # a row the 2026-09-24 hook wrote: priced per message at write time
+    hook_row = {"api_calls": 3, "estimated_cost_usd": 99.22, "subagent_cost_usd": 22.96,
+                "model": "claude-fable-5-1", "tokens": {"output": M}}
+    assert budget.row_cost(hook_row) == pytest.approx(122.18)
+    # a `clanker wrap` row: Claude Code's own total
+    wrap_row = {"cost_source": "claude_code_total_cost_usd", "estimated_cost_usd": 0.5,
+                "model": "claude-sonnet-5", "tokens": {"output": M}}
+    assert budget.row_cost(wrap_row) == 0.5
+    # an older row: re-priced from its totals at the current table
+    old_row = {"model": "claude-opus-4-8", "estimated_cost_usd": 999.0,
+               "tokens": {"input": M, "output": M, "cache_read": M, "cache_create": M}}
+    assert budget.row_cost(old_row) == pytest.approx(5.0 + 25.0 + 0.50 + 6.25)
+    assert budget.row_cost({"estimated_cost_usd": 1.5}) == 1.5      # no tokens: stored
+    assert budget.row_cost({}) == 0.0
+
+
+def test_budget_action_sums_whole_rows(monkeypatch, capsys):
+    from ecc import cli
+    rows = [{"api_calls": 1, "estimated_cost_usd": 10.0, "subagent_cost_usd": 5.0},
+            {"model": "claude-sonnet-5", "tokens": {"output": M}}]
+    monkeypatch.setattr(cli, "_clanker_sessions", lambda last_days=30: rows)
+
+    class A:
+        last, limit = 30, 100.0
+    ev = cli._budget(A())
+    assert ev["ratio"] == pytest.approx(0.25)                 # 10 + 5 + 10 of 100
+    assert "$25.00 / $100.00" in capsys.readouterr().out
 
 
 def test_budget_ladder_states():

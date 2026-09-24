@@ -121,7 +121,7 @@ def _risk(args):
 
 def _budget(args):
     sessions = _clanker_sessions(getattr(args, "last", 30))
-    total = sum(budget.session_cost(s.get("tokens") or {}, s.get("model")) for s in sessions)
+    total = sum(budget.row_cost(s) for s in sessions)   # main + subagents, single price table
     limit = getattr(args, "limit", None)
     ev = budget.evaluate_budget(total, limit)
     print(f"=== Budget ({getattr(args, 'last', 30)}d) ===")

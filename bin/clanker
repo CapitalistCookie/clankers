@@ -692,83 +692,9 @@ def cmd_ingest(args):
         sys.exit(1)
 
 def cmd_wrap(args):
-    """Wrap any command with session tracking."""
-    import subprocess, time, json, re
-
-    project = args.project or os.path.basename(os.getcwd())
-    agent = "generic"
-
-    # Snapshot git state before
-    git_before = {}
-    try:
-        git_before["branch"] = subprocess.check_output(
-            ["git", "branch", "--show-current"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        git_before["commit"] = subprocess.check_output(
-            ["git", "log", "--oneline", "-1"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-    except:
-        pass
-
-    # Start session
-    from ingest import ingest_from_args
-    ok, sid, _ = ingest_from_args("session_start", agent, project, cwd=os.getcwd())
-    if ok:
-        print(f"[clanker] Session {sid[:8]} started", file=__import__('sys').stderr)
-
-    # Run the command
-    start = time.time()
-    try:
-        result = subprocess.run(args.command, shell=False)
-        exit_code = result.returncode
-    except KeyboardInterrupt:
-        exit_code = 130
-    except Exception as e:
-        print(f"[clanker] Command failed: {e}", file=__import__('sys').stderr)
-        exit_code = 1
-
-    duration = int(time.time() - start)
-
-    # Snapshot git state after
-    git_diff = {}
-    try:
-        diff_stat = subprocess.check_output(
-            ["git", "diff", "--shortstat", "HEAD"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        if diff_stat:
-            ins = re.search(r'(\d+) insertion', diff_stat)
-            dels = re.search(r'(\d+) deletion', diff_stat)
-            files = re.search(r'(\d+) file', diff_stat)
-            git_diff = {
-                "insertions": int(ins.group(1)) if ins else 0,
-                "deletions": int(dels.group(1)) if dels else 0,
-                "files": int(files.group(1)) if files else 0,
-            }
-    except:
-        pass
-
-    # Determine outcome
-    outcome = "unknown"
-    try:
-        new_commit = subprocess.check_output(
-            ["git", "log", "--oneline", "-1"], stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        if git_before.get("commit") and new_commit != git_before["commit"]:
-            outcome = "commit"
-    except:
-        pass
-    if exit_code != 0:
-        outcome = "abandoned"
-
-    # End session
-    ok, _, _ = ingest_from_args(
-        "session_end", agent, project,
-        cwd=os.getcwd(), session_id=sid,
-        duration=duration, outcome=outcome,
-        exit_code=exit_code, git_diff_stats=json.dumps(git_diff) if git_diff else None,
-    )
-    if ok:
-        print(f"[clanker] Session {sid[:8]} ended ({duration}s, exit={exit_code})", file=__import__('sys').stderr)
+    """Scripted `claude -p` pinned + isolated, or any command with session tracking."""
+    from wrap import main_from_args
+    return main_from_args(args)
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -1099,9 +1025,42 @@ def main():
     p.add_argument('--batch', action='store_true', help='Read JSONL from stdin')
     p.set_defaults(func=cmd_ingest)
 
-    p = sub.add_parser('wrap', help='Wrap any command with session tracking')
-    p.add_argument('command', nargs='+', help='Command to wrap')
-    p.add_argument('--project', help='Project name (default: current dir name)')
+    p = sub.add_parser(
+        'wrap',
+        help='Run a scripted `claude -p` pinned and isolated (no user layer, MCP, skills or transcript; '
+             'pinned model/effort, cost cap, timeout, one telemetry row); any other command runs with session tracking',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            'Run one scripted claude call the way a cron job or batch backend should:\n'
+            '  claude -p --setting-sources project,local --strict-mcp-config --disable-slash-commands\n'
+            '         --no-session-persistence --model M --effort E --max-budget-usd USD ...\n'
+            'in $CLANKER_DATA/run/<caller>, with the parent session\'s CLAUDE_CODE_* env removed,\n'
+            'CLANKER_WRAP=1 and CLANKER_WRAP_CALLER set, and one kind:nested row (Claude Code\'s own\n'
+            'total_cost_usd) appended to raw/sessions. Stdout follows --output-format (text prints\n'
+            '.result). Exit: claude\'s code; 124 timeout; 2 usage error; 127 claude missing.\n'
+            'A command that is not claude runs under session tracking and returns its own exit code.'),
+        epilog=(
+            'examples:\n'
+            '  clanker wrap --caller nightly --model claude-haiku-4-5-20251001 --effort low -- -p "Reply with exactly: OK"\n'
+            '  clanker wrap --caller batch --model claude-sonnet-5 --effort medium --timeout 900 \\\n'
+            '      -- claude -p --output-format json --tools "" < prompt.txt\n'
+            '  clanker wrap make test          # generic: session tracking only'))
+    p.add_argument('--caller', help='caller name: telemetry tag, CLANKER_WRAP_CALLER, and the run dir $CLANKER_DATA/run/<caller> (default: current dir name)')
+    p.add_argument('--model', help='model to pin (required for claude, here or as claude --model)')
+    p.add_argument('--effort', choices=['low', 'medium', 'high', 'xhigh', 'max'],
+                   help='effort to pin (required for claude, here or as claude --effort)')
+    p.add_argument('--max-cost', type=float, metavar='USD',
+                   help='claude --max-budget-usd (default 5, or CLANKER_WRAP_MAX_COST; 0 = no cap); a run over it also warns')
+    p.add_argument('--max-turns', type=int, metavar='N', help='claude --max-turns (agentic turn cap)')
+    p.add_argument('--cwd', metavar='DIR', help='directory claude runs in (default: $CLANKER_DATA/run/<caller>)')
+    p.add_argument('--timeout', type=float, metavar='S', help='kill claude\'s process group after S seconds; exit 124')
+    p.add_argument('--allow-user-layer', action='store_true',
+                   help='keep the user layer (global CLAUDE.md, user skills and hooks): omit --setting-sources')
+    p.add_argument('--dry-run', action='store_true', help='print the resolved argv, cwd and env changes; run nothing')
+    p.add_argument('--quiet', action='store_true', help='no summary line on stderr')
+    p.add_argument('--project', help='project for the telemetry row (default: the project that owns the current dir)')
+    p.add_argument('command', nargs=argparse.REMAINDER,
+                   help='after --: `claude [args]`, bare claude args (-p ...), or any other command')
     p.set_defaults(func=cmd_wrap)
 
     args = parser.parse_args()

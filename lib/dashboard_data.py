@@ -6,28 +6,22 @@ import glob
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
 
-DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
+from pricing import row_cost, row_tokens
 
-# Per-model token pricing ($/M: input, output, cache_read, cache_write). Recomputed
-# at display so the estimate is correct for known-model (recent) sessions; unknown
-# model -> Opus, since historical records predate model tracking and usage is mostly Opus.
-_PRICING = {
-    "opus": (15.0, 75.0, 1.50, 18.75),
-    "sonnet": (3.0, 15.0, 0.30, 3.75),
-    "haiku": (0.80, 4.0, 0.08, 1.00),
-}
+DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
 
 
 def _session_cost(s):
-    t = s.get("tokens") or {}
-    if not t:
-        return s.get("estimated_cost_usd", 0) or 0
-    m = (s.get("model") or "").lower()
-    pin, pout, pcr, pcw = (_PRICING["haiku"] if "haiku" in m
-                           else _PRICING["sonnet"] if "sonnet" in m
-                           else _PRICING["opus"])
-    return (t.get("input", 0) / 1e6 * pin + t.get("output", 0) / 1e6 * pout +
-            t.get("cache_read", 0) / 1e6 * pcr + t.get("cache_create", 0) / 1e6 * pcw)
+    """USD of one session row, main transcript plus subagents, from the single
+    price table (lib/pricing.py, the table the session-end hook prices with).
+    The table this replaced priced Opus at $15/$75 and ignored
+    subagent_cost_usd."""
+    return row_cost(s)
+
+
+def _session_tokens(s):
+    """Token counts of one session row, main transcript plus subagents."""
+    return row_tokens(s)
 
 
 def generate_dashboard_data():
@@ -88,7 +82,7 @@ def generate_dashboard_data():
             "hours": round(sum(min(s.get("duration_s", 0), MAX_DURATION_S) for s in sess) / 3600, 1),
             "errors": sum(s.get("errors", 0) for s in sess),
             "cost": round(sum(_session_cost(s) for s in sess), 2),
-            "tokens_m": round(sum(sum(s.get("tokens", {}).values()) for s in sess) / 1e6, 1),
+            "tokens_m": round(sum(sum(_session_tokens(s).values()) for s in sess) / 1e6, 1),
         }
 
     cur = _period_stats(current_week)
@@ -99,7 +93,7 @@ def generate_dashboard_data():
     total_tools = sum(sum(s.get("tool_uses", {}).values()) for s in sessions)
     total_cost = sum(_session_cost(s) for s in sessions)
     total_tokens = sum(
-        sum(s.get("tokens", {}).values()) for s in sessions
+        sum(_session_tokens(s).values()) for s in sessions
     )
 
     def _delta(cur_val, prev_val):
@@ -222,7 +216,7 @@ def generate_dashboard_data():
     # Token type breakdown
     token_types = Counter()
     for s in sessions:
-        for tok_type, count in (s.get("tokens") or {}).items():
+        for tok_type, count in _session_tokens(s).items():
             token_types[tok_type] += count
     data["token_types"] = dict(token_types)
 

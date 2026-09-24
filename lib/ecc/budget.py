@@ -1,8 +1,6 @@
 """Per-model cost pricing (with cache tiers) + budget alert ladder.
 
 Ported from affaan-m/ECC (OFF by default — see lib/ecc/__init__.py):
-  - the per-1M rate table incl. cacheWrite/cacheRead + the getRates substring
-    matcher        (scripts/hooks/cost-tracker.js)
   - the Normal/Alert50/Alert75/Alert90/OverBudget ladder + budget_ratio
                    (ecc2/src/tui/widgets.rs :: budget_state / budget_ratio)
   - the advisory 0.50 / warning 0.75 / critical 0.90 thresholds
@@ -10,86 +8,55 @@ Ported from affaan-m/ECC (OFF by default — see lib/ecc/__init__.py):
   - the green->yellow->red gauge gradient
                    (ecc2/src/tui/widgets.rs :: gradient_color / interpolate_rgb)
 
-PRICING uses Anthropic public list rates ($/1M tokens). cache_write is ~1.25x
-the input rate, cache_read ~0.1x the input rate.
+Prices come from the single price table, lib/pricing.py: the table the
+session-end hook prices every session row with (2026-09-24). The ECC table
+this module carried before (Opus $15/$75, cache_read 0.1x input for every
+model) no longer applied to any model in use.
 
-ESTIMATE ONLY — two real billing multipliers are deliberately NOT modeled here:
-  - the >200K-context "long-context" 2x tier (Opus/Sonnet bill input+output at
-    2x once the prompt crosses 200K tokens), and
-  - the 1h ("extended") prompt-cache 2x cache-write tier.
-On long sessions this under-counts. ECC's cost hook prefers the harness's
-authoritative `cost.total_cost_usd` when available and keeps this table only as
-a fallback; treat any number it produces as a lower-bound estimate.
+row_cost() prices a whole session row: its main transcript plus the subagent
+cost the hook records beside it (subagent_cost_usd). session_cost() prices a
+bare token dict at one model's rate, every cache write at the 5-minute rate
+unless the dict carries cache_create_1h. On rows written before 2026-09-24
+the token totals count each message 2-3 times, so their figures stay high.
 
-Pure stdlib. No imports.
+Pure stdlib apart from lib/pricing.py.
 """
 
-# Per-1M-token billing rates (USD): (input, output, cache_write, cache_read).
-# cache_write ~= 1.25x input, cache_read ~= 0.1x input.
-PRICING = {
-    "opus":   (15.00, 75.0, 18.75, 1.50),
-    "sonnet": (3.00,  15.0, 3.75,  0.30),
-    "haiku":  (0.80,  4.0,  1.00,  0.08),
-}
-
-# clanker's own usage is mostly Opus, so an unknown/unmatched model defaults to
-# opus (NOT sonnet as in the upstream JS hook — see getRates there).
-DEFAULT_FAMILY = "opus"
-
-# Budget alert ladder thresholds (advisory / warning / critical), matching
-# ecc2 Config::BUDGET_ALERT_THRESHOLDS.
-DEFAULT_THRESHOLDS = (0.50, 0.75, 0.90)
+from pricing import price_for, row_cost as _row_cost, tokens_cost
 
 
 def rates_for(model):
-    """Substring-match a model id to a pricing family; return its 4-tuple.
-
-    (input, output, cache_write, cache_read) in $/1M tokens. Matching mirrors
-    cost-tracker.js getRates (case-insensitive substring), but the fall-through
-    is opus, not sonnet. None / "" / unknown -> DEFAULT_FAMILY.
-    """
-    m = str(model or "").lower()
-    if "haiku" in m:
-        return PRICING["haiku"]
-    if "opus" in m:
-        return PRICING["opus"]
-    if "sonnet" in m:
-        return PRICING["sonnet"]
-    return PRICING[DEFAULT_FAMILY]
+    """(input, output, cache_write, cache_read) in $/1M tokens for a model id,
+    from the single price table; cache_write is the 5-minute rate. An id
+    outside the table is priced by family, anything else at Sonnet 5 (the
+    table's rule, not ECC's opus default)."""
+    pin, pout, pcr, p5m, _p1h = price_for(model)
+    return (pin, pout, p5m, pcr)
 
 
 def session_cost(tokens, model=None):
     """USD cost for a usage dict at the given model's rates.
 
     `tokens` keys (all optional, default 0):
-        input        -> input_tokens
-        output       -> output_tokens
-        cache_read   -> cache_read_input_tokens
-        cache_create -> cache_creation_input_tokens (alias: cache_write)
-
-    Returns a float rounded to 6 decimals (micro-dollars), matching the
-    rounding cost-tracker.js applies.
+        input           -> input_tokens
+        output          -> output_tokens
+        cache_read      -> cache_read_input_tokens
+        cache_create    -> cache_creation_input_tokens (alias: cache_write)
+        cache_create_1h -> the 1-hour part of cache_create
+    Unparseable values count as 0. Returns a float rounded to 6 decimals
+    (micro-dollars), matching the rounding cost-tracker.js applies.
     """
-    tokens = tokens or {}
+    return round(tokens_cost(tokens or {}, model), 6)
 
-    def _n(key, *aliases):
-        for k in (key,) + aliases:
-            if k in tokens:
-                try:
-                    v = float(tokens[k])
-                except (TypeError, ValueError):
-                    return 0.0
-                return v if v == v else 0.0  # NaN guard
-        return 0.0
 
-    inp, out, cw, cr = rates_for(model)
-    cost = (
-        (_n("input") / 1e6) * inp
-        + (_n("output") / 1e6) * out
-        + (_n("cache_create", "cache_write") / 1e6) * cw
-        + (_n("cache_read") / 1e6) * cr
-    )
-    return round(cost, 6)
+def row_cost(row):
+    """USD of one clanker session row: main transcript plus subagents."""
+    return round(_row_cost(row), 6)
+
+
+# Budget alert ladder thresholds (advisory / warning / critical), matching
+# ecc2 Config::BUDGET_ALERT_THRESHOLDS.
+DEFAULT_THRESHOLDS = (0.50, 0.75, 0.90)
 
 
 def evaluate_budget(used_usd, limit_usd, thresholds=DEFAULT_THRESHOLDS):

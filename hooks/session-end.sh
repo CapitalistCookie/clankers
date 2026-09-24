@@ -297,6 +297,12 @@ except Exception:
     pass
 
 # ---- pricing ------------------------------------------------------------------
+# One price table and one way to count API calls. This block is byte-identical
+# in hooks/session-end.sh and in the pricing module that the dashboard and the
+# budget report import. The hook ships alone and cannot import that module, so
+# it carries the block itself; tests/test_pricing.py fails when the two copies
+# differ. Edit both copies together.
+#
 # $/MTok: (input, output, cache read, 5-minute cache write, 1-hour cache write).
 # Source: the claude-api skill bundled with Claude Code 2.1.280, read
 # 2026-09-24 (shared/models.md, shared/model-migration.md,
@@ -305,6 +311,8 @@ except Exception:
 # 0.025x) and Opus 5.5 ($0.20, 0.05x). The table this replaced priced every
 # write at 1.25x, Fable 5.1 reads at $1.00, Sonnet 5 at $3/$15, and a whole
 # session at its dominant model's rate.
+import itertools
+
 PRICES = {
     "claude-fable-5-1":  (10.0, 50.0, 0.25, 12.50, 20.0),
     "claude-fable-5":    (10.0, 50.0, 1.00, 12.50, 20.0),
@@ -335,6 +343,15 @@ def price_for(model):
         if fam in m:
             return PRICES[k]
     return PRICES["claude-sonnet-5"]
+
+
+def call_cost(model, inp, out, cache_read, cache_create, cache_create_1h=0):
+    """USD for usage on one model: the 1-hour part of the cache writes at the
+    1-hour rate, the rest of them at the 5-minute rate."""
+    pin, pout, pcr, p5m, p1h = price_for(model)
+    cc1h = min(cache_create_1h, cache_create)
+    return (inp * pin + out * pout + cache_read * pcr
+            + (cache_create - cc1h) * p5m + cc1h * p1h) / 1e6
 
 
 def _n(v):
@@ -379,10 +396,9 @@ def totals(calls):
         t["output"] += o
         t["cache_read"] += cr
         t["cache_create"] += cc
-        pin, pout, pcr, p5m, p1h = price_for(model)
-        cc1h = min(cc1h, cc)
-        cost += (i * pin + o * pout + cr * pcr + (cc - cc1h) * p5m + cc1h * p1h) / 1e6
+        cost += call_cost(model, i, o, cr, cc, cc1h)
     return t, cost, len(calls)
+# ---- end of pricing -----------------------------------------------------------
 
 # ---- main transcript -----------------------------------------------------------
 tool_uses = Counter()
