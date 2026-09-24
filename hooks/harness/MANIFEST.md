@@ -87,8 +87,8 @@ These files are in `~/.claude/hooks/`, but not in this directory.
 |---|---|---|
 | `check-compute.sh` | Yes, as dispatcher gate 1 | It names an operator path and private hosts. A generic copy needs a new design. |
 | `subagent-delivery-gate.py` | Yes, PreToolUse `Agent` | It came on 2026-08-01, after the first vendoring. It is not in this directory. |
-| `branded-pdf-guard.sh`, `data-flow-map-check.sh`, `post-deploy-screenshot.sh`, `reducer-design-check.sh`, `research-optimization-check.sh`, `research-rule-guards.sh`, `research-rule9-ast.py` | No | Project-specific. |
-| `pwb-post-resolution-real-sim.sh`, `pwb-sessionend-compile.sh` | No | Symlinks into the polymarket research repo. |
+| `branded-pdf-guard.sh`, `data-flow-map-check.sh`, `post-deploy-screenshot.sh`, `reducer-design-check.sh`, `research-optimization-check.sh`, `research-rule-guards.sh`, `research-rule9-ast.py` | No | Not in `~/.claude/hooks/` since 2026-09-24. The first four moved to `.claude/hooks/` in the eigenstate repo (c0d5c23). The last three moved to `.claude/hooks/` in the eigenstateresearch repo (4387924). |
+| `pwb-post-resolution-real-sim.sh`, `pwb-sessionend-compile.sh` | No | Not in `~/.claude/hooks/` since 2026-09-24. The SessionEnd of the polymarket repo runs these scripts from its own `clanker_hooks/` directory (8d34bf4), so the two symlinks are gone. |
 | `tests/test_pretooluse_dispatch.sh` | not a hook | The parity test of the dispatcher. It contains operator paths and addresses. |
 
 ## Files removed on 2026-09-24
