@@ -36,6 +36,8 @@
   "hooks/harness/ssh-tunnel-port-guard.py",
   "hooks/harness/task-payload-gate.py",
   "hooks/harness/tests/test_context_gauge.sh",
+  "hooks/harness/tests/test_watch_gate.py",
+  "hooks/harness/watch-gate.py",
   "hooks/hooks.json",
   "hooks/session-end.sh",
   "hooks/session-start.sh",
@@ -179,5 +181,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "cf075a7"
+ "source_commit": "4878e9a"
 }

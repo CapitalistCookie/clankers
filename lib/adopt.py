@@ -26,6 +26,10 @@ CLAUDE_STUB = """# {name}
 - **Skills:** `.claude/skills/` · **project hooks:** `.claude/settings.json`.
 - **CI:** `ci/fast.sh` (<60s, green) gates pre-push via localci; add `ci/full.sh` for the detached post-commit suite.
 - Launch sessions here via `clanker work {name}`.
+
+## Waiting
+
+- Orchestrator wake economy — the orchestrator's context is the build's most expensive object; every wake (a watch event, a cron firing, a task notification) re-sends it. Arm ONE single-shot watch for all in-flight work, firing only on a terminal event (a job exited, a report file appeared, a hard threshold crossed) and re-armed only after the event is handled; never a watch that emits state (initial lines, 'running', bands, heartbeats); scheduled wakes are one-shots at the moment something can change (a reset, a deadline), never a polling cadence; batch every action into one turn; a routine event gets no reply beyond the re-arm; the lead's own turns count against the same usage window as the builders. (Global rule 25; `~/.claude/hooks/watch-gate.py` enforces it.)
 """
 
 STATUS_STUB = """# STATUS — {name} (seeded by `clanker adopt`; refine each session)

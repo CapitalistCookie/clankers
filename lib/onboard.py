@@ -42,6 +42,9 @@ ARCHETYPE_COMMANDS = {
 }
 
 
+# Global rule 25 (2026-09-26), written into each new project's CLAUDE.md.
+WAKE_ECONOMY = ("Orchestrator wake economy — the orchestrator's context is the build's most expensive object; every wake (a watch event, a cron firing, a task notification) re-sends it. Arm ONE single-shot watch for all in-flight work, firing only on a terminal event (a job exited, a report file appeared, a hard threshold crossed) and re-armed only after the event is handled; never a watch that emits state (initial lines, 'running', bands, heartbeats); scheduled wakes are one-shots at the moment something can change (a reset, a deadline), never a polling cadence; batch every action into one turn; a routine event gets no reply beyond the re-arm; the lead's own turns count against the same usage window as the builders.")
+
 def detect_archetype(project_path):
     """Scan a project directory and suggest an archetype."""
     indicators = {
@@ -304,6 +307,9 @@ Tools: {", ".join(stack["tools"]) or "none detected"}
         lines.append("- Follow existing code style and conventions\n")
         lines.append("- Run tests before committing\n")
         lines.append("- Keep commits focused and atomic\n")
+        lines.append("\n## Waiting\n\n")
+        lines.append("- " + WAKE_ECONOMY + " (Global rule 25; "
+                     "`~/.claude/hooks/watch-gate.py` enforces it.)\n")
 
         with open(project_claude, "w") as f:
             f.writelines(lines)

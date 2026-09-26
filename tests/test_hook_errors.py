@@ -237,6 +237,8 @@ def test_normal_payloads_log_nothing(tmp_path):
         ("harness/ssh-tunnel-port-guard.py", base),
         ("harness/task-payload-gate.py", dict(base, tool_name="TaskCreate",
                                                tool_input={"subject": "s", "description": "d"})),
+        ("harness/watch-gate.py", dict(base, tool_name="CronCreate",
+                                        tool_input={"cron": "17 3 26 9 *", "recurring": False})),
     ]
     for rel, payload in cases:
         path = os.path.join(HOOKS, rel)

@@ -27,6 +27,7 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | PreToolUse | `Agent` | none | `clanker-dist/subagent-tier-gate.py` | 5 | Blocks an Agent call that has no explicit `model`. |
 | PreToolUse | `Agent` | none | `subagent-delivery-gate.py` | 10 | Blocks an Agent call whose prompt has no contract to deliver the report to `main`. |
 | PreToolUse | `TaskCreate\|TaskUpdate` | none | `task-payload-gate.py` | 30 | Limits the size of the task registry, because each reminder sends the full registry again. |
+| PreToolUse | `Monitor\|CronCreate` | none | `watch-gate.py` | 10 | Enforces global rule 25, the orchestrator wake economy (see the next section). |
 | PostToolUse | `Bash` | `Bash(git *)` | `post-build-review-reminder.sh` | 5 | After `git commit` or `git push`, asks for comments and concerns. |
 | PostToolUse | `Bash` | `Bash(git commit *)` | `closure-claim-verifier.sh` | 10 | Warns when a commit claims a closure but shows no integration-test evidence. |
 | PostToolUse | `Skill` | none | `clanker-dist/skill-tracker.sh` | 5 | Records which skills run (telemetry only). |
@@ -34,6 +35,26 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. In a nested run (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`), it stops at once, unless `CLANKER_INJECT_NESTED=1`. |
 | Stop | none | none | `iron-law-check.sh` (`asyncRewake`) | 30 | Blocks a success claim that has no evidence token in the recent tool output. |
 | SessionEnd | none | none | `clanker-dist/session-end.sh` | 20 | Records the session metrics for clanker. |
+
+## Orchestrator wake economy (rule 25)
+
+Global rule 25, from 2026-09-26:
+
+> Orchestrator wake economy — the orchestrator's context is the build's most expensive object; every wake (a watch event, a cron firing, a task notification) re-sends it. Arm ONE single-shot watch for all in-flight work, firing only on a terminal event (a job exited, a report file appeared, a hard threshold crossed) and re-armed only after the event is handled; never a watch that emits state (initial lines, 'running', bands, heartbeats); scheduled wakes are one-shots at the moment something can change (a reset, a deadline), never a polling cadence; batch every action into one turn; a routine event gets no reply beyond the re-arm; the lead's own turns count against the same usage window as the builders.
+
+The incident: a lead session armed five Monitor watches for five jobs and one more watch for usage bands. Each watch sent its first state and each change of state. Each event woke the lead: about twelve wakes in 45 minutes. Each wake sent the full context of the lead again. See `~/.claude/LESSONS.md`, "Rule 25".
+
+`watch-gate.py` enforces the rule:
+
+| Case | Result |
+|---|---|
+| A Monitor command has an endless loop or follow (`while true`, `tail -f`, `inotifywait -m`, `journalctl -f`, `watch`) and has no `exit` or `break` | Deny |
+| A Monitor while an other Monitor of the same session (and subagent) is live | Deny |
+| A recurring CronCreate with a gap of less than 30 minutes between two firings | Deny |
+| A Monitor command with a state line (`heartbeat`, `echo ... running`) or a `ws` Monitor | Warning (`additionalContext`) |
+| A one-shot CronCreate (`recurring: false`) | Allow |
+
+Each allowed Monitor writes a stamp file to `$CLAUDE_SCRATCHPAD_DIR/watch-gate/<key>/`, or to `/var/tmp/claude-<uid>/watch-gate/<key>/` when that variable is not set. The key is the session ID, with `-<agent_id>` for a subagent. A stamp expires after the `timeout_ms` of its Monitor (at most 1,800,000). The hook cannot see a Monitor that stops early. Then clear the stamp: `python3 ~/.claude/hooks/watch-gate.py --reset <key>`, or remove the stamp files, or start the session with `WATCH_GATE_RESET=1`. `WATCH_GATE_OFF=1` turns off the gate.
 
 ## Bash dispatcher
 
@@ -149,8 +170,9 @@ When you change a hook, keep its block the same as the block in the other hooks.
 1. After a change to the dispatcher or to one of its gates, run `bash ~/.claude/hooks/tests/test_pretooluse_dispatch.sh`. Each row must show PASS.
 2. After a change to the context gauge, run `bash ~/.claude/hooks/context-gauge.sh --selftest`.
 3. After a change to the iron-law hook, run `bash ~/.claude/hooks/iron-law-check.sh --selftest`.
-4. After a change to a hook or to its hook-error block, run `python3 -m pytest tests/test_hook_errors.py` in the clanker repo.
-5. Before you use a new `if` rule, test it in a headless session. Use `claude -p --setting-sources project` in a scratch project that has only that hook.
+4. After a change to the watch gate, run `python3 -u ~/.claude/hooks/watch-gate.py --selftest`. It runs `tests/test_watch_gate.py` and must show `n/n PASS`.
+5. After a change to a hook or to its hook-error block, run `python3 -m pytest tests/test_hook_errors.py` in the clanker repo.
+6. Before you use a new `if` rule, test it in a headless session. Use `claude -p --setting-sources project` in a scratch project that has only that hook.
 
 ## Tool set policy
 

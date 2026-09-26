@@ -41,6 +41,7 @@ by hand. It stops and tells you to use `--force`.
 | `post-build-review-reminder.sh` | PostToolUse `Bash`, `if: Bash(git *)` | Asks for comments and concerns after `git commit` or `git push`. |
 | `governance-gates-autorun.sh` | PostToolUse `Edit\|Write`, timeout 150 s | Runs the gates of a research spec directory after an edit to one of its registry files. |
 | `task-payload-gate.py` | PreToolUse `TaskCreate\|TaskUpdate`, timeout 30 s | Limits the size of the task registry. |
+| `watch-gate.py` | PreToolUse `Monitor\|CronCreate`, timeout 10 s | Global rule 25, the orchestrator wake economy. It has a `--selftest` (runs `tests/test_watch_gate.py`). |
 
 ## Other files that sync manages
 
@@ -89,6 +90,7 @@ These files are in `~/.claude/hooks/`, but not in this directory.
 | `subagent-delivery-gate.py` | Yes, PreToolUse `Agent` | It came on 2026-08-01, after the first vendoring. It is not in this directory. |
 | `tests/test_pretooluse_dispatch.sh` | not a hook | The parity test of the dispatcher. It contains operator paths and addresses. |
 | `tests/test_context_gauge.sh` | not a hook | The installed copy of `tests/test_context_gauge.sh` in this directory. See "Tests". |
+| `tests/test_watch_gate.py` | not a hook | The selftest of `watch-gate.py`. The source is `tests/test_watch_gate.py` in this directory. Sync does not copy it, so copy it by hand after a change (`cp -p`). `watch-gate.py --selftest` runs it. |
 | `tests/test_task_payload_gate.py`, `tests/pytest.ini`, `tests/conftest.py` | not a hook | The pytest suite of `task-payload-gate.py` (`~/.claude` dc36824). `conftest.py` points `CLANKER_DATA` at a temporary directory, so that the suite writes no row to the live hook-error log (`~/.claude` 454b12f). |
 
 The nine project hooks below left `~/.claude/hooks/` on 2026-09-24. Their repos keep them now.
