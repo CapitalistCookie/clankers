@@ -44,6 +44,9 @@ ARCHETYPE_COMMANDS = {
 
 # Global rule 25 (2026-09-26), written into each new project's CLAUDE.md.
 WAKE_ECONOMY = ("Orchestrator wake economy — the orchestrator's context is the build's most expensive object; every wake (a watch event, a cron firing, a task notification) re-sends it. Arm ONE single-shot watch for all in-flight work, firing only on a terminal event (a job exited, a report file appeared, a hard threshold crossed) and re-armed only after the event is handled; never a watch that emits state (initial lines, 'running', bands, heartbeats); scheduled wakes are one-shots at the moment something can change (a reset, a deadline), never a polling cadence; batch every action into one turn; a routine event gets no reply beyond the re-arm; the lead's own turns count against the same usage window as the builders.")
+# Global rule 22's live site (2026-09-26), written into each new project's CLAUDE.md.
+LIVE_SITE = ("Live site — From the first milestone that serves a UI, the harness keeps a hot-reloading dev serve of the product alive on the tailnet, a stable, tagged origin the owner can open and watch (restarted by the supervisor, asserted by the smoke), next to the served-build smoke and the walk; the lead reports its origin (`DEV_ORIGIN`) in STATE.md. Day-0 shape: the dev serve (the framework's HMR server) runs under the supervisor (systemd user unit, or the driver) and is restarted on exit; it binds one tagged, stable local port, published on the tailnet at one stable origin; `DEV_ORIGIN=<origin>` is written in STATE.md; the smoke asserts the origin answers 200 and prints `DEV: not-yet-built(<row>)` and passes only before the row that builds it lands. (Global rule 22.)")
+
 
 def detect_archetype(project_path):
     """Scan a project directory and suggest an archetype."""
@@ -310,6 +313,8 @@ Tools: {", ".join(stack["tools"]) or "none detected"}
         lines.append("\n## Waiting\n\n")
         lines.append("- " + WAKE_ECONOMY + " (Global rule 25; "
                      "`~/.claude/hooks/watch-gate.py` enforces it.)\n")
+        lines.append("\n## Live site\n\n")
+        lines.append("- " + LIVE_SITE + "\n")
 
         with open(project_claude, "w") as f:
             f.writelines(lines)
