@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-"""Claude Code status line — a 4-row style (2026-09-27) plus the segments the old bash line carried:
-the F5 gauge (Fable weekly bucket, from ~/.cache/clanker/usage.json kept fresh by the detached refresher
-~/.claude/scripts/statusline-usage-refresh.py, at most one run per usage.next window), the GPU host probe
-(SSH, cached 300 s in /tmp/.claude-gpu-status.v2) and the user@host identity. Reads the status-line JSON on stdin.
-Rows: LIMITS [CTX] [5H] [7D] [F5] · TOKENS [IN] [OUT] [CACHE] · CONFIG model · effort · duration · GPU · WHERE user@host · cwd · branch
+"""Claude Code status line — v9 (2026-09-27): rows sized to the width Claude Code really gives the line.
+
+Segments, priority order: LIMITS [CTX] [5H] [7D] [F5] + 5-hour sparkline · TOKENS [IN] [OUT] [CACHE] · CONFIG model ·
+effort · duration · cost · GPU · WHERE user@host · cwd · branch · BUILD sup · LAND · walks · load · rx · cycle.
+The F5 gauge (Fable weekly bucket) reads ~/.cache/clanker/usage.json, kept fresh by the detached refresher
+~/.claude/scripts/statusline-usage-refresh.py; the GPU probe (SSH) is cached 300 s in /tmp/.claude-gpu-status.v2.
+
+Width (v9). Claude Code 2.1.280/281 runs this command detached (no tty; stdin/stdout/stderr are sockets) with
+COLUMNS = its own terminal width, and draws each output row as a truncating Text inside the footer box, which has
+2 cells of padding on each side plus statusLine.padding (default 0) on each side; a longer row is cut with '…'.
+So a row gets COLUMNS - 4 - 2*padding cells (CLANKER_STATUSLINE_RESERVE overrides the 4). Width source: COLUMNS,
+then the tmux pane ($TMUX_PANE), then /dev/tty, then 80. Cells are counted as tmux 3.5a (glibc, Unicode 16) and
+Claude Code count them, not by Python 3.13's Unicode 15.1 table (it calls the 7D trigram glyph one cell; both
+count two). Every glyph used is one cell in every terminal: no emoji-capable symbol, none whose width changed in
+Unicode 16. Rows are anchored by category (limits · tokens+config · where+build) when all three fit, so a value
+changing by one digit does not reshuffle the rows; otherwise segments flow greedily into three rows and the
+lowest-priority ones are dropped. Claude Code drops blank rows, so only non-empty rows are printed.
 """
 
 import json
@@ -13,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime
 
 # ── ANSI colors ──────────────────────────────────────────────────────────────
@@ -32,14 +45,19 @@ DELTA   = "\033[38;5;244m"   # muted gray for (+N) deltas
 
 USAGE_DIR = os.path.expanduser("~/.cache/clanker")
 USAGE_TTL = 300          # s: the F5 cache is fresh this long; older starts one detached refresher
-USAGE_MAX_AGE = 3600     # s: older than this the F5 segment is left out (the old line's rule)
+USAGE_MAX_AGE = 3600     # s: older than this the F5 segment is marked stale
 USAGE_REFRESHER = os.path.expanduser("~/.claude/scripts/statusline-usage-refresh.py")
 GPU_CACHE = "/tmp/.claude-gpu-status.v2"
 GPU_TTL = 300
+ERR_LOG = os.path.join(USAGE_DIR, "statusline.err")
+ERR_LOG_MAX = 256 * 1024
 # the build this line watches: overridable, no machine literal in the script
 BUILD_ROOT = os.environ.get("CLANKER_BUILD_ROOT") or os.path.expanduser("~/projects/colonizers")
 BUILD_LOCK = os.environ.get("CLANKER_BUILD_LOCK") or "/data/colonizers/locks/main.lock"
 RX_JOBS = os.environ.get("CLANKER_RX_JOBS") or "/data/colonizers/out/rx/jobs.jsonl"
+# Claude Code's footer box pads the status line by 2 cells on each side (2.1.280/281)
+FOOTER_RESERVE = 4
+SEP_CELLS = 3            # " · "
 
 
 def fmt_tokens(n):
@@ -167,19 +185,73 @@ def git_branch(cwd):
         d = parent
 
 
-def read_effort_level(cwd):
-    """Cascade: project local > project > user settings.json."""
+def settings_value(cwd, getter):
+    """First non-null value in the settings cascade: project local > project > user settings.json."""
     for path in (os.path.join(cwd, ".claude", "settings.local.json"),
                  os.path.join(cwd, ".claude", "settings.json"),
                  os.path.expanduser("~/.claude/settings.json")):
         try:
             with open(path) as f:
-                v = json.load(f).get("effortLevel")
-            if v:
+                v = getter(json.load(f))
+            if v is not None:
                 return v
         except Exception:
             continue
     return None
+
+
+# ── width: the cells a row takes in tmux and in Claude Code's renderer ────────────────────────────────────
+ANSI_RE = re.compile(r"\x1b\[[0-9;:?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+# East_Asian_Width N -> W in Unicode 16.0: tmux 3.5a (glibc) and Claude Code count these as 2; Python 3.13 says 1
+WIDE_U16 = ((0x2630, 0x2637), (0x268A, 0x268F), (0x4DC0, 0x4DFF))
+
+
+def cells(text):
+    n = last = 0
+    for ch in ANSI_RE.sub("", text):
+        o = ord(ch)
+        if o == 0xFE0F:                          # VS16 asks for emoji presentation: its base takes 2 cells
+            if last == 1:
+                n += 1
+                last = 2
+            continue
+        if o < 0x20 or 0x7F <= o < 0xA0 or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+            continue                             # controls, combining marks, ZWJ, VS15: no cell of their own
+        wide = unicodedata.east_asian_width(ch) in ("W", "F") or any(a <= o <= b for a, b in WIDE_U16)
+        last = 2 if wide else 1
+        n += last
+    return n
+
+
+def terminal_columns():
+    """The width Claude Code lays the line out in: its COLUMNS; else the tmux pane; else the tty; else 80."""
+    try:
+        c = int(os.environ.get("COLUMNS") or 0)
+    except ValueError:
+        c = 0
+    if c > 0:
+        return c, "COLUMNS"
+    pane = os.environ.get("TMUX_PANE")
+    if os.environ.get("TMUX") and pane:
+        try:
+            r = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_width}"],
+                               capture_output=True, text=True, timeout=1)
+            c = int((r.stdout or "").strip() or 0)
+            if c > 0:
+                return c, "tmux"
+        except Exception:
+            pass
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+        try:
+            c = os.get_terminal_size(fd).columns
+        finally:
+            os.close(fd)
+        if c > 0:
+            return c, "tty"
+    except Exception:
+        pass
+    return 80, "default"
 
 
 # ── F5: the Fable weekly bucket (the old line's cache + detached refresher) ──────────────────────────────
@@ -218,9 +290,9 @@ def fable_gauge_data():
         return None
     resets = to_epoch(fable.get("resets_at"))
     if not resets or resets <= now:
-        return {"percent": fable.get("percent"), "resets_at": None, "note": "\u21bb reset"}
+        return {"percent": fable.get("percent"), "resets_at": None, "note": "↻ reset"}
     if age < 0 or age >= USAGE_MAX_AGE:
-        return {"percent": fable.get("percent"), "resets_at": resets, "note": "\u21bb stale %dh" % max(1, age // 3600)}
+        return {"percent": fable.get("percent"), "resets_at": resets, "note": "↻ stale %dh" % max(1, age // 3600)}
     return {"percent": fable.get("percent"), "resets_at": resets}
 
 
@@ -241,7 +313,8 @@ def gpu_status():
                 line = line.strip()
                 if "=" in line and not line.startswith("#"):
                     k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip().strip('"').strip("'")
+                    if k.strip() in ("GPU_HOST", "GPU_USER"):
+                        env[k.strip()] = v.strip().strip('"').strip("'")
     except Exception:
         pass
     if not env.get("GPU_HOST"):
@@ -268,17 +341,19 @@ def gpu_status():
 
 HIST = os.path.join(USAGE_DIR, "statusline-hist.json")
 BLOCKS = "▁▂▃▄▅▆▇█"
-ICON = {"CTX": "▣", "5H": "⧗", "7D": "☷", "F5": "✧", "gpu": "⚙", "branch": "⎇", "land": "⚒",
-        "sup": "♥", "walk": "♟", "load": "⚖", "rx": "⇄", "cycle": "↻", "cost": "$"}
+# one cell in every terminal: no emoji-capable symbol (the v8 gear, scales, hammer, heart, pawn) and none whose
+# width changed in Unicode 16 (the v8 7D trigram, two cells in tmux and Claude Code, one in Python 3.13)
+ICON = {"CTX": "▣", "5H": "⧗", "7D": "▦", "F5": "✧", "gpu": "▤", "branch": "⎇", "land": "↧",
+        "sup": "◉", "walk": "▷", "load": "▴", "rx": "⇄", "cycle": "↻", "cost": "$"}
 
 
 def bar(pct, col, n=5):
-    """Five blocks: ▰ filled, ▱ empty, in the meter's colour."""
+    """Five squares in the meter's colour: ■ filled, □ empty."""
     try:
         k = max(0, min(n, int(round(float(pct) / 100.0 * n))))
     except Exception:
         return DIM + "□" * n + RESET
-    return col + "■" * k + DIM + "□" * (n - k) + RESET      # squares at text height: ■ filled, □ empty 
+    return col + "■" * k + DIM + "□" * (n - k) + RESET
 
 
 def countdown(epoch):
@@ -293,14 +368,17 @@ def history(key, pct):
     """Append (ts, pct) at most every 5 min; keep 8 points; return the sparkline (0–100 scaled)."""
     hist = {}
     try:
-        hist = json.load(open(HIST))
+        with open(HIST) as f:
+            hist = json.load(f)
     except Exception:
         hist = {}
     pts = [x for x in hist.get(key, []) if isinstance(x, list) and len(x) == 2][-8:]
     now = int(time.time())
     if pct is not None and (not pts or now - int(pts[-1][0]) >= 300):
-        pts.append([now, float(pct)]); pts = pts[-8:]; hist[key] = pts
         try:
+            pts.append([now, float(pct)])
+            pts = pts[-8:]
+            hist[key] = pts
             tmp = HIST + ".%d" % os.getpid()
             with open(tmp, "w") as f:
                 json.dump(hist, f)
@@ -309,7 +387,10 @@ def history(key, pct):
             pass
     if len(pts) < 2:
         return ""
-    return "".join(BLOCKS[max(0, min(7, int(v / 100.0 * 7.999)))] for _, v in pts)
+    try:
+        return "".join(BLOCKS[max(0, min(7, int(float(v) / 100.0 * 7.999)))] for _, v in pts)
+    except Exception:
+        return ""
 
 
 def build_state():
@@ -319,7 +400,8 @@ def build_state():
     now = int(time.time())
     segs = []
     try:
-        hb = json.load(open(os.path.join(root, "ci/out/run/heartbeat.json")))
+        with open(os.path.join(root, "ci/out/run/heartbeat.json")) as f:
+            hb = json.load(f)
         age = now - to_epoch(hb.get("utc"))
         if age < 30:
             segs.append(DIM + ICON["sup"] + " sup ok" + RESET)
@@ -328,7 +410,8 @@ def build_state():
     except Exception:
         segs.append(RED + ICON["sup"] + " sup ?" + RESET)
     try:
-        lk = open(BUILD_LOCK).read().strip()
+        with open(BUILD_LOCK) as f:
+            lk = f.read().strip()
         if lk:
             m = re.search(r"row=(\S+)", lk) or re.search(r'"row"\s*:\s*"([^"]+)"', lk)
             segs.append(MAGENTA + ICON["land"] + " LAND " + (m.group(1) if m else "held") + RESET)
@@ -348,14 +431,18 @@ def build_state():
     try:
         last = None
         with open(RX_JOBS, "rb") as f:
-            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 4000)); lines = f.read().decode(errors="ignore").strip().split("\n")
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 4000))
+            lines = f.read().decode(errors="ignore").strip().split("\n")
         for line in reversed(lines):
             try:
                 e = json.loads(line)
             except Exception:
                 continue
             if e.get("ev") in ("end", "fallback", "start"):
-                last = e; break
+                last = e
+                break
         if last:
             host = last.get("host") or ("local" if last.get("ev") == "fallback" else "?")
             kevin = host == "kevin-node" and last.get("ev") != "fallback"
@@ -363,7 +450,8 @@ def build_state():
     except Exception:
         pass
     try:
-        st = json.load(open(os.path.join(root, "ci/out/orch/state.json")))
+        with open(os.path.join(root, "ci/out/orch/state.json")) as f:
+            st = json.load(f)
         n = st.get("n")
         cdir = os.path.join(root, "ci/out/orch/cycles", str(n))
         live = n is not None and os.path.isdir(cdir) and not os.path.exists(os.path.join(cdir, "exit.json"))
@@ -380,10 +468,40 @@ def build_state():
     return segs
 
 
+def row_cells(row):
+    return sum(cells(s) for s in row) + SEP_CELLS * max(0, len(row) - 1)
+
+
+def layout(groups, budget, max_rows=3):
+    """groups: one list of segments per category, priority order within and across.
+    Anchored: one category per row when every row fits the budget (stable placement). Else greedy flow into
+    max_rows rows; a segment wider than a row is dropped, never cut; what does not fit is dropped from the end."""
+    groups = [[s for s in g if s] for g in groups]
+    if len(groups) <= max_rows and all(row_cells(g) <= budget for g in groups):
+        return [g for g in groups if g]
+    rows, cur, cur_w = [], [], 0
+    for seg in (s for g in groups for s in g):
+        w = cells(seg)
+        if w > budget:
+            continue
+        if cur and cur_w + SEP_CELLS + w > budget:
+            rows.append(cur)
+            cur, cur_w = [], 0
+            if len(rows) == max_rows:
+                return rows
+        cur.append(seg)
+        cur_w += (SEP_CELLS if len(cur) > 1 else 0) + w
+    if cur:
+        rows.append(cur)
+    return rows[:max_rows]
+
+
 def main():
     try:
         data = json.load(sys.stdin)
     except Exception:
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     SEP = DIM + " · " + RESET
 
@@ -401,15 +519,32 @@ def main():
     duration_ms, cost_usd = cost.get("total_duration_ms"), cost.get("total_cost_usd")
     cwd_raw = (data.get("workspace") or {}).get("current_dir") or data.get("cwd") or os.getcwd()
     model = (data.get("model") or {}).get("display_name") or (data.get("model") or {}).get("id") or "?"
-    effort = (read_effort_level(cwd_raw) or "?").upper()
+    # the live session effort (the JSON's effort.level) before the settings default (effortLevel)
+    effort = (str((data.get("effort") or {}).get("level") or "")
+              or str(settings_value(cwd_raw, lambda s: s.get("effortLevel")) or "?")).upper()
     cwd, branch = shorten_home(cwd_raw), git_branch(cwd_raw)
     fable = fable_gauge_data()
-    segs = build_state()
+    build = build_state()
+
+    # the row budget: the terminal width minus Claude Code's footer padding and statusLine.padding on both sides
+    cols, _src = terminal_columns()
+    try:
+        reserve = int(os.environ.get("CLANKER_STATUSLINE_RESERVE") or FOOTER_RESERVE)
+    except ValueError:
+        reserve = FOOTER_RESERVE
+    try:
+        pad = int(settings_value(cwd_raw, lambda s: (s.get("statusLine") or {}).get("padding")
+                                 if isinstance(s.get("statusLine"), dict) else None) or 0)
+    except (TypeError, ValueError):
+        pad = 0
+    budget = max(20, cols - reserve - 2 * max(0, pad))
+    wide = cols >= 120
 
     # the meters, with their thresholds; the hottest (closest to its red line) shows a countdown instead of the clock
     meters = [("CTX", used_pct, None, 60, 70, None), ("5H", five_pct, five_reset, 50, 80, None), ("7D", seven_pct, seven_reset, 50, 80, None)]
     if fable:
         meters.append(("F5", fable["percent"], None if fable.get("note") else fable["resets_at"], 80, 90, fable.get("note")))
+
     def heat(m):
         try:
             return float(m[1]) - m[4]
@@ -417,19 +552,11 @@ def main():
             return -999
     hot = max(meters, key=heat)[0] if meters else None
 
-    # the terminal width is unknowable from a pipe: assume 80 columns unless the environment or a tty says more
-    cols = int(os.environ.get("COLUMNS") or 0)
-    for fd in (2, 1, 0):
-        if cols:
-            break
-        try:
-            cols = os.get_terminal_size(fd).columns
-        except Exception:
-            cols = 0
-    wide = cols >= 120
-
     def fmt_pct_tight(pct):
-        return "?" if pct is None else f"{int(round(float(pct)))}%"
+        try:
+            return "?" if pct is None else f"{int(round(float(pct)))}%"
+        except Exception:
+            return "?"
 
     def gauge(label, pct, reset_epoch, yellow_at, red_at, note):
         col = pct_color(pct, yellow_at, red_at)
@@ -445,87 +572,64 @@ def main():
             return DIM + "[" + body.replace(BOLD, "").replace(RESET, RESET + DIM) + "]" + RESET
         return DIM + "[" + RESET + col + body.replace(RESET, RESET + col) + RESET + DIM + "]" + RESET
 
-    row1 = " ".join(gauge(*m) for m in meters)
-    spark = history("five_hour", five_pct)
-    if spark:
-        row1 += " " + DIM + spark + RESET
-
     def delta(n):
         return "" if not n else " " + DELTA + f"+{fmt_tokens(n)}" + RESET
+
     def bracket(inner):
         return DIM + "[" + RESET + inner + DIM + "]" + RESET
-    row2 = (bracket(LABEL + "IN " + RESET + fmt_k(total_in) + delta(cu_in)) + " "
-            + bracket(LABEL + "OUT " + RESET + RED + fmt_k(total_out) + RESET + delta(cu_out)) + " "
-            + bracket(LABEL + "CACHE " + RESET + ((YELLOW + "+" + fmt_k(cu_cc) + RESET + DIM + " / " + RESET) if cu_cc else "") + GREEN + fmt_k(cu_cr) + RESET))
 
-    gpu = gpu_status()
-    gpu_seg = "" if gpu == "unset" else (DIM if gpu == "idle" else RED if gpu == "offline" else MAGENTA) + ICON["gpu"] + " GPU " + gpu + RESET
-    row3 = CYAN + model + RESET + SEP + BOLD + effort_color(effort) + effort + RESET
+    limits = [gauge(*m) for m in meters]
+    spark = history("five_hour", five_pct)
+    if spark:
+        limits.append(DIM + spark + RESET)
+
+    tokens = [bracket(LABEL + "IN " + RESET + fmt_k(total_in) + delta(cu_in)),
+              bracket(LABEL + "OUT " + RESET + RED + fmt_k(total_out) + RESET + delta(cu_out)),
+              bracket(LABEL + "CACHE " + RESET + ((YELLOW + "+" + fmt_k(cu_cc) + RESET + DIM + " / " + RESET) if cu_cc else "")
+                      + GREEN + fmt_k(cu_cr) + RESET)]
+    config = [CYAN + model + RESET, BOLD + effort_color(effort) + effort + RESET]
     dur = fmt_duration(duration_ms)
     if dur:
-        row3 += SEP + LABEL + dur + RESET
+        config.append(LABEL + dur + RESET)
     if cost_usd:
         try:
-            row3 += SEP + LABEL + "$%.2f" % float(cost_usd) + RESET
+            config.append(LABEL + "$%.2f" % float(cost_usd) + RESET)
         except Exception:
             pass
-    row3 += SEP + gpu_seg
+    gpu = gpu_status()
+    if gpu != "unset":
+        config.append((DIM if gpu == "idle" else RED if gpu == "offline" else MAGENTA) + ICON["gpu"] + " GPU " + gpu + RESET)
     ident = "%s@%s" % (os.environ.get("USER") or os.environ.get("LOGNAME") or "?", socket.gethostname().split(".")[0])
-    row4 = SEP.join([GREEN + ident + RESET, PINK + cwd + RESET] + ([YELLOW + ICON["branch"] + " " + branch + RESET] if branch else []))
+    where = [GREEN + ident + RESET, PINK + cwd + RESET] + ([YELLOW + ICON["branch"] + " " + branch + RESET] if branch else [])
 
-    # Exactly THREE rows, filled by flowing whole segments in priority order : a row never wraps
-    # (the terminal would repeat the middle row) and a segment is never cut; what does not fit in three rows is dropped,
-    # lowest priority first. 
-    width = int(os.environ.get("COLUMNS") or 0)
-    for fd in (2, 1, 0):                      # the status line runs on a pipe; stderr is often still the tty
-        if width:
-            break
-        try:
-            width = os.get_terminal_size(fd).columns
-        except Exception:
-            width = 0
-    width = (width or 80) - 1                # unknown width → 80 columns: safe on every terminal
-    ansi = re.compile(r"\x1b\[[0-9;]*m")
-    import unicodedata
-    def vis(t):                              # terminal cells, not characters: wide glyphs take two (a miscount wraps the row)
-        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in ansi.sub("", t))
-    width -= 1                               # one spare cell against ambiguous-width glyphs
+    rows = layout([limits, tokens + config, where + build], budget)
+    for r in rows:
+        print(SEP.join(r))
 
-    order = [gauge(*m) for m in meters]
-    if spark:
-        order.append(DIM + spark + RESET)
-    order += [bracket(LABEL + "IN " + RESET + fmt_k(total_in) + delta(cu_in)),
-              bracket(LABEL + "OUT " + RESET + RED + fmt_k(total_out) + RESET + delta(cu_out)),
-              bracket(LABEL + "CACHE " + RESET + ((YELLOW + "+" + fmt_k(cu_cc) + RESET + DIM + " / " + RESET) if cu_cc else "") + GREEN + fmt_k(cu_cr) + RESET)]
-    order += [CYAN + model + RESET, BOLD + effort_color(effort) + effort + RESET]
-    if dur:
-        order.append(LABEL + dur + RESET)
-    if cost_usd:
-        try:
-            order.append(LABEL + "$%.2f" % float(cost_usd) + RESET)
-        except Exception:
-            pass
-    order += ([gpu_seg] if gpu_seg else []) + [GREEN + ident + RESET, PINK + cwd + RESET]
-    if branch:
-        order.append(YELLOW + ICON["branch"] + " " + branch + RESET)
-    order += segs
 
-    rows, cur, cur_w = [], [], 0
-    for seg in order:
-        w = vis(seg)
-        if cur and cur_w + 3 + w > width:
-            rows.append(cur); cur, cur_w = [], 0
-            if len(rows) == 3:
-                break
-        if not cur and w > width:
-            continue                           # a single segment wider than the terminal is dropped, never cut
-        cur.append(seg); cur_w += (3 if cur_w else 0) + w
-    if cur and len(rows) < 3:
-        rows.append(cur)
-    while len(rows) < 3:
-        rows.append([])
-    for r in rows[:3]:
-        print(SEP.join(r) if r else " ")
+def _log_error():
+    try:
+        import traceback
+        os.makedirs(USAGE_DIR, mode=0o700, exist_ok=True)
+        if not os.path.exists(ERR_LOG) or os.path.getsize(ERR_LOG) < ERR_LOG_MAX:
+            with open(ERR_LOG, "a") as f:
+                f.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ", time.gmtime()) + traceback.format_exc() + "\n")
+    except Exception:
+        pass
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        sys.stdout.flush()
+    except BrokenPipeError:                     # Claude Code dropped this run for a newer one: exit quietly
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+    except Exception:
+        _log_error()                            # never a traceback in the line, never a blank line: one short row
+        try:
+            print(DIM + "statusline error (~/.cache/clanker/statusline.err)" + RESET)
+        except Exception:
+            pass
