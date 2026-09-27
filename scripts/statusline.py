@@ -417,6 +417,17 @@ def main():
             return -999
     hot = max(meters, key=heat)[0] if meters else None
 
+    # the terminal width is unknowable from a pipe: assume 80 columns unless the environment or a tty says more
+    cols = int(os.environ.get("COLUMNS") or 0)
+    for fd in (2, 1, 0):
+        if cols:
+            break
+        try:
+            cols = os.get_terminal_size(fd).columns
+        except Exception:
+            cols = 0
+    wide = cols >= 120
+
     def fmt_pct_tight(pct):
         return "?" if pct is None else f"{int(round(float(pct)))}%"
 
@@ -424,7 +435,8 @@ def main():
         col = pct_color(pct, yellow_at, red_at)
         calm = col == GREEN
         body = ICON[label] + " " + label + " " + bar(pct, col) + " " + BOLD + fmt_pct_tight(pct) + RESET
-        when = countdown(reset_epoch) if (label == hot and reset_epoch) else fmt_reset(reset_epoch)
+        # the reset time only on the hottest meter unless the terminal is wide: four meters must fit 80 columns
+        when = countdown(reset_epoch) if (label == hot and reset_epoch) else (fmt_reset(reset_epoch) if wide else "")
         if when:
             body += " " + when
         if note:
@@ -472,7 +484,7 @@ def main():
             width = os.get_terminal_size(fd).columns
         except Exception:
             width = 0
-    width = (width or 170) - 1
+    width = (width or 80) - 1                # unknown width → 80 columns: safe on every terminal
     ansi = re.compile(r"\x1b\[[0-9;]*m")
     import unicodedata
     def vis(t):                              # terminal cells, not characters: wide glyphs take two (a miscount wraps the row)
