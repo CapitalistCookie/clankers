@@ -36,6 +36,10 @@ USAGE_MAX_AGE = 3600     # s: older than this the F5 segment is left out (the ol
 USAGE_REFRESHER = os.path.expanduser("~/.claude/scripts/statusline-usage-refresh.py")
 GPU_CACHE = "/tmp/.claude-gpu-status.v2"
 GPU_TTL = 300
+# the build this line watches: overridable, no machine literal in the script
+BUILD_ROOT = os.environ.get("CLANKER_BUILD_ROOT") or os.path.expanduser("~/projects/colonizers")
+BUILD_LOCK = os.environ.get("CLANKER_BUILD_LOCK") or "/data/colonizers/locks/main.lock"
+RX_JOBS = os.environ.get("CLANKER_RX_JOBS") or "/data/colonizers/out/rx/jobs.jsonl"
 
 
 def fmt_tokens(n):
@@ -240,7 +244,9 @@ def gpu_status():
                     env[k.strip()] = v.strip().strip('"').strip("'")
     except Exception:
         pass
-    host = "%s@%s" % (env.get("GPU_USER", "root"), env.get("GPU_HOST", "192.168.1.252"))
+    if not env.get("GPU_HOST"):
+        return "unset"                          # no GPU host configured in ~/.claude/research.env: the segment is left out
+    host = "%s@%s" % (env.get("GPU_USER", "root"), env["GPU_HOST"])
     remote = ("nvidia-smi --query-compute-apps=process_name,used_memory --format=csv,noheader,nounits 2>/dev/null"
               " | grep -iE 'python|torch|xgboost'"
               " | awk -F', *' '{ s+=$2 } END { if (s>0) printf \"busy %.1fGiB\", s/1024; else print \"idle\" }'")
@@ -309,7 +315,7 @@ def history(key, pct):
 def build_state():
     """The colonizers build from files the supervisor and the executor write (no process spawned):
     → the segments, colour only."""
-    root = "/home/user/projects/colonizers"
+    root = BUILD_ROOT
     now = int(time.time())
     segs = []
     try:
@@ -322,7 +328,7 @@ def build_state():
     except Exception:
         segs.append(RED + ICON["sup"] + " sup ?" + RESET)
     try:
-        lk = open("/data/colonizers/locks/main.lock").read().strip()
+        lk = open(BUILD_LOCK).read().strip()
         if lk:
             m = re.search(r"row=(\S+)", lk) or re.search(r'"row"\s*:\s*"([^"]+)"', lk)
             segs.append(MAGENTA + ICON["land"] + " LAND " + (m.group(1) if m else "held") + RESET)
@@ -341,7 +347,7 @@ def build_state():
         pass
     try:
         last = None
-        with open("/data/colonizers/out/rx/jobs.jsonl", "rb") as f:
+        with open(RX_JOBS, "rb") as f:
             f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 4000)); lines = f.read().decode(errors="ignore").strip().split("\n")
         for line in reversed(lines):
             try:
@@ -441,7 +447,7 @@ def main():
             + bracket(LABEL + "CACHE " + RESET + ((YELLOW + "+" + fmt_k(cu_cc) + RESET + DIM + " / " + RESET) if cu_cc else "") + GREEN + fmt_k(cu_cr) + RESET))
 
     gpu = gpu_status()
-    gpu_seg = (DIM if gpu == "idle" else RED if gpu == "offline" else MAGENTA) + ICON["gpu"] + " GPU " + gpu + RESET
+    gpu_seg = "" if gpu == "unset" else (DIM if gpu == "idle" else RED if gpu == "offline" else MAGENTA) + ICON["gpu"] + " GPU " + gpu + RESET
     row3 = CYAN + model + RESET + SEP + BOLD + effort_color(effort) + effort + RESET
     dur = fmt_duration(duration_ms)
     if dur:
@@ -484,7 +490,7 @@ def main():
             order.append(LABEL + "$%.2f" % float(cost_usd) + RESET)
         except Exception:
             pass
-    order += [gpu_seg, GREEN + ident + RESET, PINK + cwd + RESET]
+    order += ([gpu_seg] if gpu_seg else []) + [GREEN + ident + RESET, PINK + cwd + RESET]
     if branch:
         order.append(YELLOW + ICON["branch"] + " " + branch + RESET)
     order += segs
