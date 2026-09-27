@@ -125,6 +125,7 @@
   "localci/install.sh",
   "localci/localci-install",
   "scripts/bootstrap.py",
+  "scripts/statusline.py",
   "templates/settings/README.md",
   "templates/settings/build.json",
   "templates/settings/frontend.json",
@@ -181,5 +182,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "74e8c0a"
+ "source_commit": "fd5b6f4"
 }
