@@ -268,7 +268,7 @@ def gpu_status():
 
 HIST = os.path.join(USAGE_DIR, "statusline-hist.json")
 BLOCKS = "▁▂▃▄▅▆▇█"
-ICON = {"CTX": "▣", "5H": "⏱", "7D": "☷", "F5": "✧", "gpu": "⚙", "branch": "⎇", "land": "⚒",
+ICON = {"CTX": "▣", "5H": "⧗", "7D": "☷", "F5": "✧", "gpu": "⚙", "branch": "⎇", "land": "⚒",
         "sup": "♥", "walk": "♟", "load": "⚖", "rx": "⇄", "cycle": "↻", "cost": "$"}
 
 
@@ -474,7 +474,10 @@ def main():
             width = 0
     width = (width or 170) - 1
     ansi = re.compile(r"\x1b\[[0-9;]*m")
-    vis = lambda t: len(ansi.sub("", t))
+    import unicodedata
+    def vis(t):                              # terminal cells, not characters: wide glyphs take two (a miscount wraps the row)
+        return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in ansi.sub("", t))
+    width -= 1                               # one spare cell against ambiguous-width glyphs
 
     order = [gauge(*m) for m in meters]
     if spark:
