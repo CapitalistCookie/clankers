@@ -102,10 +102,12 @@ def canonical_name(project_path, fallback=None):
     return fallback or os.path.basename(project_path.rstrip("/"))
 
 
-def ensure_memory_stub(project_path, project_name=None):
+def ensure_memory_stub(project_path, project_name=None, config_dir=None):
     """Seed <ns>/memory/MEMORY.md for a project path. Idempotent: creates the
     stub when missing, appends the router pointer and any missing ARCS lines
-    when present. Returns 'created' | 'updated' | 'ok' | 'skipped:<why>'."""
+    when present. Returns 'created' | 'updated' | 'ok' | 'skipped:<why>'.
+    config_dir: the account slot's config dir when it is not ~/.claude — each
+    slot keeps its own projects/ tree, so the stub goes where that slot reads."""
     try:
         project_path = os.path.abspath(os.path.expanduser(project_path))
         if not os.path.isdir(project_path):
@@ -121,7 +123,10 @@ def ensure_memory_stub(project_path, project_name=None):
         root = memory_root(project_path)
         if os.path.realpath(root) == os.path.realpath(os.path.expanduser("~")):
             return "ok"
-        mem_dir = os.path.join(ns_dir(root), "memory")
+        ns = ns_dir(root)
+        if config_dir and os.path.realpath(config_dir) != os.path.realpath(os.path.dirname(CLAUDE_PROJECTS)):
+            ns = os.path.join(config_dir, "projects", slug(root))
+        mem_dir = os.path.join(ns, "memory")
         os.makedirs(mem_dir, exist_ok=True)
         mm = os.path.join(mem_dir, "MEMORY.md")
         if os.path.exists(mm):

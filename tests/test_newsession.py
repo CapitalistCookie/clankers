@@ -5,6 +5,7 @@ invoked and nothing is spawned. The integration path (real tmux, fake claude)
 was verified separately on a disposable container.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ _REAL_RUN = subprocess.run   # grabbed before the autouse fixture fakes it
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO, "lib"))
+import accounts  # noqa: E402
 import newsession  # noqa: E402
 
 calls = []
@@ -34,12 +36,28 @@ def fake_run(argv, **kw):
         return FakeProc(rc=1)            # nothing exists yet
     if "capture-pane" in argv:
         return FakeProc(rc=0, out="$ ")  # shell prompt ready, no trust dialog
+    if "display-message" in argv:
+        return FakeProc(rc=0, out="bash\n")   # the new pane runs its login shell
     return FakeProc(rc=0)
+
+
+FAKES = os.path.join(_REPO, "tests", "fakes")
+
+
+def fake_registered(name, timeout=60.0, exclude_pids=(), interval=0.5, info=None):
+    """Stand-in for newsession.wait_registered: Claude registered as THIS process
+    (whose environment is readable), resuming whatever id the launch line named."""
+    calls.append(["REGISTERED?", name])
+    typed = [c[-1] for c in calls if "send-keys" in c and "-l" in c]
+    m = re.search(r"--resume (\S+)$", typed[-1]) if typed else None
+    return {"pid": os.getpid(), "sessionId": m.group(1) if m else "sid-new",
+            "tmux_session": name, "status": "idle"}
 
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     calls.clear()
+    monkeypatch.setattr(newsession, "wait_registered", fake_registered)
     monkeypatch.setattr(newsession, "DATA_DIR", str(tmp_path))
     monkeypatch.setattr(newsession, "_LAST_FILE", str(tmp_path / ".last_new_session"))
     monkeypatch.setattr(newsession.shutil, "which", lambda _: "/usr/bin/tmux")
@@ -69,10 +87,21 @@ def test_spawn_launches_claude_with_flags():
 
 
 def test_launch_cmd_cd_prefix_and_resume():
-    lc = newsession.launch_cmd("/tmp/some repo")
+    single = accounts.resolve(None)[0]                    # conftest: single-slot mode
+    lc = newsession.launch_cmd("/tmp/some repo", slot=single)
     assert lc.startswith("cd '/tmp/some repo' && ") and lc.endswith(newsession.LAUNCH)
-    assert newsession.launch_cmd("/x", resume=True).endswith("--resume")
-    assert newsession.launch_cmd("/x", resume="abc-123").endswith("--resume abc-123")
+    assert newsession.launch_cmd("/x", resume=True, slot=single).endswith("--resume")
+    assert newsession.launch_cmd("/x", resume="abc-123", slot=single).endswith("--resume abc-123")
+    # account slots: the launch line always says which config dir — set or unset
+    home = {"id": "a1", "home": True, "config_dir": "/data/accounts/a1"}
+    a3 = {"id": "a3", "home": False, "config_dir": "/data/accounts/a3"}
+    assert newsession.launch_cmd("/x", slot=home, session="s1") == (
+        "cd /x && env -u CLAUDE_CONFIG_DIR CLANKER_SESSION=s1 " + newsession.LAUNCH)
+    assert newsession.launch_cmd("/x", resume="r-1", slot=a3, session="s1") == (
+        "cd /x && env CLAUDE_CONFIG_DIR=/data/accounts/a3 CLANKER_SESSION=s1 "
+        + newsession.LAUNCH + " --resume r-1")
+    with pytest.raises(TypeError):
+        newsession.launch_cmd("/x")                       # no launch without a slot
 
 
 def test_spawn_waits_for_prompt_and_polls_trust():
@@ -366,17 +395,16 @@ def test_work_starts_claude_in_existing_plain_shell_session(monkeypatch):
     """Boot and fleet-heal recreate mapped sessions as plain shells (Claude only
     on demand), so the `work` path must start Claude in one: cd-prefixed,
     resumed when asked, exact-match target, trust dialog still handled."""
-    trusted = []
     monkeypatch.setattr(newsession.subprocess, "run", _run_existing("bash"))
-    monkeypatch.setattr(newsession, "accept_trust_prompt", lambda n: trusted.append(n))
     name, msg = newsession.spawn(name="proj", cwd="/tmp/proj", resume="abc-123",
                                  start_claude_in_shell=True)
-    assert name == "proj" and "started claude" in msg
+    assert name == "proj" and "started claude" in msg, msg
     typed = [c for c in calls if "send-keys" in c and "-l" in c]
     assert len(typed) == 1
-    assert typed[0][-1] == newsession.launch_cmd("/tmp/proj", resume="abc-123")
+    assert typed[0][-1] == newsession.launch_cmd("/tmp/proj", resume="abc-123",
+                                                 slot=accounts.resolve(None)[0], session="proj")
     assert "=proj:" in typed[0]
-    assert trusted == ["proj"]
+    assert ["REGISTERED?", "proj"] in calls               # verified, trust dialog handled on the way
     assert not any("new-session" in c for c in calls)
 
 
@@ -407,12 +435,17 @@ def test_work_cli_starts_claude_in_existing_plain_shell_end_to_end(tmp_path):
     log, state = tmp_path / "tmux.log", tmp_path / "capture.n"
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
+    pending = tmp_path / "pending"
     (fakebin / "tmux").write_text(
         "#!/bin/bash\n"
         f'echo "$*" >> "{log}"\n'
         'case "$1" in\n'
         "  has-session) exit 0;;\n"
-        "  display-message) echo bash;;\n"
+        "  display-message) case \"$*\" in *pane_id*) printf '%%1\\t1\\tbash\\t/x\\n';; *) echo bash;; esac;;\n"
+        "  send-keys)\n"
+        f'    if [ "$4" = "-l" ]; then printf "%s" "${{@: -1}}" > "{pending}";\n'
+        f'    elif [ "${{@: -1}}" = Enter ] && [ -s "{pending}" ]; then\n'
+        f'      l=$(cat "{pending}"); : > "{pending}"; setsid bash -c "$l" >/dev/null 2>&1 < /dev/null & fi;;\n'
         "  capture-pane)\n"
         f'    n=$(cat "{state}" 2>/dev/null || echo 0); echo $((n+1)) > "{state}"\n'
         "    if [ \"$n\" = 0 ]; then echo '$ '; else\n"
@@ -421,17 +454,20 @@ def test_work_cli_starts_claude_in_existing_plain_shell_end_to_end(tmp_path):
     (fakebin / "tmux").chmod(0o755)
     env = {**os.environ, "HOME": str(tmp_path), "CLANKER_REGISTRY": str(reg),
            "CLANKER_PROJECT_ROOTS": str(tmp_path), "CLANKER_DATA": str(tmp_path / "data"),
-           "PATH": f"{fakebin}:{os.environ['PATH']}"}
+           "PATH": f"{fakebin}:{FAKES}:{os.environ['PATH']}", "FAKE_CLAUDE_LIFETIME": "15",
+           "CLANKER_LAUNCH_TIMEOUT": "20"}
     env.pop("TMUX", None)
+    env.pop("CLANKER_CLAUDE_SESSIONS_DIR", None)          # the fake claude registers under $HOME/.claude
     r = _REAL_RUN([os.path.join(_REPO, "bin", "clanker"), "work", "bootproj", "--no-attach"],
                   capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "started claude in existing session 'bootproj'" in r.stdout
+    assert "started claude in existing session 'bootproj'" in r.stderr
     lines = log.read_text().splitlines()
     typed = [ln for ln in lines if ln.startswith("send-keys") and " -l -- " in ln]
     assert len(typed) == 1 and "-t =bootproj:" in typed[0]
-    assert typed[0].endswith(f"cd {proj} && {newsession.LAUNCH}")
-    assert sum(1 for ln in lines if ln.startswith("send-keys") and ln.endswith("Enter")) == 2
+    assert typed[0].endswith(f"cd {proj} && CLANKER_SESSION=bootproj {newsession.LAUNCH}")
+    enters = [ln for ln in lines if ln.startswith("send-keys") and ln.endswith("Enter")]
+    assert len(enters) >= 2 and all("=bootproj:" in ln for ln in enters)   # launch + trust Yes
     assert not any(ln.startswith("new-session") for ln in lines)
 
 
@@ -483,6 +519,7 @@ def test_work_clanker_never_resolves_to_clanker_41_end_to_end(tmp_path):
     reg.write_text("projects:\n  clanker:\n    archetype: tool\n"
                    f"    path: {proj}\n")
     log, alive, cap = tmp_path / "tmux.log", tmp_path / "alive", tmp_path / "capture.n"
+    pending = tmp_path / "pending"
     alive.write_text("clanker-41\n")
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
@@ -504,7 +541,11 @@ def test_work_clanker_never_resolves_to_clanker_41_end_to_end(tmp_path):
         'case "$1" in\n'
         '  has-session) [ -n "$r" ] || exit 1;;\n'
         '  new-session) prev=""; for a in "$@"; do [ "$prev" = "-s" ] && echo "$a" >> "$alive"; prev="$a"; done;;\n'
-        '  display-message) [ -n "$r" ] || exit 1; echo bash;;\n'
+        '  display-message) [ -n "$r" ] || exit 1; case "$*" in *pane_id*) printf "%%1\\t1\\tbash\\t/x\\n";; *) echo bash;; esac;;\n'
+        '  send-keys)\n'
+        f'    if [ "$4" = "-l" ]; then printf "%s" "${{@: -1}}" > "{pending}";\n'
+        f'    elif [ "${{@: -1}}" = Enter ] && [ -s "{pending}" ]; then\n'
+        f'      l=$(cat "{pending}"); : > "{pending}"; setsid bash -c "$l" >/dev/null 2>&1 < /dev/null & fi;;\n'
         '  capture-pane)\n'
         '    [ -n "$r" ] || exit 1\n'
         '    n=$(cat "$cap" 2>/dev/null || echo 0); echo $((n+1)) > "$cap"\n'
@@ -515,12 +556,14 @@ def test_work_clanker_never_resolves_to_clanker_41_end_to_end(tmp_path):
     (fakebin / "tmux").chmod(0o755)
     env = {**os.environ, "HOME": str(tmp_path), "CLANKER_REGISTRY": str(reg),
            "CLANKER_PROJECT_ROOTS": str(tmp_path), "CLANKER_DATA": str(tmp_path / "data"),
-           "PATH": f"{fakebin}:{os.environ['PATH']}"}
+           "PATH": f"{fakebin}:{FAKES}:{os.environ['PATH']}", "FAKE_CLAUDE_LIFETIME": "15",
+           "CLANKER_LAUNCH_TIMEOUT": "20"}
     env.pop("TMUX", None)
+    env.pop("CLANKER_CLAUDE_SESSIONS_DIR", None)
     r = _REAL_RUN([os.path.join(_REPO, "bin", "clanker"), "work", "clanker", "--no-attach"],
                   capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "session 'clanker'" in r.stdout and "already exists" not in r.stdout
+    assert "started claude 'clanker'" in r.stderr and "already exists" not in r.stderr
     lines = log.read_text().splitlines()
     assert "has-session -t =clanker" in lines
     assert any(ln.startswith("new-session -d -s clanker ") for ln in lines)

@@ -53,6 +53,8 @@ def _set(args):
         val = int(val)
     elif key == "budget_usd":
         val = None if str(val).lower() in ("none", "off", "") else float(val)
+    elif key == "account":
+        val = None if str(val).lower() in ("none", "off", "") else str(val)
     cfg = control.set_config(**{key: val})
     print(f"{key} = {cfg[key]}")
 
@@ -61,11 +63,14 @@ def _spawn(args):
     if not control.enabled():
         print("orchestration is OFF — enable first: clanker orch on")
         return 1
-    task = " ".join(args.cmdline or [])
+    words = list(args.cmdline or [])
+    import accounts
+    account = words.pop(0) if words and accounts.SLOT_RX.match(words[0]) else None
+    task = " ".join(words)
     if not task:
-        print("usage: clanker orch spawn \"<task>\" --project X [--headless]")
+        print("usage: clanker orch spawn [<slot>] \"<task>\" --project X [--headless]")
         return 1
-    rec = spawn_mod.spawn(task, project=args.project, headless=args.headless)
+    rec = spawn_mod.spawn(task, project=args.project, headless=args.headless, account=account)
     if rec.get("error"):
         print(f"could not spawn: {rec['error']} ({rec.get('active')}/{rec.get('max_parallel')})")
         return 1

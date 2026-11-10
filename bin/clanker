@@ -6,6 +6,7 @@ onboarding, audit, GC, resource monitoring, temporal analysis, export/import.
 """
 
 import argparse
+import json
 import sys
 import os
 
@@ -92,16 +93,19 @@ def cmd_alert(args):
     from alerts import handle_alert
     handle_alert(args.action, alert_id=args.id, message=args.message, cron=args.cron, json_output=args.json)
 
-def cmd_version(args):
-    import json as _json
+def _version():
+    """plugin.json is the single version source; None for a detached install."""
     plugin_json = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '.claude-plugin', 'plugin.json')
     try:
         with open(plugin_json) as f:
-            meta = _json.load(f)
-        print(f"clanker v{meta['version']}")
+            return json.load(f)['version']
     except (OSError, ValueError, KeyError):
-        # plugin.json is the single version source; absent = detached install
-        print("clanker (version unknown — plugin.json missing)")
+        return None
+
+
+def cmd_version(args):
+    v = _version()
+    print(f"clanker v{v}" if v else "clanker (version unknown — plugin.json missing)")
 
     from analyze import load_sessions
     from alerts import count_alerts
@@ -312,12 +316,45 @@ def cmd_init(args):
             add_session(args.name, path)
 
 def cmd_remove(args):
+    """`clanker remove <project> [-y] [--force]` (also `project remove`): take a
+    project out of clanker; the repo stays. Asks first (a script needs -y); its
+    session ends through `close`, which refuses while Claude is working."""
     from onboard import remove_project
     from audit import log_change
-    ok = remove_project(args.name, force_schedules=getattr(args, 'force_schedules', False))
+    from registry import Registry
+    from newsession import _session_exists
+    import session_flow as sf
+    name = args.name
+    reg = Registry()
+    if name not in reg.projects:
+        _err(f"no project '{name}' (clanker project ls lists them)")
+        return 1
+    live = _session_exists(name)
+    summary = (f"remove the project '{name}' from clanker — the repo {reg.get_path(name)} stays:\n"
+               "  deleted: its registry entry, its per-project settings.json, .claude/clanker.local.md, "
+               "its wiki article"
+               + (f"\n  its session '{name}' closes: Claude exits cleanly" if live else ""))
+    if not getattr(args, "yes", False):
+        if not _interactive():
+            _err(summary + f"\nnot a terminal: confirm with  clanker remove {name} -y")
+            return 2
+        print(summary, file=sys.stderr)
+        if not _yes(f"remove '{name}'?", False):
+            _say(f"kept '{name}'")
+            return 1
+
+    def end_session():
+        if not _session_exists(name):
+            return True
+        rc, msg = sf.close(name, yes=True, force=getattr(args, "force", False), progress=_progress)
+        (_say if rc == 0 else _err)(msg)
+        return rc == 0
+
+    ok = remove_project(name, force_schedules=getattr(args, 'force_schedules', False),
+                        end_session=end_session)
     if not ok:
         return 1          # gate refused (exit-code honesty, repo law 2)
-    log_change("project-removed", args.name)
+    log_change("project-removed", name)
     return 0
 
 
@@ -395,9 +432,15 @@ def cmd_schedules(args):
 def cmd_tmux(args):
     from tmux_manager import list_sessions, add_session, remove_session
     if args.action == 'list':
-        print(list_sessions())
+        print(_with_accounts(list_sessions()))
     elif args.action == 'add':
-        add_session(args.name, args.path)
+        import accounts
+        slot, _rest, err = accounts.take_slot(list(args.extra or []))
+        if err:
+            print(err, file=sys.stderr)
+            return 2
+        if not add_session(args.name, args.path, account=slot):
+            return 1
     elif args.action == 'remove':
         remove_session(args.name)
     elif args.action == 'accept-trust':
@@ -410,60 +453,620 @@ def cmd_tmux(args):
         print(f"accept-trust: answered {len(done)} of {len(names)} pane(s)"
               + (f": {', '.join(done)}" if done else ""))
 
-def cmd_new(args):
-    from newsession import spawn
-    name = " ".join(args.name) if args.name else None
-    sess, msg = spawn(name=name, shell=args.shell)
-    print(msg)
-    return 0 if sess else 1
+def _with_accounts(listing):
+    """`tmux ls` lines, each Claude session tagged with the account slot its
+    process runs on (read from the process, every slot's registry)."""
+    try:
+        import accounts
+        import claude_registry
+        import subprocess
+        sl, _err = accounts.slots_or_home()
+        # pane id -> session: a record names the session its client came through
+        # (the dashboard's web-* bridge while a web terminal is open), the pane is exact
+        p = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{session_name}"],
+                           capture_output=True, text=True)
+        session_of = dict(ln.split(" ", 1) for ln in p.stdout.splitlines() if " " in ln)
+        slot_of = {}
+        for rec in claude_registry.read_all(sl):
+            sess = session_of.get(rec.get("pane_id")) or rec.get("tmux_session")
+            if sess and not sess.startswith("web-"):
+                s = accounts.slot_of_pid(rec["pid"], sl)
+                slot_of[sess] = s["id"] if s else "?"
+    except Exception:
+        return listing
+    out = []
+    for line in (listing or "").splitlines():
+        name = line.split(":", 1)[0]
+        out.append(line + (f"  [account {slot_of[name]}]" if name in slot_of else ""))
+    return "\n".join(out)
 
-def cmd_open(args):
+
+def _interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _ask_account(what):
+    """On a terminal, the user picks the slot from the usable ones; otherwise None
+    (the caller fails, exit 2). The user always selects: no default."""
+    import accounts
+    try:
+        sl = accounts.slots(online=True)
+    except accounts.AccountsError as e:
+        print(f"account slots unavailable: {e}", file=sys.stderr)
+        return None
+    if len(sl) == 1 and sl[0].get("single"):
+        return sl[0]["id"]
+    if not _interactive():
+        return None
+    good = [s for s in sl if s["usable"]]
+    if not good:
+        print("no usable account slot\n" + accounts.usable_summary(sl), file=sys.stderr)
+        return None
+    print(f"Account for {what}:")
+    for s in good:
+        warn = ("  ! " + "; ".join(s["warnings"])) if s["warnings"] else ""
+        print(f"  {accounts.label(s)}{'  (home login)' if s['home'] else ''}{warn}")
+    for s in sl:
+        if not s["usable"] and s["status"] != "empty":
+            print(f"  {s['id']}: not usable — {s['why']}")
+    ids = [s["id"] for s in good]
+    while True:
+        try:
+            got = input(f"account [{'/'.join(ids)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if got in ids:
+            return got
+        if not got:
+            return None
+        print(f"  '{got}' is not one of {', '.join(ids)}")
+
+
+def _need_account(slot, what, usage):
+    """(account, rc): the slot word given, or the one picked on a terminal; else
+    rc 2 after saying how to name one."""
+    acct = slot or _ask_account(what)
+    if acct:
+        return acct, 0
+    import accounts
+    try:
+        summary = accounts.usable_summary(accounts.slots(online=True))
+    except accounts.AccountsError as e:
+        summary = f"account slots unavailable: {e}"
+    print(f"choose an account for {what}: {usage}\n{summary}", file=sys.stderr)
+    return None, 2
+
+
+def _words(args):
+    """(slot word, other words) of a session command, or exit 2 on two slots."""
+    import accounts
+    slot, rest, err = accounts.take_slot(list(getattr(args, 'words', None) or []))
+    if err:
+        _err(err)
+        sys.exit(2)
+    return slot, rest
+
+
+# Output (clig.dev): results — a session name, JSON, a table — go to stdout; messages
+# for the person go to stderr, and -q silences them. Errors always reach stderr.
+QUIET = False
+
+
+def _say(msg):
+    if msg and not QUIET:
+        print(msg, file=sys.stderr)
+
+
+def _err(msg):
+    if msg:
+        print(msg, file=sys.stderr)
+
+
+def _progress(text):
+    """A step of a slow action (switch, close), on a terminal only."""
+    if _interactive() and not QUIET:
+        print(f"  {text}", file=sys.stderr, flush=True)
+
+
+def _result(args, data):
+    """The command's result on stdout: JSON with --json; else the session's name when
+    no terminal reads it (a script: `s=$(clanker new a3 -d)`, as `docker run -d`
+    prints the container id); nothing for a person at a terminal."""
+    if getattr(args, "json", False):
+        print(json.dumps(data))
+    elif not _interactive() and data.get("session"):
+        print(data["session"])
+
+
+def _resolve_name(words, names, what="session", hint=""):
+    """The one name `words` means. On a terminal: forgiving case, spacing, prefixes
+    and typos, and a question when only a close match exists. In a script: exact
+    names only (case aside) — a prefix unique today fits two names tomorrow.
+    None (message printed) if nothing fits."""
+    import fleet
+    name, how, sugg = fleet.resolve(words, names)
+    scripted = False
+    if name:
+        if how in ("exact", "case") or _interactive():
+            if how != "exact":
+                _say(f"→ {name}")
+            return name
+        sugg, scripted = [name], True
+    q = " ".join(words)
+    if sugg and _interactive():
+        if len(sugg) == 1:
+            return sugg[0] if _yes(f"no {what} '{q}' — did you mean {sugg[0]}?", True) else None
+        return _pick(sugg, f"no {what} '{q}' — which one?")
+    _err(f"no {what} '{q}'" + (" (a script names it exactly)" if scripted else "")
+         + (f" — did you mean: {', '.join(sugg)}" if sugg else "") + (f"\n{hint}" if hint else ""))
+    return None
+
+
+def _pick(names, prompt, labels=None):
+    """A numbered choice on a terminal: number or name; Enter cancels."""
+    for i, n in enumerate(names, 1):
+        print(f"  {i:>2}  {labels[i - 1] if labels else n}", file=sys.stderr)
+    try:
+        got = input(f"{prompt} [1-{len(names)}, Enter = cancel]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return None
+    if got.isdigit() and 1 <= int(got) <= len(names):
+        return names[int(got) - 1]
+    if not got:
+        return None
+    return _resolve_name(got.split(), names)
+
+
+def _yes(question, default):
+    """A y/n answer on a terminal; Enter takes the default."""
+    try:
+        ans = input(f"{question} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print(file=sys.stderr)
+        return False
+    return default if not ans else ans in ("y", "yes")
+
+
+def _history_path():
+    from session_switch import data_dir
+    return os.path.join(data_dir(), ".open_history.json")
+
+
+def _history():
+    try:
+        with open(_history_path()) as f:
+            h = json.load(f)
+        return h if isinstance(h, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember_open(name):
+    """For `clanker open -` (as `cd -`): the session a person comes from — the tmux
+    client's current one, else the one opened before — and the one they go to."""
+    import subprocess
+    cur = None
+    if os.environ.get("TMUX"):
+        p = subprocess.run(["tmux", "display-message", "-p", "#S"], capture_output=True, text=True)
+        cur = p.stdout.strip() if p.returncode == 0 and not p.stdout.startswith("web-") else None
+    h = _history()
+    prev = cur if cur and cur != name else (h.get("cur") if h.get("cur") != name else h.get("prev"))
+    try:
+        from session_switch import data_dir
+        os.makedirs(data_dir(), exist_ok=True)
+        tmp = _history_path() + f".{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"prev": prev, "cur": name}, f)
+        os.replace(tmp, _history_path())
+    except OSError:
+        pass
+
+
+def _attach(name):
+    """Attach a person at a terminal (recorded for `open -`); a script is told the
+    command to run."""
     from newsession import attach
-    ok, msg = attach(args.name)
-    print(msg)
+    if _interactive():
+        _remember_open(name)
+    ok, msg = attach(name)
+    (_say if ok else _err)(msg)
     return 0 if ok else 1
 
-def cmd_work(args):
-    """`clanker work <project>` — launch (or reattach) a Claude work session IN the
-    project's repo, so the repo's CLAUDE.md / skills / hooks / memory namespace load.
-    Harness overhaul 2026-07-05: sessions belong in repos; ~ is for meta work only."""
-    from registry import Registry
-    from newsession import spawn, attach
-    reg = Registry()
-    name = args.project
-    path = reg.get_path(name)
-    if not path or not os.path.isdir(path):
-        known = ", ".join(sorted(reg.projects.keys()))
-        print(f"work: unknown project '{name}' (path: {path or '?'})\nregistered: {known}",
-              file=sys.stderr)
-        return 1
-    if args.print_path:
-        print(path)
-        return 0
-    # Boot and fleet-heal leave mapped sessions as plain shells (Claude is on
-    # demand only, 2026-09-24): `work` starts Claude in one that exists.
-    sess, msg = spawn(name=name, cwd=path, shell=args.shell, resume=getattr(args, 'resume', None),
-                      start_claude_in_shell=True)
-    print(msg)
+
+def _finish(args, data):
+    """The end of new/open: the result, then attach unless -d or no terminal."""
+    _result(args, data)
+    return 0 if args.detach or getattr(args, "json", False) else _attach(data["session"])
+
+
+def cmd_new(args):
+    """`clanker new [<slot>] [project] [name...]` — a new Claude session in a
+    project: the one named, else the project of the current directory (a git
+    worktree of it stays a worktree). Every Claude session belongs to a project
+    (lib/session_flow.py); outside one, a terminal offers to create it. Opened
+    right away; kept across reboots until `clanker close`."""
+    import session_flow as sf
+    from newsession import spawn, _session_exists, _slug, _pane_command
+    slot, rest = _words(args)
+    if args.shell:
+        # a plain shell needs no project and no account
+        name = " ".join(rest) if rest else None
+        if name and _session_exists(_slug(name)):
+            _say(f"session '{_slug(name)}' exists — opening it")
+            return _finish(args, {"session": _slug(name), "action": "exists", "shell": True})
+        sess, msg = spawn(name=name, shell=True)
+        (_say if sess else _err)(msg)
+        if not sess:
+            return 1
+        sf.keep(sess, os.getcwd(), say=_say)
+        return _finish(args, {"session": sess, "action": "started", "shell": True, "path": os.getcwd()})
+    projs = sf.projects()
+    where = sf.resolve_new(rest, os.getcwd(), projs)
+    if where.get("error"):
+        where = _new_project_or_say(where, rest, projs)
+        if not where:
+            return 1 if rest else 2
+    name = sf.session_name(where["project"], where["label"])
+    if _session_exists(name):
+        _say(f"session '{name}' exists — opening it"
+             + (f" (to move it to {slot}: clanker open {name} {slot})"
+                if slot and _pane_command(name) == "claude" else ""))
+        return _finish(args, {"session": name, "action": "exists", "project": where["project"]})
+    acct, rc = _need_account(slot, f"session '{name}' in {where['project']}",
+                             "clanker new <slot> [project] [name]")
+    if rc:
+        return rc
+    sess, msg = spawn(name=name, cwd=where["place"], account=acct, resume=args.resume)
+    (_say if sess else _err)(msg)
     if not sess:
         return 1
-    if not args.no_boot:
-        # Crash-resilience (audit M1, 07-22 OOM): a work session absent from the
-        # boot map dies with the box. Also covers the reattach path — sessions
-        # created before this existed get registered on their next `work`.
-        from tmux_manager import ensure_boot_entry
-        ensure_boot_entry(sess, path)
-    if args.no_attach:
+    sf.keep(sess, where["place"], say=_say)
+    return _finish(args, {"session": sess, "action": "started", "project": where["project"],
+                          "path": where["place"], "account": acct})
+
+
+def _new_project_or_say(where, rest, projs):
+    """`new` outside every project: on a terminal, offer the close match, then to
+    create the project the first word names (clanker create); else say what to run."""
+    import session_flow as sf
+    word, sugg = where["word"], where["suggestions"]
+    if not word:
+        if _interactive():
+            names = sorted(projs)
+            _say("here is not inside a project.")
+            got = _pick(names, "start the session in which project?")
+            if got:
+                return {"project": got, "root": projs[got], "place": projs[got], "label": []}
+            return None
+        _err("here is not inside a project — name one: clanker new <slot> <project> [name]\n"
+             "(clanker project ls lists them; clanker project create <name> makes one)")
+        return None
+    tip = f" — did you mean: {', '.join(sugg)}" if sugg else ""
+    if not _interactive():
+        _err(f"no project '{word}'{tip}\nevery Claude session runs in a project: "
+             f"clanker create {word} makes it (or run clanker new inside one)")
+        return None
+    if sugg:
+        got = (sugg[0] if _yes(f"no project '{word}' — did you mean {sugg[0]}?", True) else None) \
+            if len(sugg) == 1 else _pick(sugg, f"no project '{word}' — which one? (Enter: none of these)")
+        if got:
+            return {"project": got, "root": projs[got], "place": projs[got], "label": rest[1:]}
+    else:
+        _say(f"no project '{word}'")
+    if not _yes(f"create the project '{word}' (~/projects/{word}, git, CLAUDE.md, registry)?", False):
+        return None
+    from adopt import adopt
+    adopt(word, new=True)          # its doctor fails until the repo has a remote: that is fine here
+    projs = sf.projects()
+    if word not in projs:
+        _err(f"the project '{word}' was not created (see above)")
+        return None
+    return {"project": word, "root": projs[word], "place": projs[word], "label": rest[1:]}
+
+
+def cmd_open(args):
+    """`clanker open [<project|session>|-] [<slot>]` — go to it (`work` is the same
+    command). A session: attach; when it is only a shell (after a reboot) Claude
+    starts in it, on the account named or picked; a slot moves a running Claude
+    there. A project with no session: its session starts in the repo. `-`: the
+    session you came from. No name: a picker on a terminal."""
+    import fleet
+    import session_flow as sf
+    from newsession import read_last, pane_info, spawn, SHELLS, _session_exists, _pane_command
+    slot, rest = _words(args)
+    projs = sf.projects()
+    sessions = fleet.session_names()
+    if rest == ["-"]:
+        name = _history().get("prev")
+        if not name or not _session_exists(name):
+            _err("no previous session to go back to" + (f" ('{name}' is gone)" if name else ""))
+            return 1
+    elif rest:
+        name = _resolve_name(rest, sorted(set(sessions) | set(projs)), what="session or project",
+                             hint="clanker ls lists sessions, clanker project ls projects; "
+                                  "clanker new <slot> <project> starts one")
+        if not name:
+            return 1
+    elif _interactive():
+        rs = [r for r in fleet.rows() if r["claude"]]
+        if not rs:
+            _err("no Claude sessions — start one: clanker open <project> <slot>")
+            return 1
+        labels = [f"{r['name'][:30]:30} {','.join(r['slots']):5} {r['state']:9} {fleet.ago(r['since_s'])}"
+                  for r in rs]
+        name = _pick([r["name"] for r in rs], "open which?", labels)
+        if not name:
+            return 1
+    else:
+        name = read_last()
+        if not name or name not in sessions:
+            _err("no session to open — name one: clanker open <project|session> [slot]")
+            return 1
+    is_session, path = _session_exists(name), projs.get(name)
+    if args.print_path:
+        if not path:
+            _err(f"'{name}' is not a project")
+            return 1
+        print(path)
         return 0
-    ok, amsg = attach(sess)
-    print(amsg)
-    return 0 if ok else 1
+    data = {"session": name, "project": name if path else None, "action": "attached"}
+    if is_session:
+        pane = pane_info(name) or {}
+        cmd = _pane_command(name)
+        if cmd == "claude":
+            if slot:
+                from session_switch import switch
+                ok, msg = switch(name, slot, progress=_progress, force=args.force)
+                (_say if ok else _err)(msg)
+                if not ok:
+                    return 1
+                data.update(action="switched", account=slot)
+        elif cmd in SHELLS and not args.shell:
+            from tmux_manager import startup_entries
+            place = path or startup_entries().get(name) or pane.get("path") or ""
+            proj, _root = sf.project_of(place, projs)
+            if not proj:
+                note = (f"'{name}' is a shell in {place or '?'}, outside every project: Claude starts only "
+                        "in a project (clanker open <project>)")
+                if slot:
+                    _err(note)
+                    return 1
+                _say(note)
+            else:
+                acct, rc = _need_account(slot, f"session '{name}'", f"clanker open {name} <slot>")
+                if rc:
+                    return rc
+                sess, msg = spawn(name=name, cwd=place, account=acct, resume=args.resume,
+                                  start_claude_in_shell=True)
+                (_say if sess else _err)(msg)
+                if not sess:
+                    return 1
+                if not args.no_boot:
+                    sf.keep(name, place, say=_say)
+                data.update(action="started", project=proj, path=place, account=acct)
+        elif slot and not args.shell:
+            _err(f"'{name}' runs {cmd or 'nothing'}, not Claude — nothing to move")
+            return 1
+        if args.detach and cmd == "claude" and not slot:
+            _say(f"session '{name}' already exists — attach with: clanker open {name}")
+    else:
+        # a project without a session: its session starts in the repo
+        acct = None
+        if not args.shell:
+            acct, rc = _need_account(slot, f"project '{name}'", f"clanker open {name} <slot>")
+            if rc:
+                return rc
+        sess, msg = spawn(name=name, cwd=path, shell=args.shell, account=acct, resume=args.resume)
+        (_say if sess else _err)(msg)
+        if not sess:
+            return 1
+        if not args.no_boot:
+            sf.keep(name, path, say=_say)
+        data.update(action="started", path=path, account=acct)
+    return _finish(args, data)
+
+
+def _duration(text):
+    """Seconds of '30d', '12h', '90m', '45s' (a bare number is days); None if unreadable."""
+    import re
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([dhms]?)\s*", text or "")
+    if not m:
+        return None
+    return float(m.group(1)) * {"d": 86400, "h": 3600, "m": 60, "s": 1, "": 86400}[m.group(2)]
+
+
+def cmd_close(args):
+    """`clanker close <session> [-y] [--force]` — end a session: Claude exits
+    cleanly (the conversation stays on disk), the session and its boot entry go.
+    `close --idle 30d [--shells] [-n]`: every session idle that long, asked once."""
+    import fleet
+    import session_flow as sf
+    words = list(args.words or [])
+    if args.idle:
+        if words:
+            _err("close --idle takes no session name")
+            return 2
+        return _close_idle(args)
+    if not words:
+        _err("usage: clanker close <session> [-y] [--force]   or   clanker close --idle 30d")
+        return 2
+    name = _resolve_name(words, fleet.session_names(), hint="clanker ls -a lists every session")
+    if not name:
+        return 1
+
+    def ask(summary):
+        print(summary, file=sys.stderr)
+        return _yes(f"close '{name}'?", False)
+
+    if args.dry_run:
+        info = sf.inspect(name)
+        print(sf.describe(name, info) if info else f"no session named '{name}'")
+        return 0 if info else 1
+    rc, msg = sf.close(name, yes=args.yes, force=args.force, confirm=ask if _interactive() else None,
+                       progress=_progress)
+    (_say if rc == 0 else _err)(msg)
+    if rc == 0:
+        _result(args, {"session": name, "action": "closed"})
+    return rc
+
+
+def _close_idle(args):
+    """Every session idle at least --idle (Claude: no status change; shell: no
+    output), not attached, not working, running nothing else; one question."""
+    import subprocess
+    import time as _time
+    import fleet
+    import session_flow as sf
+    from newsession import SHELLS
+    secs = _duration(args.idle)
+    if not secs:
+        _err(f"--idle: '{args.idle}' is not a duration (30d, 12h, 90m)")
+        return 2
+    now = _time.time()
+    act = {}
+    out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}\t#{session_activity}"],
+                         capture_output=True, text=True).stdout
+    for ln in out.splitlines():
+        n, _, a = ln.partition("\t")
+        act[n] = float(a) if a.strip().isdigit() else now
+    others = {}
+    for p in fleet.panes():
+        if p["command"] not in SHELLS and p["command"] != "claude":
+            others.setdefault(p["session"], p["command"])
+    take, skip = [], []
+    for r in fleet.rows():
+        idle = r["since_s"] if r["claude"] and r["since_s"] is not None else now - act.get(r["name"], now)
+        if idle < secs or (args.shells and r["claude"]):
+            continue
+        why = ("a terminal is attached" if r["attached"] else
+               f"Claude is {r['state']}" if r["state"] in ("working", "starting", "unknown") else
+               f"runs {others[r['name']]}" if r["name"] in others else None)
+        (skip if why else take).append((r, idle, why))
+    if not take:
+        _say(f"no session idle for {args.idle}" + (f" ({len(skip)} skipped)" if skip else ""))
+        return 0
+    lines = [f"{'SESSION':32} {'IDLE':>5}  {'WHAT':20} PROJECT"]
+    for r, idle, _w in take:
+        what = f"Claude {','.join(r['slots'])} {r['state']}" if r["claude"] else "shell"
+        lines.append(f"{r['name'][:32]:32} {fleet.ago(idle):>5}  {what[:20]:20} {r.get('project') or '— ' + r['dir']}")
+    for r, _idle, why in skip:
+        lines.append(f"  skipped {r['name']}: {why}")
+    print("\n".join(lines))
+    if args.dry_run:
+        return 0
+    if not args.yes:
+        if not _interactive():
+            _err(f"not a terminal: confirm with  clanker close --idle {args.idle} -y")
+            return 2
+        if not _yes(f"close these {len(take)} session(s)? Claude exits cleanly in each", False):
+            return 1
+    closed, refused = [], []
+    for r, _idle, _w in take:
+        rc, msg = sf.close(r["name"], yes=True, progress=_progress)
+        (closed if rc == 0 else refused).append((r["name"], msg.splitlines()[-1]))
+    _say(f"closed {len(closed)} session(s)" + (f"; kept {len(refused)}:" if refused else ""))
+    for n, why in refused:
+        _err(f"  {n}: {why}")
+    if getattr(args, "json", False):
+        print(json.dumps({"closed": [n for n, _ in closed], "kept": [n for n, _ in refused]}))
+    return 0 if not refused else 1
+
+
+def cmd_ls(args):
+    """`clanker ls [<slot>] [-a] [--json] [-w]` — every account's 5h/7d usage, then
+    the Claude sessions, most urgent first. Login state comes from a check cached 5
+    minutes (accounts.slots_display), so `ls` answers in a fraction of a second."""
+    import time as _time
+    import accounts
+    import fleet
+    slot, _rest = _words(args)
+    paint = fleet.painter(sys.stdout) if not args.json else None
+
+    def once():
+        sl, err = accounts.slots_display()
+        rs = fleet.rows(sl)
+        if slot:
+            rs = [r for r in rs if slot in r["slots"]]
+        us = fleet.usage(sl, rs if not slot else fleet.rows(sl))
+        if slot:
+            us = [u for u in us if u["id"] == slot]
+        if args.json:
+            return fleet.as_json(rs, us)
+        now = _time.time()
+        parts = [p for p in (fleet.render_usage(us, now, paint), fleet.render_rows(rs, now, args.all, paint)) if p]
+        if err:
+            parts.insert(0, f"(accounts unavailable: {err})")
+        return "\n\n".join(parts)
+
+    if not args.watch:
+        print(once())
+        return 0
+    try:
+        while True:
+            out = once()
+            sys.stdout.write("\033[H\033[2J" + _time.strftime("%H:%M:%S") + "  clanker ls (Ctrl-C to stop)\n\n"
+                             + out + "\n")
+            sys.stdout.flush()
+            _time.sleep(args.watch)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+def cmd_project(args):
+    """`clanker project [ls|create|adopt|remove|path] [name]` — the projects; the
+    top-level create/adopt/remove/registry still work (hidden)."""
+    import argparse as _ap
+    act = {"list": "ls"}.get(args.action, args.action)
+    if act == "ls":
+        return _project_ls(args)
+    if not args.target:
+        _err(f"usage: clanker project {act} <{'path|url' if act == 'adopt' else 'name'}>")
+        return 2
+    if act == "create":
+        return cmd_create(_ap.Namespace(name=args.target, archetype=args.archetype))
+    if act == "adopt":
+        return cmd_adopt(_ap.Namespace(target=args.target, archetype=args.archetype, new=False))
+    if act == "remove":
+        return cmd_remove(_ap.Namespace(name=args.target, yes=args.yes, force=args.force,
+                                        force_schedules=args.force_schedules))
+    import session_flow as sf
+    path = sf.projects().get(args.target)
+    if not path:
+        _err(f"no project '{args.target}'")
+        return 1
+    print(path)
+    return 0
+
+
+def _project_ls(args):
+    import fleet
+    import session_flow as sf
+    projs = sf.projects()
+    count = {}
+    for r in fleet.rows():
+        if r["claude"] and r.get("project"):
+            count[r["project"]] = count.get(r["project"], 0) + r["claude"]
+    if getattr(args, "json", False):
+        print(json.dumps([{"name": n, "path": p, "claude_sessions": count.get(n, 0)}
+                          for n, p in sorted(projs.items(), key=lambda x: x[0].lower())], indent=1))
+        return 0
+    home = os.path.expanduser("~")
+    lines = [f"{'PROJECT':32} {'CLAUDE':>6}  PATH"]
+    for n, p in sorted(projs.items(), key=lambda x: (-count.get(x[0], 0), x[0].lower())):
+        short = "~" + p[len(home):] if p.startswith(home + "/") else p
+        lines.append(f"{n[:32]:32} {count.get(n, 0) or '':>6}  {short}")
+    print("\n".join(lines))
+    return 0
+
 
 def cmd_resurrect(args):
     """`clanker resurrect` — post-OOM/reboot fleet recovery: merge the registry
     into the boot map, then recreate every mapped session that isn't running,
     as a plain shell (via the boot script itself, so behavior can't drift from
-    systemd's path). Claude starts on demand: `clanker work <project>`."""
+    systemd's path). Claude starts on demand: `clanker open <project|session>`."""
     from tmux_manager import resurrect
     return resurrect(dry_run=args.dry_run, sync_registry=args.sync_registry)
 
@@ -777,9 +1380,150 @@ def cmd_wrap(args):
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(prog='clanker', description='Self-improving development harness')
-    sub = parser.add_subparsers(dest='command')
+# The help page: what people run, grouped. Every verb is in one group or in
+# HIDDEN (still callable; `clanker help all`) — tests/test_cli_ux.py checks it.
+HELP_GROUPS = [
+    ("Sessions", [
+        ("ls [slot]", "every account's 5h/7d usage and every Claude session (also: bare `clanker`)"),
+        ("open <project|session> [slot]", "go there: attach, or start Claude (on the account you name); a slot moves it"),
+        ("new [slot] [project] [name]", "another Claude session in a project (default: the one you are in)"),
+        ("close <session>", "end it: Claude exits cleanly, the session and its boot entry go"),
+    ]),
+    ("Projects", [("project [ls|create|adopt|remove|path]", "the projects and their Claude sessions; start, take in, drop"),
+                  ("briefing <project>", "a project's briefing")]),
+    ("Fleet health", [("doctor · alert · sync · gc · resources · schedules · audit · version · resurrect", "")]),
+    ("Dashboard", [("serve · serve-user", "the web dashboard and its logins")]),
+    ("Analysis", [("sessions · analyze · autonomy · skills · context · propose · review", "")]),
+    ("Automation", [("orch · wrap · ingest · memory · publish · settings · plugins", "")]),
+]
+HIDDEN = {"init", "dashboard", "compile", "lint-wiki", "temporal", "model-versions", "decompose",
+          "regression", "suggest-skills", "cross-project", "contracts", "export", "import", "snapshot",
+          "new-watchdog", "audit-configs", "ecc", "completion", "_complete",
+          "scratch", "attach", "list", "work", "tmux", "projects", "create", "adopt", "remove", "registry"}
+
+
+def help_verbs():
+    """The verbs the help page lists, in order."""
+    out = []
+    for _g, items in HELP_GROUPS:
+        for cmd, _d in items:
+            out += [x.strip().split()[0] for x in cmd.split("·")] if "·" in cmd else [cmd.split()[0]]
+    return out
+
+
+def grouped_help():
+    lines = ["clanker — Claude Code sessions on your accounts, projects, fleet health, dashboard", ""]
+    for g, items in HELP_GROUPS:
+        lines.append(g)
+        for cmd, desc in items:
+            lines.append(f"  {cmd:30} {desc}".rstrip() if len(cmd) <= 30 else f"  {cmd}" + (f"\n  {'':30} {desc}" if desc else ""))
+        lines.append("")
+    lines += ["Examples",
+              "  clanker open clanker a3        go to clanker's session; Claude starts on a3 if none runs",
+              "  clanker new a3                 another session in the project you are in",
+              "  clanker open -                 back to the session you came from",
+              "  clanker close --idle 30d -n    the sessions idle 30 days (nothing changes)",
+              "",
+              "clanker help <command>   one command in detail      clanker help all   every command",
+              "Flags: -q quiet · --json results · -y no questions · -n dry run · -V version",
+              'Tab completion: add  eval "$(clanker completion)"  to ~/.bashrc (zsh: completion zsh; fish: completion fish)']
+    return "\n".join(lines)
+
+
+_BASH_COMPLETION = '''_clanker_complete() {
+  local cur="${COMP_WORDS[COMP_CWORD]}" IFS=$'\\n'
+  COMPREPLY=($(compgen -W "$(clanker _complete "${COMP_WORDS[@]:1:$((COMP_CWORD-1))}" 2>/dev/null)" -- "$cur"))
+}
+complete -o default -F _clanker_complete clanker'''
+
+
+def cmd_completion(args):
+    """bash and zsh (through bashcompinit) share one function; fish asks the same
+    `clanker _complete` for the words after the command."""
+    if args.shell == "fish":
+        print("# clanker tab completion (fish): clanker completion fish | source\n"
+              "complete -c clanker -f -a '(clanker _complete (commandline -opc)[2..-1] 2>/dev/null)'")
+    elif args.shell == "zsh":
+        print('# clanker tab completion (zsh): eval "$(clanker completion zsh)"\n'
+              "autoload -U +X bashcompinit && bashcompinit\n" + _BASH_COMPLETION)
+    else:
+        print('# clanker tab completion (bash): eval "$(clanker completion)"\n' + _BASH_COMPLETION)
+    return 0
+
+
+def _slot_ids():
+    """Usable slot IDs, fast: the statusline's cached slot map, else claude-acct."""
+    try:
+        with open(os.path.expanduser("~/.cache/clanker/accounts.json")) as f:
+            rows = json.load(f)
+        return [r["slot"] for r in rows if r.get("status") == "live"]
+    except Exception:
+        pass
+    try:
+        import accounts
+        return [s["id"] for s in accounts.slots() if s["usable"] and not s.get("single")]
+    except Exception:
+        return []
+
+
+def cmd_complete(args):
+    """Candidates for the word after `clanker <words...>` (one per line)."""
+    import accounts
+    w = [x for x in (args.words or []) if x != "--"]
+    if not w:
+        print("\n".join(sorted(set(help_verbs()) | {"help"})))
+        return 0
+    verb, rest = w[0], w[1:]
+    has_slot = any(accounts.SLOT_RX.match(x) for x in rest)
+    slots = [] if has_slot else _slot_ids()
+    out = []
+    if verb in ("open", "attach", "work"):
+        import fleet
+        out = sorted(set(fleet.session_names()) | set(_project_names())) + slots
+    elif verb in ("new", "scratch"):
+        out = slots + ([] if [x for x in rest if not accounts.SLOT_RX.match(x)] else _project_names())
+    elif verb == "close":
+        import fleet
+        out = fleet.session_names() if not rest else []
+    elif verb in ("project", "projects"):
+        out = ["ls", "create", "adopt", "remove", "path"] if not rest else \
+            (_project_names() if rest[0] in ("remove", "path") and len(rest) == 1 else [])
+    elif verb in ("ls", "list"):
+        out = slots + ["-a", "--json", "-w"]
+    elif verb == "tmux":
+        out = ["list", "add", "remove", "accept-trust"] if not rest else (slots if rest[0] == "add" and len(rest) >= 2 else [])
+    elif verb == "help":
+        out = sorted(set(help_verbs())) + ["all"]
+    print("\n".join(out))
+    return 0
+
+
+def _project_names():
+    try:
+        from registry import Registry
+        return sorted(Registry().projects.keys())
+    except Exception:
+        return []
+
+
+def _unknown_verb(word, verbs):
+    """A friendly answer to `clanker <typo>`: `openclanker` → `clanker open clanker`."""
+    import difflib
+    tips = []
+    for v in ("open", "new", "close", "ls"):
+        if word.startswith(v) and len(word) > len(v):
+            tips.append(f"clanker {v} {word[len(v):]}")
+    tips += [f"clanker {m}" for m in difflib.get_close_matches(word, sorted(verbs), n=3, cutoff=0.6)]
+    msg = f"clanker: unknown command '{word}'"
+    if tips:
+        msg += " — did you mean: " + ", ".join(dict.fromkeys(tips))
+    print(msg + "\n(clanker help lists the commands)", file=sys.stderr)
+    return 2
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog='clanker', description='Claude Code fleet: sessions on accounts, projects, health, dashboard')
+    sub = parser.add_subparsers(dest='command', metavar='<command>')
 
     # === Tier 1 ===
     p = sub.add_parser('registry', help='Project registry')
@@ -899,7 +1643,7 @@ def main():
     mp.add_argument('--project', default=None)
     mp.set_defaults(func=cmd_memory_doctor)
 
-    p = sub.add_parser('create', help='Start a project from NOTHING: mkdir ~/projects/<name> + git init + scaffold contract + register + doctor. Then: clanker work <name>')
+    p = sub.add_parser('create', help='Start a project from NOTHING: mkdir ~/projects/<name> + git init + scaffold contract + register + doctor. Then: clanker open <name> <slot>')
     p.add_argument('name', help='project name (becomes ~/projects/<name>) or explicit path')
     p.add_argument('--archetype', default=None, help='research | production | frontend | infra | tool (default: auto-detect)')
     p.set_defaults(func=cmd_create)
@@ -925,8 +1669,10 @@ def main():
     p.add_argument('--no-tmux', action='store_true', help='Skip tmux session creation')
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser('remove', help='Remove project from clanker (keeps repo)')
+    p = sub.add_parser('remove', help='Remove project from clanker (keeps repo; asks first; its session closes)')
     p.add_argument('name', help='Project name')
+    p.add_argument('-y', '--yes', action='store_true', help='do not ask (needed without a terminal)')
+    p.add_argument('-f', '--force', action='store_true', help='close its session even when Claude is working')
     p.add_argument('--force-schedules', action='store_true',
                    help='Proceed even though the project still owns active cron/timers '
                         '(only after dispositioning each one)')
@@ -948,31 +1694,119 @@ def main():
     p.add_argument('action', choices=['list', 'add', 'remove', 'accept-trust'])
     p.add_argument('name', nargs='?', help='Session/project name')
     p.add_argument('--path', help='Project path (for add)')
+    p.add_argument('extra', nargs='*', help='add: an account slot (a3) to start Claude on; without one the session is a plain shell')
     p.add_argument('--timeout', type=float, default=120.0,
                    help='accept-trust: seconds to keep watching the pane(s) (default 120)')
     p.set_defaults(func=cmd_tmux)
 
-    p = sub.add_parser('scratch', aliases=['new'],
-                       help='Throwaway Claude session at the CURRENT dir — no project machinery. (Projects: `create`/`adopt`; project sessions: `work`.)')
-    p.add_argument('name', nargs='*', help='Session name (default: auto-generated)')
-    p.add_argument('--shell', action='store_true', help='Launch a bare shell instead of Claude')
+    raw = argparse.RawDescriptionHelpFormatter
+    out_flags = lambda q: (q.add_argument('-q', '--quiet', action='store_true', help='no messages, only errors and the result'),
+                           q.add_argument('--json', action='store_true', help='the result as JSON on stdout'))
+
+    p = sub.add_parser('new', aliases=['scratch'], formatter_class=raw,
+                       help='Another Claude session in a project: clanker new a3 [project] [name] (opens it)',
+                       epilog='''examples:
+  clanker new a3                     another session in the project you are in
+  clanker new a3 clanker review      a session named "review" in the clanker project
+  s=$(clanker new a3 clanker -d)     in a script: start it, get its name
+  clanker new --shell                a plain shell here (no project, no account)
+
+Every Claude session runs in a project. Outside one, a terminal offers the close
+match, then to create the project; a script gets exit 1 and the command to run.''')
+    p.add_argument('words', nargs='*', metavar='[slot] [project] [name]',
+                   help='the account (a1, a3, …; asked for on a terminal), a project (default: the one '
+                        'you are in) and a session name (default: the project\'s)')
+    p.add_argument('--shell', action='store_true', help='a plain shell here instead of Claude (no project, no account)')
+    p.add_argument('-d', '--detach', action='store_true', help='start it, do not open it')
+    p.add_argument('--resume', nargs='?', const=True, default=None, metavar='SESSION_ID',
+                   help='continue a past conversation: bare --resume opens the picker, an id resumes it')
+    out_flags(p)
     p.set_defaults(func=cmd_new)
 
-    p = sub.add_parser('open', aliases=['attach'],
-                       help='Attach to a session from `clanker new` (default: most recent)')
-    p.add_argument('name', nargs='?', help='Session name (default: most recent)')
+    p = sub.add_parser('open', aliases=['attach', 'work'], formatter_class=raw,
+                       help='Go to a session or project: attach, start Claude in it, or start the project\'s session; a slot moves it',
+                       epilog='''examples:
+  clanker open clanker               go to clanker's session (Claude starts there if it is a shell)
+  clanker open clanker a3            the same, on account a3; a running Claude moves to a3
+  clanker open -                     back to the session you came from
+  clanker open                       pick from a list (on a terminal)
+
+On a terminal, names are forgiven (case, spaces, prefixes, typos). A script names
+the session or project exactly (case aside).''')
+    p.add_argument('words', nargs='*', metavar='[project|session|-] [slot]',
+                   help='a session or project name, or - for the previous session, and an account')
+    p.add_argument('--shell', action='store_true', help='only the shell: do not start Claude')
+    p.add_argument('-f', '--force', action='store_true',
+                   help='with a slot: switch even when the prompt box holds unsent text (it is cleared)')
+    p.add_argument('-d', '--detach', '--no-attach', dest='detach', action='store_true',
+                   help='start it, do not open it')
+    p.add_argument('--resume', nargs='?', const=True, default=None, metavar='SESSION_ID',
+                   help='when Claude starts: bare --resume opens the picker (this project\'s conversations), an id resumes it')
+    p.add_argument('--no-boot', action='store_true', help=argparse.SUPPRESS)
+    p.add_argument('--print-path', action='store_true', help='print the project\'s repo path and exit')
+    out_flags(p)
     p.set_defaults(func=cmd_open)
 
-    p = sub.add_parser('work', help='Launch/attach a Claude work session IN a registered project repo (tmux + cd + claude)')
-    p.add_argument('project', help='registry project name (clanker registry list)')
-    p.add_argument('--shell', action='store_true', help='bare shell instead of claude')
-    p.add_argument('--no-attach', action='store_true', help='start detached; do not attach')
-    p.add_argument('--no-boot', action='store_true',
-                   help='do not register this session in the boot map (~/.tmux-startup.sh); default is to register so it survives reboot')
-    p.add_argument('--print-path', action='store_true', help='print resolved repo path and exit')
-    p.add_argument('--resume', nargs='?', const=True, default=None, metavar='SESSION_ID',
-                   help="resume a past conversation in this repo: bare --resume opens the picker (this repo's sessions only); with an id, resumes it directly")
-    p.set_defaults(func=cmd_work)
+    p = sub.add_parser('close', formatter_class=raw,
+                       help='End a session: Claude exits cleanly, the session and its boot entry go',
+                       epilog='''examples:
+  clanker close clanker-2            asks first; the conversation stays on disk
+  clanker close clanker-2 -y         no question (a script needs -y)
+  clanker close --idle 30d -n        list every session idle 30 days; change nothing
+  clanker close --idle 30d --shells  close the plain shells idle 30 days (asked once)
+
+Refused unless --force: a Claude that is working, unsent text in its prompt box,
+other programs in the session.''')
+    p.add_argument('words', nargs='*', metavar='session', help='the session (names forgiven on a terminal)')
+    p.add_argument('-y', '--yes', action='store_true', help='do not ask (needed without a terminal)')
+    p.add_argument('-f', '--force', action='store_true',
+                   help='close even when Claude is working, text is unsent or other programs run')
+    p.add_argument('--idle', metavar='DURATION', help='every session idle this long (30d, 12h, 90m), asked once')
+    p.add_argument('--shells', action='store_true', help='with --idle: plain shells only')
+    p.add_argument('-n', '--dry-run', action='store_true', help='show what would close; change nothing')
+    out_flags(p)
+    p.set_defaults(func=cmd_close)
+
+    p = sub.add_parser('ls', aliases=['list'], formatter_class=raw,
+                       help='Every account\'s 5h/7d usage and every Claude session, most urgent first',
+                       epilog='''examples:
+  clanker                            the same as clanker ls
+  clanker ls a3                      one account and its sessions
+  clanker ls -a                      also the plain shells
+  clanker ls -w                      redraw every 2 s until Ctrl-C
+  clanker ls --json | jq '.sessions[] | select(.state == "decision") | .name'
+
+Colour on a terminal only; NO_COLOR=1 turns it off.''')
+    p.add_argument('words', nargs='*', metavar='[slot]', help='only this account (a3)')
+    p.add_argument('-a', '--all', action='store_true', help='also list plain shell sessions')
+    p.add_argument('--json', action='store_true', help='machine-readable')
+    p.add_argument('-w', '--watch', nargs='?', type=float, const=2.0, default=None, metavar='SECONDS',
+                   help='redraw every SECONDS (default 2) until Ctrl-C')
+    p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser('project', aliases=['projects'], formatter_class=raw,
+                       help='Projects: ls (with their Claude sessions) · create · adopt · remove · path',
+                       epilog='''examples:
+  clanker project                    every project and how many Claude sessions run in it
+  clanker project create notes       ~/projects/notes: git, CLAUDE.md, registry
+  clanker project adopt ~/code/x     an existing repo becomes a project
+  clanker project remove notes       asks first; the repo stays''')
+    p.add_argument('action', nargs='?', default='ls', choices=['ls', 'list', 'create', 'adopt', 'remove', 'path'])
+    p.add_argument('target', nargs='?', metavar='name|path|url')
+    p.add_argument('--archetype', default=None, help='create/adopt: research | production | frontend | infra | tool')
+    p.add_argument('-y', '--yes', action='store_true', help='remove: do not ask (needed without a terminal)')
+    p.add_argument('-f', '--force', action='store_true', help='remove: close its session even when Claude is working')
+    p.add_argument('--force-schedules', action='store_true', help='remove: past the scheduled-work gate (see clanker remove -h)')
+    p.add_argument('--json', action='store_true', help='ls: machine-readable')
+    p.set_defaults(func=cmd_project)
+
+    p = sub.add_parser('completion', help='Print shell tab-completion: eval "$(clanker completion)" in ~/.bashrc (zsh: eval; fish: | source)')
+    p.add_argument('shell', nargs='?', default='bash', choices=['bash', 'zsh', 'fish'])
+    p.set_defaults(func=cmd_completion)
+
+    p = sub.add_parser('_complete')
+    p.add_argument('words', nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_complete)
 
     p = sub.add_parser('resurrect', help='Fleet recovery: recreate missing boot-mapped tmux sessions as plain shells (post-OOM/reboot; watchdog-callable; claude starts on demand via work)')
     p.add_argument('--dry-run', action='store_true', help='report what would change/create; write and create nothing')
@@ -1188,9 +2022,36 @@ def main():
                    help='after --: `claude [args]`, bare claude args (-p ...), or any other command')
     p.set_defaults(func=cmd_wrap)
 
-    args = parser.parse_args()
+    return parser, sub
+
+
+def main():
+    global QUIET
+    parser, sub = build_parser()
+    argv = sys.argv[1:]
+    while argv and argv[0] in ('-q', '--quiet'):
+        QUIET, argv = True, argv[1:]
+    if argv and argv[0] in ('-V', '--version'):
+        v = _version()
+        print(f"clanker {v}" if v else "clanker (version unknown)")
+        sys.exit(0)
+    if not argv:
+        argv = ['ls']                     # bare `clanker`: the fleet at a glance
+    elif argv[0] in ('-h', '--help', 'help'):
+        if len(argv) > 1 and argv[1] == 'all':
+            parser.print_help()
+            sys.exit(0)
+        if len(argv) > 1:
+            argv = [argv[1], '-h']
+        else:
+            print(grouped_help())
+            sys.exit(0)
+    elif not argv[0].startswith('-') and argv[0] not in sub.choices:
+        sys.exit(_unknown_verb(argv[0], [v for v in sub.choices if v not in HIDDEN]))
+    args = parser.parse_args(argv)
+    QUIET = QUIET or bool(getattr(args, 'quiet', False))
     if not args.command:
-        parser.print_help()
+        print(grouped_help())
         sys.exit(1)
 
     sys.exit(args.func(args) or 0)

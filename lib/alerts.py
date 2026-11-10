@@ -149,6 +149,33 @@ def _create_alert(alert_id, severity, source, message, details=None, project=Non
     return alert
 
 
+_token = {}
+
+
+def ntfy_token():
+    """The ntfy access token: CLANKER_NTFY_TOKEN; else the output of
+    CLANKER_NTFY_TOKEN_CMD (a secret store's `get`, run once per process), so the
+    token lives in no unit file and no `systemctl show`; else ''. Never raises."""
+    v = os.environ.get("CLANKER_NTFY_TOKEN")
+    if v:
+        return v
+    cmd = (os.environ.get("CLANKER_NTFY_TOKEN_CMD") or "").strip()
+    if not cmd:
+        return ""
+    if cmd in _token:
+        return _token[cmd]
+    import shlex
+    import subprocess
+    try:
+        p = subprocess.run(shlex.split(cmd), capture_output=True, text=True, timeout=15)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return ""
+    tok = p.stdout.strip() if p.returncode == 0 else ""
+    if tok:
+        _token[cmd] = tok              # a failure is retried on the next notification
+    return tok
+
+
 def _ntfy(title, message, priority="high", tags="warning"):
     """Best-effort ntfy publish (same env config as the dashboard:
     CLANKER_NTFY_TOPIC/SERVER/TOKEN). Returns delivered?"""
@@ -156,7 +183,7 @@ def _ntfy(title, message, priority="high", tags="warning"):
     if not topic:
         return False
     server = os.environ.get("CLANKER_NTFY_SERVER", "https://ntfy.sh")
-    token = os.environ.get("CLANKER_NTFY_TOKEN", "")
+    token = ntfy_token()
     try:
         import urllib.request
         req = urllib.request.Request(

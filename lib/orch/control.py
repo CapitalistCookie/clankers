@@ -34,6 +34,7 @@ DEFAULTS = {
     "nudge_max": 3,            # lifetime cap on auto-nudges per session (0 = uncapped)
     "done_idle_secs": 0,       # interactive: stable, question-free pane this long → done (0 = off)
     "budget_usd": None,        # global cost cap across orchestrated sessions (None = off)
+    "account": None,           # account slot for spawned sessions (the operator's choice; required with slots)
 }
 
 _BOOL_KEYS = {"enabled", "auto_nudge", "auto_spawn", "auto_merge", "worktrees", "skip_permissions", "auto_trust"}

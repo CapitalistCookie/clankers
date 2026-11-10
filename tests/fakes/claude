@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Fake interactive `claude` for the session-account tests. No network, no account.
+
+It does what the account code reads from a real Claude Code REPL:
+- writes its registry record to <config dir>/sessions/<pid>.json (config dir =
+  CLAUDE_CONFIG_DIR, else $HOME/.claude), with its real pid and kernel start time,
+  so the reader's liveness check and /proc/<pid>/environ both see this process;
+- appends one line to its transcript <config dir>/projects/<enc cwd>/<id>.jsonl
+  (`--resume <id>` continues that id; otherwise a new one);
+- then waits until SIGTERM (the fake tmux sends it on /exit).
+FAKE_CLAUDE_STATUS sets the record status (default idle); FAKE_CLAUDE_REGISTER_DELAY
+waits that many seconds before registering. FAKE_CLAUDE_TMUX_SESSION
+names another session in the tmux ref, as real Claude does while the dashboard's
+grouped web-* bridge session is attached to the pane. FAKE_CLAUDE_FAIL_DIR:
+exit at once, unregistered, when the config dir resolves to it.
+"""
+import json
+import os
+import re
+import signal
+import sys
+import time
+import uuid
+
+cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.environ["HOME"], ".claude")
+if os.environ.get("FAKE_CLAUDE_FAIL_DIR") and \
+        os.path.realpath(cfg) == os.path.realpath(os.environ["FAKE_CLAUDE_FAIL_DIR"]):
+    sys.exit(3)
+args = sys.argv[1:]
+sid = args[args.index("--resume") + 1] if "--resume" in args else str(uuid.uuid4())
+pid = os.getpid()
+with open(f"/proc/{pid}/stat") as f:
+    stat = f.read()
+start = stat[stat.rindex(")") + 2:].split()[19]
+cwd = os.getcwd()
+proj = os.path.join(cfg, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+if not os.environ.get("FAKE_CLAUDE_NO_TRANSCRIPT"):     # a session that never got a message has none
+    os.makedirs(proj, exist_ok=True)
+    with open(os.path.join(proj, sid + ".jsonl"), "a") as f:
+        f.write(json.dumps({"type": "user", "pid": pid, "cfg": os.path.realpath(cfg)}) + "\n")
+time.sleep(float(os.environ.get("FAKE_CLAUDE_REGISTER_DELAY", "0")))   # a slow start
+sess = os.path.join(cfg, "sessions")
+os.makedirs(sess, exist_ok=True)
+rec = {"pid": pid, "procStart": start, "sessionId": sid, "cwd": cwd, "kind": "interactive",
+       "status": os.environ.get("FAKE_CLAUDE_STATUS", "idle"),
+       "tmux": f"{os.environ.get('FAKE_CLAUDE_TMUX_SESSION') or os.environ.get('CLANKER_SESSION', 'x')}"
+               f":@1.{os.environ.get('FAKE_TMUX_PANE', '%1')}"}
+with open(os.path.join(sess, f"{pid}.json"), "w") as f:
+    json.dump(rec, f)
+signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+deadline = time.time() + float(os.environ.get("FAKE_CLAUDE_LIFETIME", "90"))
+while time.time() < deadline:
+    time.sleep(0.2)

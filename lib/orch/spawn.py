@@ -132,19 +132,33 @@ def _worktree_path(working_dir, session_id):
 # ── spawn ────────────────────────────────────────────────────────────────────
 def spawn(task, project=None, working_dir=None, headless=False, worktree=None,
           model=None, agent_type="claude", store_path=None, launcher=None,
-          config=None, skip_permissions=None, **claude_opts):
+          config=None, skip_permissions=None, account=None, **claude_opts):
     """Spawn a coding-agent session and register it in the store.
 
     Returns the inserted session record on success, or ``{"error": ...}`` (never
     raises) when at capacity or when a precondition fails. `claude_opts` are passed
     straight through to :func:`build_claude_command` (allowed_tools, permission_mode,
     add_dirs, append_system_prompt, max_budget_usd, disallowed_tools).
+    account: the account slot to run on (lib/accounts.py), else the orch config's
+    `account` — the operator's own choice; with account slots present and neither
+    set, the spawn is refused (nothing picks a slot for the user).
     """
     lr = _launcher(launcher)
     cfg = config if config is not None else control.get_config()
 
-    # Resolve the working directory.
+    import accounts
+    slot, err = accounts.resolve(account or cfg.get("account"))
+    if err:
+        return {"error": "account: " + err.splitlines()[0]}
+
+    # Resolve the working directory. Every Claude session runs in a registered
+    # project (lib/session_flow.py; owner, 2026-10-29).
     working_dir = _resolve_working_dir(working_dir, project)
+    proj, _root = _project_of(working_dir)
+    if not proj:
+        return {"error": "outside every project", "working_dir": working_dir,
+                "hint": "orchestrated sessions run in a registered project (clanker project ls)"}
+    project = project or proj
 
     # Capacity cap — refuse (don't raise) when already at max_parallel.
     max_parallel = int(cfg.get("max_parallel", 4))
@@ -197,6 +211,12 @@ def spawn(task, project=None, working_dir=None, headless=False, worktree=None,
         task, model=model, headless=headless, skip_permissions=skip_permissions, **claude_opts
     )
     cmd_str = " ".join(shlex.quote(a) for a in claude_cmd)
+    # CLANKER_SESSION marks a session clanker started: the dashboard's lease
+    # reconciler keeps a user lease on it (accounts D-002) for its whole life.
+    cmd_str = f"CLANKER_SESSION={shlex.quote(tmux_name)} " + cmd_str
+    env_prefix = accounts.launch_env(slot)       # pins CLAUDE_CONFIG_DIR to the slot
+    if env_prefix:
+        cmd_str = env_prefix + " " + cmd_str
     # Exit sentinel: when the agent process terminates the pane shell prints the
     # exit code, which the supervise loop turns into done (rc 0) / failed (rc != 0).
     sentinel = exit_sentinel_prefix(sid)
@@ -215,6 +235,7 @@ def spawn(task, project=None, working_dir=None, headless=False, worktree=None,
 
     # Capture the pane PID if tmux can tell us.
     pid = _pane_pid(tmux_target, lr)
+    lease = _lease_now(slot, tmux_name, pid) if launcher is None else None
 
     rec = {
         "id": sid,
@@ -230,7 +251,8 @@ def spawn(task, project=None, working_dir=None, headless=False, worktree=None,
         "state": "running",
         "cost_usd": 0,
         "tokens": 0,
-        "meta": {"command": claude_cmd, "run_dir": run_dir, "exit_sentinel": sentinel},
+        "meta": {"command": claude_cmd, "run_dir": run_dir, "exit_sentinel": sentinel,
+                 "account": slot.get("id") if slot else None, "lease": lease},
     }
     store.insert_session(rec, path=store_path)
     return rec
@@ -240,8 +262,41 @@ def _resolve_working_dir(working_dir, project):
     if working_dir:
         return os.path.abspath(os.path.expanduser(working_dir))
     if project:
-        return os.path.abspath(os.path.expanduser(os.path.join("~/projects", project)))
+        try:
+            import session_flow
+            path = session_flow.projects().get(project)
+        except Exception:
+            path = None
+        return path or os.path.abspath(os.path.expanduser(os.path.join("~/projects", project)))
     return os.getcwd()
+
+
+def _project_of(path):
+    """(name, root) of the registered project that holds `path`, else (None, None)."""
+    import session_flow
+    return session_flow.project_of(path)
+
+
+def _lease_now(slot, name, pane_pid, wait=5.0):
+    """A user lease on the Claude process the pane just started (its shell's child),
+    so the account layer counts it from the start; None when it cannot be taken now
+    (the dashboard's reconciler leases it within the hour). Never raises."""
+    import accounts
+    import claude_registry
+    if not slot or slot.get("single") or not pane_pid:
+        return None
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        kids = claude_registry.proc_children(pane_pid)
+        if kids:
+            try:
+                r = accounts.lease_user(slot, name, kids[0])
+            except accounts.AccountsError:
+                return None
+            lease = r.get("lease")
+            return lease.get("id") if isinstance(lease, dict) else None
+        time.sleep(0.25)
+    return None
 
 
 def _accept_trust_prompt(target, launcher, tries=14, interval=0.5):

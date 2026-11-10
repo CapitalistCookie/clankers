@@ -342,8 +342,10 @@ def test_add_session_creates_clanker_while_clanker_41_runs(startup, monkeypatch,
     assert "Created tmux session: clanker" in capsys.readouterr().out
     assert alive == ["clanker-41", "clanker"]
     assert ["tmux", "has-session", "-t", "=clanker"] in calls
-    keys = [c for c in calls if "send-keys" in c]
-    assert len(keys) == 2 and all(c[c.index("-t") + 1] == "=clanker:" for c in keys)
+    # 2026-10-29: without --account the session is a plain shell — no launch is typed
+    # (Claude starts on the slot the user selects: clanker open clanker <slot>)
+    assert not [c for c in calls if "send-keys" in c]
+    assert not [c for c in calls if "RESOLVED" in c and c[-1] == "clanker-41"]
 
 
 def test_remove_session_never_kills_a_prefix_match(startup, monkeypatch):

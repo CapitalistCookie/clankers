@@ -35,6 +35,9 @@ def registry_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("CLANKER_CLAUDE_SESSIONS_DIR", str(d))
     monkeypatch.setattr(serve, "_proc_start", lambda pid: LIVE.get(pid))
     monkeypatch.setattr(serve, "_proc_children", lambda pid: [])
+    # the reading itself lives in lib/claude_registry.py (every account slot)
+    monkeypatch.setattr(serve.claude_registry, "proc_start", lambda pid: LIVE.get(pid))
+    monkeypatch.setattr(serve.claude_registry, "proc_children", lambda pid: [])
     return d
 
 
@@ -99,7 +102,7 @@ def test_malformed_records_and_missing_dir_never_raise(registry_dir, monkeypatch
 
 def test_pid_fallback_when_record_has_no_tmux_ref(registry_dir, monkeypatch):
     _write(registry_dir, 4242, status="busy", tmux=None)
-    monkeypatch.setattr(serve, "_proc_children", lambda pid: [4242] if pid == 100 else [])
+    monkeypatch.setattr(serve.claude_registry, "proc_children", lambda pid: [4242] if pid == 100 else [])
     pane = {"session": "s", "command": "claude", "pane_id": "%77", "pane_pid": 100}
     assert serve.detect_session_state(pane, serve.read_session_registry()) == "working"
     # the REPL exec'd in place: the pane pid IS the REPL pid

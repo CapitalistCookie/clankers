@@ -10,5 +10,8 @@ set -euo pipefail
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX GIT_OBJECT_DIRECTORY GIT_COMMON_DIR GIT_NAMESPACE
 cd "$(git rev-parse --show-toplevel)"
 echo "[ci/fast] hermetic test suites…"
-python3 -m pytest tests/ -q
+# -n 8 (pytest-xdist): the serial suite passed 80 s on 2026-10-29 (734 tests), over
+# the <60 s pre-push budget (global rule 17); 8 workers run it in ~30 s. Every test
+# isolates its own tmp data, so the result does not depend on the order.
+python3 -m pytest tests/ -q -n 8
 echo "[ci/fast] all green"

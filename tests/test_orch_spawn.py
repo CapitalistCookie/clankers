@@ -14,6 +14,14 @@ import tempfile
 sys.path.insert(0, "lib")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from orch import spawn, store, control  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _every_dir_is_a_project(monkeypatch, request):
+    """These tests spawn in temp repos; the project rule has its own test below."""
+    if "outside_every_project" not in request.node.name:
+        monkeypatch.setattr(spawn, "_project_of", lambda path: ("demo", path))
 
 
 # ── fakes ─────────────────────────────────────────────────────────────────────
@@ -181,7 +189,7 @@ def test_spawn_creates_worktree_tmux_and_registers_running(tmp_git_repo=None):
     assert sk[-1] == "Enter"
     assert sk[sk.index("-t") + 1] == rec["tmux_target"]
     cmd_str = sk[-2]
-    assert cmd_str.startswith("claude")
+    assert cmd_str.startswith(f"CLANKER_SESSION={rec['tmux_target']} claude")   # the clanker-session marker
     assert "--allowed-tools Read,Edit" in cmd_str
     assert "build a feature" in cmd_str
     assert "--print" not in cmd_str  # interactive seed, not headless
@@ -374,3 +382,26 @@ if __name__ == "__main__":
             traceback.print_exc()
     print(f"\n{passed}/{len(fns)} passed")
     sys.exit(0 if passed == len(fns) else 1)
+
+
+def test_spawn_outside_every_project_is_refused(tmp_path, monkeypatch):
+    """Every Claude session runs in a registered project (lib/session_flow.py)."""
+    reg = tmp_path / "reg.yaml"
+    reg.write_text("projects: {}\n")
+    monkeypatch.setenv("CLANKER_REGISTRY", str(reg))
+    monkeypatch.setenv("CLANKER_PROJECT_ROOTS", str(tmp_path / "noroot"))
+    monkeypatch.setenv("CLANKER_DATA", str(tmp_path / "data"))
+    db = _tmp_db()
+    fl = FakeLauncher(is_repo=False)
+    rec = spawn.spawn("x", working_dir=str(tmp_path), store_path=db, launcher=fl, config=_cfg())
+    assert rec.get("error") == "outside every project" and fl.calls == []
+
+
+def test_spawned_claude_carries_the_clanker_session_marker():
+    db = _tmp_db()
+    fl = FakeLauncher(is_repo=False)
+    rec = spawn.spawn("marked", working_dir=tempfile.mkdtemp(prefix="plain_"), store_path=db,
+                      launcher=fl, config=_cfg())
+    sent = fl.first("send-keys")
+    assert f"CLANKER_SESSION={rec['tmux_target']} " in sent[-2]
+    os.unlink(db)

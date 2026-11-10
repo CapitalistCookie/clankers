@@ -18,6 +18,7 @@ changing by one digit does not reshuffle the rows; otherwise segments flow greed
 lowest-priority ones are dropped. Claude Code drops blank rows, so only non-empty rows are printed.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -26,7 +27,8 @@ import subprocess
 import sys
 import time
 import unicodedata
-from datetime import datetime
+import fcntl
+from datetime import datetime, timezone
 
 # ── ANSI colors ──────────────────────────────────────────────────────────────
 RESET   = "\033[0m"
@@ -255,12 +257,138 @@ def terminal_columns():
 
 
 # ── F5: the Fable weekly bucket (the old line's cache + detached refresher) ──────────────────────────────
+def config_dir():
+    """The config dir of this session (Claude Code passes its env to the statusline); unset = ~/.claude."""
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def slot_usage_dir():
+    """F5 cache of this session's account slot: the home dir uses USAGE_DIR, any other config dir its own
+    cfg-<hash> subdir (the same rule as statusline-usage-refresh.py), so one slot's figure never shows in
+    another slot's session."""
+    real = os.path.realpath(config_dir())
+    if real == os.path.realpath(os.path.expanduser("~/.claude")):
+        return USAGE_DIR
+    return os.path.join(USAGE_DIR, "cfg-" + hashlib.sha256(real.encode()).hexdigest()[:10])
+
+
+ACCOUNTS_CACHE = os.path.join(USAGE_DIR, "accounts.json")
+ACCOUNTS_TTL = 300       # s: the slot map (claude-acct list --json --offline) is refreshed this often, detached
+
+
+def accounts_cmd():
+    """argv of the box accounts command (CLANKER_ACCOUNTS_CMD, `none` = off; else claude-acct on PATH)."""
+    v = os.environ.get("CLANKER_ACCOUNTS_CMD")
+    if v is not None:
+        v = v.strip()
+        if not v or v.lower() == "none":
+            return None
+        import shlex
+        return shlex.split(v)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = os.path.join(d, "claude-acct")
+        if d and os.access(p, os.X_OK):
+            return [p]
+    return None
+
+
+def account_slot():
+    """The account slot this session runs on ("a3"), "?" when its config dir is no known slot, None when
+    there are no slots. Reads a cached slot map; a stale map is refreshed in the background."""
+    cmd = accounts_cmd()
+    if not cmd:
+        return None
+    rows, age = None, None
+    try:
+        age = time.time() - os.path.getmtime(ACCOUNTS_CACHE)
+        with open(ACCOUNTS_CACHE) as f:
+            rows = json.load(f)
+    except Exception:
+        rows = None
+    if age is None or age >= ACCOUNTS_TTL:
+        try:
+            os.makedirs(USAGE_DIR, mode=0o700, exist_ok=True)
+            if age is not None:
+                os.utime(ACCOUNTS_CACHE)      # claim this refresh: other sessions keep the old map meanwhile
+            subprocess.Popen(["sh", "-c", 'out=$1; shift; "$@" list --json --offline > "$out.$$" && mv "$out.$$" "$out"',
+                              "sh", ACCOUNTS_CACHE] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            pass
+    if not isinstance(rows, list):
+        return None
+    real = os.path.realpath(config_dir())
+    for r in rows:
+        if isinstance(r, dict) and r.get("resolves_to") and os.path.realpath(r["resolves_to"]) == real:
+            return str(r.get("slot") or "?")
+    return "?"
+
+
+LIMITS_KEEP_S = 7 * 86400   # a session's last-seen figures are kept this long in its slot's file
+
+
+def limits_dir():
+    return os.environ.get("CLANKER_LIMITS_DIR") or os.path.join(USAGE_DIR, "limits")
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if ts else None
+
+
+def harvest_limits(slot, session_id, five_pct, seven_pct, five_reset, seven_reset, now=None):
+    """Publish this session's rate_limits as its slot's usage figure: <limits dir>/<slot>.json in the
+    claude-acct figure-mirror format (five_hour/seven_day fractions, resets_at, windows_at), which
+    claude-acct, `clanker ls` and the dashboard read for every account.
+
+    Claude re-runs the statusline every 10 s with the figures of its LAST API response, so a refresh is
+    not a fresh figure. A session publishes only when its own figures change from a state it saw
+    before — from none (its first API response) or from older ones — so windows_at is the time of a
+    real response, an idle session never re-stamps old figures as new, and a session already running
+    when this code arrived only records its first observation. Returns True when it published."""
+    if not slot or slot == "?" or not session_id:
+        return False
+    try:
+        v = None if five_pct is None or seven_pct is None else [
+            round(float(five_pct) / 100, 4), round(float(seven_pct) / 100, 4),
+            to_epoch(five_reset), to_epoch(seven_reset)]
+    except Exception:
+        return False
+    now = int(now or time.time())
+    d = limits_dir()
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    path = os.path.join(d, slot + ".json")
+    with open(path + ".lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                cur = json.load(f)
+        except Exception:
+            cur = {}
+        seen = cur.get("sessions") if isinstance(cur.get("sessions"), dict) else {}
+        seen = {k: x for k, x in seen.items() if isinstance(x, dict) and now - (x.get("at") or 0) < LIMITS_KEEP_S}
+        known = session_id in seen
+        if known and seen[session_id].get("v") == v:
+            return False                       # unchanged since this session's last run
+        seen[session_id] = {"v": v, "at": now}
+        out = dict(cur, sessions=seen, slot=slot)
+        publish = known and v is not None
+        if publish:
+            out.update(five_hour=v[0], seven_day=v[1], resets_at={"five_hour": _iso(v[2]), "seven_day": _iso(v[3])},
+                       windows_at=_iso(now), logged_in=True, source="statusline")
+        tmp = path + ".%d" % os.getpid()
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        os.replace(tmp, path)
+    return publish
+
+
 def fable_gauge_data():
     """{percent, resets_at} when the cache is usable (< 1 h old, window not reset), else None; keeps the cache fresh."""
     now = int(time.time())
     cache = {}
+    udir = slot_usage_dir()
     try:
-        with open(os.path.join(USAGE_DIR, "usage.json")) as f:
+        with open(os.path.join(udir, "usage.json")) as f:
             cache = json.load(f)
     except Exception:
         cache = {}
@@ -269,17 +397,17 @@ def fable_gauge_data():
     if age < 0 or age >= USAGE_TTL:
         nxt = 0
         try:
-            with open(os.path.join(USAGE_DIR, "usage.next")) as f:
+            with open(os.path.join(udir, "usage.next")) as f:
                 nxt = int(f.read().strip() or 0)
         except Exception:
             nxt = 0
         if now >= nxt and os.path.isfile(USAGE_REFRESHER):
             try:
-                os.makedirs(USAGE_DIR, mode=0o700, exist_ok=True)
-                tmp = os.path.join(USAGE_DIR, "usage.next.%d" % os.getpid())
+                os.makedirs(udir, mode=0o700, exist_ok=True)
+                tmp = os.path.join(udir, "usage.next.%d" % os.getpid())
                 with open(tmp, "w") as f:
                     f.write("%d\n" % (now + 60))
-                os.replace(tmp, os.path.join(USAGE_DIR, "usage.next"))
+                os.replace(tmp, os.path.join(udir, "usage.next"))
                 subprocess.Popen(["setsid", "nohup", "python3", "-u", USAGE_REFRESHER],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
@@ -515,6 +643,10 @@ def main():
     rate = data.get("rate_limits") or {}
     five_pct, seven_pct = (rate.get("five_hour") or {}).get("used_percentage"), (rate.get("seven_day") or {}).get("used_percentage")
     five_reset, seven_reset = (rate.get("five_hour") or {}).get("resets_at"), (rate.get("seven_day") or {}).get("resets_at")
+    try:   # every account's usage, fresh, for claude-acct / clanker ls / the dashboard (never fails the line)
+        harvest_limits(account_slot(), data.get("session_id"), five_pct, seven_pct, five_reset, seven_reset)
+    except Exception:
+        pass
     cost = data.get("cost") or {}
     duration_ms, cost_usd = cost.get("total_duration_ms"), cost.get("total_cost_usd")
     cwd_raw = (data.get("workspace") or {}).get("current_dir") or data.get("cwd") or os.getcwd()
@@ -600,6 +732,9 @@ def main():
     if gpu != "unset":
         config.append((DIM if gpu == "idle" else RED if gpu == "offline" else MAGENTA) + ICON["gpu"] + " GPU " + gpu + RESET)
     ident = "%s@%s" % (os.environ.get("USER") or os.environ.get("LOGNAME") or "?", socket.gethostname().split(".")[0])
+    slot = account_slot()
+    if slot:
+        ident += DIM + "·" + RESET + (RED if slot == "?" else GREEN) + slot
     where = [GREEN + ident + RESET, PINK + cwd + RESET] + ([YELLOW + ICON["branch"] + " " + branch + RESET] if branch else [])
 
     rows = layout([limits, tokens + config, where + build], budget)

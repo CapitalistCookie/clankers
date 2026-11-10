@@ -25,7 +25,7 @@ CLAUDE_STUB = """# {name}
 - **State:** `STATUS.md` (NOW / NEXT / BLOCKED / DECISIONS) — update it as part of finishing work.
 - **Skills:** `.claude/skills/` · **project hooks:** `.claude/settings.json`.
 - **CI:** `ci/fast.sh` (<60s, green) gates pre-push via localci; add `ci/full.sh` for the detached post-commit suite.
-- Launch sessions here via `clanker work {name}`.
+- Launch sessions here via `clanker open {name}`.
 
 ## Waiting
 
@@ -33,7 +33,7 @@ CLAUDE_STUB = """# {name}
 
 ## Live site
 
-- Live site — From the first milestone that serves a UI, the harness keeps a hot-reloading dev serve of the product alive on the tailnet, a stable, tagged origin the owner can open and watch (restarted by the supervisor, asserted by the smoke), next to the served-build smoke and the walk; the lead reports its origin (`DEV_ORIGIN`) in STATE.md. Day-0 shape: the dev serve (the framework's HMR server) runs under the supervisor (systemd user unit, or the driver) and is restarted on exit; it binds one tagged, stable local port, published on the tailnet at one stable origin; `DEV_ORIGIN=<origin>` is written in STATE.md; the smoke asserts the origin answers 200 and prints `DEV: not-yet-built(<row>)` and passes only before the row that builds it lands. (Global rule 22.)
+- Live site — From the first milestone that serves a UI, the harness keeps a hot-reloading dev serve of the product alive on the tailnet, a stable, tagged origin the owner can open and watch (restarted by the supervisor, asserted by the smoke), next to the served-build smoke and the walk; the lead reports its origin (`DEV_ORIGIN`) in STATE.md. Day-0 shape: the dev serve (the framework's HMR server) runs under the supervisor (systemd user unit, or the driver) and is restarted on exit; it binds one tagged, stable loopback port, published at its own tailnet name (`tsname add <project>-dev <port>` → `https://<project>-dev.tail596b0c.ts.net`, global rule 28); `DEV_ORIGIN=<origin>` is written in STATE.md; the smoke asserts the origin answers 200 and prints `DEV: not-yet-built(<row>)` and passes only before the row that builds it lands. (Global rule 22.)
 """
 
 STATUS_STUB = """# STATUS — {name} (seeded by `clanker adopt`; refine each session)
@@ -293,5 +293,5 @@ def adopt(target, archetype=None, new=False):
 
     # 5. doctor
     rc = doctor_project(name)
-    print(f"next: review the stubs, commit, add a private remote if missing, then: clanker work {name}")
+    print(f"next: review the stubs, commit, add a private remote if missing, then: clanker open {name} <slot>")
     return rc

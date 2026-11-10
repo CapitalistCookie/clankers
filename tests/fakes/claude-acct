@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""Fake box accounts command (claude-acct) for the session-account tests.
+
+$FAKE_ACCT_DIR/slots.json holds the `list --json` rows; a row may carry
+"refuse": [...] (a user lease is refused) and "warn": [...] (its warnings).
+Leases live in leases.json; every call is logged to calls.log.
+"""
+import json
+import os
+import sys
+import uuid
+
+D = os.environ["FAKE_ACCT_DIR"]
+argv = sys.argv[1:]
+with open(os.path.join(D, "calls.log"), "a") as f:
+    f.write(" ".join(argv) + "\n")
+rows = json.load(open(os.path.join(D, "slots.json")))
+LP = os.path.join(D, "leases.json")
+try:
+    leases = json.load(open(LP))
+except (OSError, ValueError):
+    leases = []
+
+
+def opt(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def save():
+    json.dump(leases, open(LP, "w"))
+
+
+leases = [l for l in leases if alive(l.get("pid"))]
+cmd = argv[0]
+if cmd == "list":
+    print(json.dumps(rows))
+elif cmd == "lease":
+    row = next((r for r in rows if r["slot"] == argv[1]), None)
+    if row is None:
+        print("claude-acct: unknown slot", file=sys.stderr)
+        sys.exit(2)
+    if row.get("refuse"):
+        print(json.dumps({"lease": None, "refused": row["refuse"], "warnings": []}))
+        sys.exit(1)
+    l = {"id": f"{argv[1]}-{uuid.uuid4().hex[:6]}", "slot": argv[1], "holder": opt("--holder"),
+         "pid": int(opt("--pid")), "kind": "user" if "--user" in argv else "job",
+         "warnings": row.get("warn") or [], "ttl_s": int(opt("--ttl") or 3600)}
+    leases.append(l)
+    save()
+    print(json.dumps({"lease": l, "refused": [], "warnings": l["warnings"]}))
+elif cmd == "renew":
+    hit = [l for l in leases if l["id"] == argv[1]]
+    if not hit:
+        print(f"no active lease {argv[1]}")
+        save()
+        sys.exit(1)
+    if opt("--pid"):
+        hit[0]["pid"] = int(opt("--pid"))
+    save()
+    print("renewed")
+elif cmd == "release":
+    n = len(leases)
+    leases = [l for l in leases if l["id"] != argv[1]]
+    save()
+    sys.exit(0 if len(leases) < n else 1)
+elif cmd == "leases":
+    save()
+    print(json.dumps(leases))
+else:
+    sys.exit(2)

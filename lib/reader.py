@@ -67,14 +67,24 @@ def _wyc_transcript(tmux_session):
         sid, cwd = best.get("id"), best.get("cwd")
         if not sid or not cwd:
             return None
-        for base in (cwd,):
-            p = os.path.join(os.path.expanduser("~/.claude/projects"),
-                             _slug(base), f"{sid}.jsonl")
+        for pdir in _projects_dirs():
+            p = os.path.join(pdir, _slug(cwd), f"{sid}.jsonl")
             if os.path.exists(p):
                 return p
     except Exception:
         pass
     return None
+
+
+def _projects_dirs():
+    """Every account slot's transcript dir (lib/accounts.py): a session on a
+    slot other than ~/.claude writes its transcript under that slot."""
+    try:
+        import accounts
+        sl, _err = accounts.slots_or_home()
+        return [d for _slot, d in accounts.projects_dirs(sl)]
+    except Exception:
+        return [os.path.expanduser("~/.claude/projects")]
 
 
 def resolve_transcript(tmux_session):
@@ -94,21 +104,21 @@ def resolve_transcript(tmux_session):
     except Exception:
         root = cwd
     for base in (root, cwd):
-        ns = os.path.join(os.path.expanduser("~/.claude/projects"), _slug(base))
-        if not os.path.isdir(ns):
-            continue
         best, best_m = None, 0
-        try:
-            for fn in os.listdir(ns):
-                # agent-*.jsonl are SUBAGENT transcripts — never the session's own
-                if not fn.endswith(".jsonl") or fn.startswith("agent-"):
-                    continue
-                p = os.path.join(ns, fn)
-                m = os.path.getmtime(p)
-                if m > best_m:
-                    best, best_m = p, m
-        except OSError:
-            continue
+        for ns in (os.path.join(pdir, _slug(base)) for pdir in _projects_dirs()):
+            if not os.path.isdir(ns):
+                continue
+            try:
+                for fn in os.listdir(ns):
+                    # agent-*.jsonl are SUBAGENT transcripts — never the session's own
+                    if not fn.endswith(".jsonl") or fn.startswith("agent-"):
+                        continue
+                    p = os.path.join(ns, fn)
+                    m = os.path.getmtime(p)
+                    if m > best_m:
+                        best, best_m = p, m
+            except OSError:
+                continue
         if best:
             return best
     return None

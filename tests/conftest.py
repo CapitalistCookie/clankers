@@ -38,4 +38,8 @@ def _isolated_clanker_data():
         # test ever reads the live fleet's records.
         os.makedirs(os.path.join(d, "claude-sessions"), exist_ok=True)
         os.environ["CLANKER_CLAUDE_SESSIONS_DIR"] = os.path.join(d, "claude-sessions")
+        # 2026-10-29: the registry spans every account slot, and the slots come
+        # from the box accounts command (claude-acct). Single-slot mode here, so
+        # no test reads a live slot; tests that need slots set a fake command.
+        os.environ["CLANKER_ACCOUNTS_CMD"] = "none"
         yield d

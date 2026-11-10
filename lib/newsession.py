@@ -5,6 +5,11 @@ and launches Claude with the sandbox disabled and permission prompts skipped
 (`CLAUDE_CODE_DISABLE_SANDBOX=1 claude --dangerously-skip-permissions`). `clanker open
 [name]` (aliases: `attach`, `test`) attaches to it — defaulting to the most recent one
 `new` created. Works from anywhere; nothing here is project-specific.
+
+Account slots (2026-10-29, docs/SESSION-ACCOUNTS.md): every Claude launch names the
+slot the user selected (lib/accounts.py). The launch line pins CLAUDE_CONFIG_DIR
+explicitly, the session holds a user lease bound to its claude pid, and a launch
+counts as done only when Claude's own registry shows the pane's process on that slot.
 """
 import json
 import os
@@ -15,19 +20,31 @@ import shutil
 import subprocess
 import time
 
+import accounts
+import claude_registry
+
 DATA_DIR = os.environ.get("CLANKER_DATA", "/data/clanker")
 _LAST_FILE = os.path.join(DATA_DIR, ".last_new_session")
 
 LAUNCH = "CLAUDE_CODE_DISABLE_SANDBOX=1 claude --dangerously-skip-permissions"
 
 
-def launch_cmd(cwd, resume=None):
+def launch_cmd(cwd, resume=None, *, slot, session=None):
     """The one true launch line: explicit cd first, so a pane/shell that was
     re-homed by anything (rc files, restores, keepalives) still lands Claude in
     the project dir — the 2026-07-05 fleet regression was every session's
     Claude silently running at ~. resume: True → `--resume` picker (lists THIS
-    project's sessions); a session-id string → resume that session directly."""
-    cmd = f"cd {shlex.quote(os.path.abspath(cwd))} && {LAUNCH}"
+    project's sessions); a session-id string → resume that session directly.
+    slot: the account slot (lib/accounts.py) — its env(1) prefix sets or unsets
+    CLAUDE_CONFIG_DIR on every launch, so an inherited value never decides the
+    account. session: the CLANKER_SESSION marker (a session clanker started)."""
+    parts = [f"cd {shlex.quote(os.path.abspath(cwd))} &&"]
+    env = accounts.launch_env(slot)
+    if env:
+        parts.append(env)
+    if session:
+        parts.append(f"CLANKER_SESSION={shlex.quote(session)}")
+    cmd = " ".join(parts + [LAUNCH])
     if resume is True:
         cmd += " --resume"
     elif resume:
@@ -76,6 +93,21 @@ def ensure_default_shell(shell=None, timeout=5):
     return current if r.returncode == 0 else None
 
 
+# A tmux server copies the environment it is born in into every pane it ever
+# makes. Born from inside a Claude session (`clanker new` in a Bash tool), it
+# would hand that session's account and identity to the whole fleet.
+_SESSION_ENV = ("CLAUDE_CONFIG_DIR", "CLANKER_SESSION", "CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT",
+                "CLAUDE_ENV_FILE", "CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID")
+_SESSION_ENV_PARTS = ("SESSION", "MESSAGING", "ENTRYPOINT", "EXECPATH", "CHILD")
+
+
+def server_env():
+    """os.environ without a parent Claude session's account and identity."""
+    return {k: v for k, v in os.environ.items()
+            if k not in _SESSION_ENV
+            and not (k.startswith("CLAUDE_CODE_") and any(x in k for x in _SESSION_ENV_PARTS))}
+
+
 def tmux_new_session(name, cwd, cols=220, rows=50, timeout=10):
     """`tmux new-session -d` that lands in the login shell whichever way the
     server came to be: a running server has its default-shell healed first,
@@ -84,7 +116,7 @@ def tmux_new_session(name, cwd, cols=220, rows=50, timeout=10):
     Returns (CompletedProcess, healed_from_or_None)."""
     shell = login_shell()
     healed = ensure_default_shell(shell, timeout=timeout)
-    env = {**os.environ, "SHELL": shell}
+    env = {**server_env(), "SHELL": shell}
     r = subprocess.run(["tmux", "new-session", "-d", "-s", name, "-c", cwd,
                         "-x", str(cols), "-y", str(rows)],
                        capture_output=True, text=True, timeout=timeout, env=env)
@@ -119,7 +151,13 @@ def _pane_command(name):
     prefix-matches, so `web` can never resolve to `web-2`."""
     p = subprocess.run(["tmux", "display-message", "-p", "-t", f"={name}:",
                         "#{pane_current_command}"], capture_output=True, text=True)
-    return (p.stdout or "").strip() if p.returncode == 0 else ""
+    return _norm_command((p.stdout or "").strip()) if p.returncode == 0 else ""
+
+
+def _norm_command(cmd):
+    """`claude.exe` (the npm package's real binary) is Claude too (serve.py
+    CLAUDE_PANE_COMMANDS: the .exe form once hid a pane for days)."""
+    return "claude" if cmd in ("claude", "claude.exe") else cmd
 
 
 def _unique_name(base):
@@ -214,6 +252,7 @@ def accept_trust_prompt(name, timeout=7.0, interval=0.5):
 
 
 def _sessions_dir():
+    """The home slot's registry dir (kept for callers that name one dir)."""
     override = os.environ.get("CLANKER_CLAUDE_SESSIONS_DIR")
     if override:
         return override
@@ -222,23 +261,28 @@ def _sessions_dir():
 
 
 def _repl_registered(name):
-    """True when a live Claude REPL already claims tmux session `name` in Claude
-    Code's session registry (~/.claude/sessions/<pid>.json, `tmux` field) — it
-    got past every startup dialog, so there is nothing left to answer."""
-    try:
-        for fn in os.listdir(_sessions_dir()):
+    """True when a Claude REPL already claims tmux session `name` in Claude
+    Code's session registry (<config dir>/sessions/<pid>.json, `tmux` field) of
+    ANY account slot — it got past every startup dialog, so there is nothing
+    left to answer."""
+    sl, _err = accounts.slots_or_home()
+    for _slot, d in accounts.sessions_dirs(sl):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for fn in names:
             if not fn.endswith(".json"):
                 continue
             try:
-                with open(os.path.join(_sessions_dir(), fn)) as f:
+                with open(os.path.join(d, fn)) as f:
                     rec = json.load(f)
             except (OSError, ValueError):
                 continue
-            if (rec.get("tmux") or "").startswith(name + ":"):
+            if isinstance(rec, dict) and (rec.get("tmux") or "").startswith(name + ":"):
                 return True
-    except OSError:
-        pass
-    return False
+    # the record may name the dashboard's grouped web-* session: match the pane id
+    return pane_record(pane_info(name)) is not None
 
 
 def accept_trust_prompts(names, timeout=120.0, interval=2.0):
@@ -271,58 +315,241 @@ def accept_trust_prompts(names, timeout=120.0, interval=2.0):
     return answered
 
 
-def spawn(name=None, cwd=None, shell=False, resume=None, start_claude_in_shell=False):
+def pane_info(name):
+    """{pane_id, pane_pid, command, path} of the active pane of session `name`
+    (exact target), or None when there is no such session."""
+    p = subprocess.run(["tmux", "display-message", "-p", "-t", f"={name}:",
+                        "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{pane_current_path}"],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return None
+    parts = (p.stdout or "").rstrip("\n").split("\t")
+    if len(parts) < 4:
+        return None
+    try:
+        pid = int(parts[1])
+    except ValueError:
+        pid = None
+    return {"pane_id": parts[0], "pane_pid": pid, "command": _norm_command(parts[2]), "path": parts[3]}
+
+
+def would_launch(name):
+    """True when `work`/`new` with this session name would start Claude: no such
+    session, or one whose active pane is a bare shell."""
+    return not name or not _session_exists(_slug(name)) or _pane_command(_slug(name)) in SHELLS
+
+
+LAUNCH_GRACE = 3.0       # s: a launch still at a shell prompt after this never started Claude
+_NOT_FOUND_RX = re.compile(r"No such file or directory|command not found|not found", re.I)
+
+
+def _pane_tail(name, lines=4):
+    p = subprocess.run(["tmux", "capture-pane", "-p", "-t", f"={name}:"], capture_output=True, text=True)
+    rows = [ln.rstrip() for ln in (p.stdout or "").split("\n") if ln.strip()]
+    return "\n".join(rows[-lines:])
+
+
+def wait_registered(name, timeout=60.0, exclude_pids=(), interval=0.5, info=None):
+    """Wait for a live registry record (any slot) whose tmux ref names session
+    `name`, answering the workspace-trust dialog on the way (it appears per
+    slot: each slot keeps its own trust list). Returns the record, or None at
+    the timeout, when the pane is gone, or as soon as the launch has ended —
+    the pane is back at a shell and Claude never ran (2026-10-29: a launch
+    during Claude Code's npm relink got `env: 'claude': No such file or
+    directory`), or Claude ran and quit. `info["exited"]` then holds the
+    pane's last lines."""
+    t0 = time.time()
+    deadline = t0 + timeout
+    seen = False
+    pane = pane_info(name)
+    while time.time() < deadline:
+        p = subprocess.run(["tmux", "capture-pane", "-p", "-t", f"={name}:"],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            return None
+        where = _trust_cursor(p.stdout)
+        if where:
+            _answer_trust(f"={name}:", where)
+        rec = pane_record(pane, exclude_pids)
+        if rec:
+            return rec
+        cmd = _pane_command(name)
+        if cmd and cmd not in SHELLS:
+            seen = True
+        elif cmd in SHELLS and (seen or time.time() - t0 > LAUNCH_GRACE) and not where:
+            if info is not None:
+                info["exited"] = _pane_tail(name)
+            return None
+        time.sleep(0.3 if where in ("down", "up") else interval)
+    return None
+
+
+def pane_record(pane, exclude_pids=()):
+    """The live registry record (any slot) of the Claude in this pane. Matched by
+    PANE ID, never by session name: Claude writes the name of the session its
+    client came through, and while the dashboard's terminal is open that is the
+    grouped `web-*` bridge session (2026-10-29 walk: `web-9e96f80f:@360.%391`
+    for pane %391 of `walk-a3`)."""
+    if not pane:
+        return None
+    recs = [r for r in claude_registry.read_all() if r["pid"] not in exclude_pids]
+    return claude_registry.record_for_pane(pane, recs)
+
+
+def _send_line(name, line):
+    """Type one line literally (-l: nothing is a flag) and submit it."""
+    subprocess.run(["tmux", "send-keys", "-t", f"={name}:", "-l", "--", line], capture_output=True)
+    subprocess.run(["tmux", "send-keys", "-t", f"={name}:", "Enter"], capture_output=True)
+
+
+def launch_timeout():
+    """Seconds a launch may take to register (CLANKER_LAUNCH_TIMEOUT, default 60)."""
+    try:
+        return float(os.environ.get("CLANKER_LAUNCH_TIMEOUT") or 60)
+    except ValueError:
+        return 60.0
+
+
+def start_in_pane(name, cwd, slot, resume=None, exclude_pids=(), timeout=None):
+    """Launch Claude on `slot` in the existing pane of `name` (a shell at its
+    prompt) and verify it: (record, None) or (None, error). The record's process
+    must run on `slot` — read from its own environment, not assumed."""
+    timeout = launch_timeout() if timeout is None else timeout
+    line = launch_cmd(cwd, resume=resume, slot=slot, session=name)
+    for attempt in (1, 2):
+        # A launch line is typed ONLY at a shell. A prompt-looking last line is
+        # not enough: Claude's own `❯` prompt looks like one, and a launch line
+        # typed into Claude is sent to the model as a message (2026-10-29 walk).
+        cmd = _pane_command(name)
+        if cmd not in SHELLS:
+            running = pane_record(pane_info(name), exclude_pids)
+            return None, (f"session '{name}' runs {cmd or 'nothing'}, not a shell — nothing typed"
+                          + (f" (Claude pid {running['pid']}, session {running.get('sessionId')})"
+                             if running else ""))
+        _wait_shell_prompt(name)
+        _send_line(name, line)
+        info = {}
+        rec = wait_registered(name, timeout=timeout, exclude_pids=exclude_pids, info=info)
+        if rec is not None:
+            break
+        tail = info.get("exited")
+        if attempt == 1 and tail and _NOT_FOUND_RX.search(tail):
+            time.sleep(LAUNCH_GRACE)          # the claude binary was being replaced: once more
+            continue
+        if tail:
+            return None, (f"claude did not start in session '{name}' — the pane shows:\n{tail}\n"
+                          f"(the pane is left as it is: clanker open {name})")
+        return None, (f"claude did not register in session '{name}' within {int(timeout)} s "
+                      f"(the pane is left as it is: clanker open {name})")
+    sl, _err = accounts.slots_or_home()
+    got = accounts.slot_of_pid(rec["pid"], sl)
+    if got is None or got["id"] != slot["id"]:
+        return None, (f"session '{name}' started on account {got['id'] if got else '?'}, "
+                      f"not {slot['id']} (pid {rec['pid']}) — stop it and start again")
+    if resume and resume is not True and rec.get("sessionId") != resume:
+        return None, (f"session '{name}' resumed as {rec.get('sessionId')}, not {resume}")
+    return rec, None
+
+
+def _lease(slot, name):
+    """A user lease for `name` on `slot`, bound to THIS process until the claude
+    pid is known: (lease_id or None, warnings, error). When the accounts command
+    fails, the home slot still launches (warning, no lease); any other slot stops."""
+    try:
+        r = accounts.lease_user(slot, name, os.getpid())
+    except accounts.AccountsError as e:
+        if slot.get("home"):
+            return None, [f"no lease (accounts command failed: {e})"], None
+        return None, [], f"account {slot['id']}: cannot take a lease: {e}"
+    if r.get("off"):
+        return None, [], None
+    if r["refused"]:
+        return None, [], f"account {slot['id']} cannot run: " + "; ".join(r["refused"])
+    return (r["lease"] or {}).get("id"), r["warnings"], None
+
+
+def _start(name, cwd, slot, resume, new_session):
+    """Lease → (create the tmux session) → launch → verify → move the lease to
+    the claude pid. Returns (name, message) or (None, error)."""
+    lease_id, warnings, err = _lease(slot, name)
+    if err:
+        return None, err
+    healed = None
+    if new_session:
+        r, healed = tmux_new_session(name, cwd)
+        if r.returncode != 0:
+            accounts.release(lease_id)
+            return None, "tmux new-session failed: " + (r.stderr or "").strip()[:200]
+    rec, err = start_in_pane(name, cwd, slot, resume=resume)
+    if err:
+        accounts.release(lease_id)
+        return None, err
+    if lease_id and not accounts.renew(lease_id, pid=rec["pid"]):
+        warnings.append(f"lease {lease_id} could not move to claude pid {rec['pid']} "
+                        "(the dashboard reconciler retries)")
+    _record_last(name)
+    verb = "started claude" if new_session else "started claude in existing session"
+    msg = (f"{verb} '{name}' in {cwd}\n"
+           f"account: {accounts.label(slot)}" + (f"  lease {lease_id}" if lease_id else "") + "\n"
+           f"open it with:  clanker open {name}")
+    if not new_session:
+        msg = msg.replace(f"{verb} '{name}'", f"{verb} '{name}' (was a plain shell)")
+    for w in warnings:
+        msg += f"\nwarning: {w}"
+    if healed:
+        msg += (f"\nhealed tmux: default-shell was {healed} (server born in a bare "
+                f"env, e.g. cron) — now {login_shell()} for every new window")
+    return name, msg
+
+
+def spawn(name=None, cwd=None, shell=False, resume=None, start_claude_in_shell=False,
+          account=None):
     """Create a detached tmux session and launch Claude (or a bare shell) in it.
+    account: the slot the user selected (lib/accounts.py). Required whenever
+    Claude starts — the user always selects; nothing here picks one.
     start_claude_in_shell (the `clanker work` path): when the named session
     already exists and its active pane is a bare shell, start Claude there
     instead of only pointing at it. Boot and fleet-heal recreate mapped
     sessions as plain shells (Claude is on demand only, 2026-09-24), so this is
     how a mapped session gets its Claude. A pane running anything else is
     never typed into.
-    Returns (name, message). Never raises for the expected failure modes."""
+    Returns (name, message); name is None on failure. Never raises for the
+    expected failure modes."""
     if not _tmux():
         return None, "tmux is not installed (required for `clanker new`)."
     cwd = os.path.abspath(cwd or os.getcwd())
 
-    # Seed the project's Claude memory namespace so the session isn't memory-blind
-    # (repo-rooted sessions otherwise load an empty MEMORY.md). Best-effort.
-    try:
-        from memoryns import ensure_memory_stub
-        ensure_memory_stub(cwd)
-    except Exception:
-        pass
-
     requested = bool(name)
     base = _slug(name) if name else "claude"
-    if requested and _session_exists(base):
-        if not shell and start_claude_in_shell and _pane_command(base) in SHELLS:
-            _wait_shell_prompt(base)
-            subprocess.run(["tmux", "send-keys", "-t", f"={base}:", "-l", "--",
-                            launch_cmd(cwd, resume=resume)], capture_output=True)
-            subprocess.run(["tmux", "send-keys", "-t", f"={base}:", "Enter"],
-                           capture_output=True)
-            accept_trust_prompt(base)
-            _record_last(base)
-            return base, (f"started claude in existing session '{base}' (was a plain shell) "
-                          f"in {cwd}\nopen it with:  clanker open {base}")
+    exists = requested and _session_exists(base)
+    if exists and not (not shell and start_claude_in_shell and _pane_command(base) in SHELLS):
         return base, (f"session '{base}' already exists — attach with: clanker open {base}")
+
+    slot = None
+    if not shell:
+        slot, err = accounts.resolve(account)
+        if err:
+            return None, err
+        # Seed the project's Claude memory namespace in the slot that runs it,
+        # so the session isn't memory-blind. Best-effort.
+        try:
+            from memoryns import ensure_memory_stub
+            ensure_memory_stub(cwd, config_dir=slot.get("real"))
+        except Exception:
+            pass
+
+    if exists:
+        return _start(base, cwd, slot, resume, new_session=False)
+
     name = base if requested else _unique_name(base)
+    if not shell:
+        return _start(name, cwd, slot, resume, new_session=True)
 
     r, healed = tmux_new_session(name, cwd)
     if r.returncode != 0:
         return None, "tmux new-session failed: " + (r.stderr or "").strip()[:200]
-
-    if not shell:
-        _wait_shell_prompt(name)
-        # Launch literally (-l) so nothing is treated as a flag; Enter submits.
-        subprocess.run(["tmux", "send-keys", "-t", name, "-l", "--", launch_cmd(cwd, resume=resume)],
-                       capture_output=True)
-        subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], capture_output=True)
-        accept_trust_prompt(name)
-
     _record_last(name)
-    what = "shell" if shell else "claude (sandbox off, permissions skipped)"
-    msg = (f"started {what} session '{name}' in {cwd}\n"
+    msg = (f"started shell session '{name}' in {cwd}\n"
            f"open it with:  clanker open {name}    (or: clanker open)")
     if healed:
         msg += (f"\nhealed tmux: default-shell was {healed} (server born in a bare "
@@ -348,9 +575,14 @@ def attach(name=None):
             else ["tmux", "attach-session", "-t", name])
 
     import sys
+    # Only a person at a terminal is attached or switched. A script or a Claude
+    # tool call that runs `clanker open` inside tmux would otherwise move the
+    # owner's own client (2026-10-29 walk: it did).
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True, (f"run:  tmux switch-client -t {name}" if inside_tmux
+                      else f"run:  tmux attach -t {name}")
     if inside_tmux:
         subprocess.run(argv)
         return True, f"switched to '{name}'"
-    if sys.stdout.isatty():
-        os.execvp("tmux", argv)   # replace this process with the interactive client
+    os.execvp("tmux", argv)   # replace this process with the interactive client
     return True, f"run:  tmux attach -t {name}"

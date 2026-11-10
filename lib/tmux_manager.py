@@ -26,16 +26,21 @@ import re
 import subprocess
 import sys
 
-STARTUP_SCRIPT = os.path.expanduser("~/.tmux-startup.sh")
+STARTUP_SCRIPT = None    # None: ~/.tmux-startup.sh of $HOME at CALL time (law 9); tests set a path
+
+
+def startup_script():
+    """The boot map: an in-process caller under a test HOME never reaches the real one."""
+    return STARTUP_SCRIPT or os.path.expanduser("~/.tmux-startup.sh")
 
 _HEADER = """#!/bin/bash
 # Tmux session startup — runs on boot via systemd; also the canonical
-# session→path map (managed by clanker lib/tmux_manager.py — edit via
-# `clanker tmux add/remove`, not by hand).
+# session→path map (managed by clanker lib/tmux_manager.py — `clanker open`,
+# `new` and `close` keep it; not by hand).
 # Resurrect+continuum restore saved state first; this ensures every mapped
 # session exists as a fallback, as a PLAIN SHELL at its mapped dir. It never
 # launches Claude (operator rule, 2026-09-24): Claude starts only on demand,
-# via `clanker work <project>` or `clanker tmux add`.
+# via `clanker open <project|session>`; `clanker close` ends one.
 
 sleep 2
 
@@ -56,11 +61,6 @@ done
 """
 
 
-def _launch_cmd(path, resume=None):
-    from newsession import launch_cmd
-    return launch_cmd(path, resume=resume)
-
-
 def list_sessions():
     """List all tmux sessions."""
     try:
@@ -74,7 +74,7 @@ def startup_entries():
     """Parse the startup script's sessions array → {name: path}."""
     entries = {}
     try:
-        with open(STARTUP_SCRIPT) as f:
+        with open(startup_script()) as f:
             for line in f:
                 m = re.match(r'\s*"([^":]+):([^"]+)"', line)
                 if m:
@@ -87,11 +87,11 @@ def startup_entries():
 def write_startup(entries):
     """Regenerate the whole startup script from {name: path} (sorted)."""
     body = "".join(f'    "{n}:{p}"\n' for n, p in sorted(entries.items()))
-    tmp = STARTUP_SCRIPT + ".tmp"
+    tmp = startup_script() + ".tmp"
     with open(tmp, "w") as f:
         f.write(_HEADER + body + _FOOTER)
     os.chmod(tmp, 0o755)
-    os.replace(tmp, STARTUP_SCRIPT)
+    os.replace(tmp, startup_script())
 
 
 def ensure_boot_entry(name, project_path):
@@ -112,30 +112,47 @@ def ensure_boot_entry(name, project_path):
     return True
 
 
-def add_session(name, project_path=None):
-    """Ensure a tmux session exists for a project and UPSERT its boot entry."""
+def add_session(name, project_path=None, account=None):
+    """Ensure a tmux session exists for a project and UPSERT its boot entry.
+    Without `account` the session is a plain shell (Claude starts on demand,
+    on the slot the user selects: `clanker open <name> <slot>`).
+    With `account`, Claude starts on that slot through newsession (lease,
+    launch, verify). Returns False when that start failed."""
     if not project_path:
         project_path = os.path.expanduser(f"~/projects/{name}")
     project_path = os.path.abspath(os.path.expanduser(project_path))
+    if account:
+        # Claude runs only in a registered project (lib/session_flow.py)
+        import session_flow
+        if not session_flow.project_of(project_path)[0]:
+            print(f"'{project_path}' is outside every project: Claude starts only in a project "
+                  "(clanker open <project> <slot>)", file=sys.stderr)
+            return False
 
     # Exact targets (2026-09-24): "=name" never prefix-matches, so a missing
     # `clanker` is not taken for a running `clanker-41`; "=name:" sends the
     # keys to that session's current window only.
     exists = subprocess.run(["tmux", "has-session", "-t", f"={name}"],
                             capture_output=True).returncode == 0
+    ok = True
     if exists:
         print(f"Tmux session '{name}' already exists — leaving as-is, registering for boot")
     else:
         from newsession import tmux_new_session
         _r, healed = tmux_new_session(name, project_path)   # login shell guaranteed
-        subprocess.run(["tmux", "send-keys", "-t", f"={name}:", "-l", "--",
-                        _launch_cmd(project_path)], capture_output=True)
-        subprocess.run(["tmux", "send-keys", "-t", f"={name}:", "Enter"], capture_output=True)
-        print(f"Created tmux session: {name} → {project_path}"
+        print(f"Created tmux session: {name} → {project_path} (plain shell)"
               + (f" (healed tmux default-shell: was {healed})" if healed else ""))
+        if account:
+            from newsession import spawn
+            sess, msg = spawn(name=name, cwd=project_path, account=account,
+                              start_claude_in_shell=True)
+            print(msg, file=sys.stdout if sess else sys.stderr)
+            ok = bool(sess)
+        else:
+            print(f"start Claude in it with: clanker open {name} <slot>")
 
     ensure_boot_entry(name, project_path)
-    return True
+    return ok
 
 
 def _alive_sessions():
@@ -193,8 +210,8 @@ def resurrect(dry_run=False, sync_registry=False):
     write_startup(merged)
     if missing:
         print(f"[resurrect] recreating {len(missing)} session(s) as plain shells via "
-              f"{STARTUP_SCRIPT} … (claude on demand: clanker work <project>)")
-        r = subprocess.run(["bash", STARTUP_SCRIPT], capture_output=True, text=True)
+              f"{startup_script()} … (claude on demand: clanker open <project|session>)")
+        r = subprocess.run(["bash", startup_script()], capture_output=True, text=True)
         if r.returncode != 0:
             print(f"[resurrect] startup script exited {r.returncode}: "
                   f"{(r.stderr or '').strip()[:300]}", file=sys.stderr)

@@ -34,7 +34,6 @@ BASE_URL = os.environ.get("CLANKER_BASE_URL", "")  # e.g. https://dashboard.eige
 NTFY_TOPIC = os.environ.get("CLANKER_NTFY_TOPIC", "")
 NTFY_SERVER = os.environ.get("CLANKER_NTFY_SERVER", "https://ntfy.sh")
 # Access token for a self-hosted/authenticated ntfy server (Bearer). Empty = none.
-NTFY_TOKEN = os.environ.get("CLANKER_NTFY_TOKEN", "")
 
 # Auto-detect best bind address
 def _detect_bind_address():
@@ -92,6 +91,8 @@ HOST = os.environ.get("CLANKER_SERVE_HOST", "127.0.0.1")
 # no OAuth, and no header trust — a valid signed session cookie (issued only after
 # a successful 3-factor login) is the sole way past auth_middleware.
 import webauth
+import accounts
+import claude_registry
 
 # Cookie secret — auto-generate and persist if not provided
 COOKIE_SECRET = os.environ.get("CLANKER_COOKIE_SECRET", "")
@@ -717,7 +718,8 @@ REGISTRY_LOSS_REALERT_SECS = 6 * 3600
 
 
 def _sessions_dir():
-    """Registry directory, resolved at call time (Law 9: no import-time capture)."""
+    """The HOME slot's registry directory, resolved at call time (Law 9). The
+    fleet spans every account slot: read_session_registry reads them all."""
     override = os.environ.get("CLANKER_CLAUDE_SESSIONS_DIR")
     if override:
         return override
@@ -725,72 +727,31 @@ def _sessions_dir():
     return os.path.join(cfg, "sessions")
 
 
-def _proc_start(pid):
-    """Kernel start time of pid (clock ticks since boot; /proc/<pid>/stat field
-    22), or None when it is not running. Compared with the record's procStart so
-    a reused pid never vouches for a dead session."""
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            stat = f.read()
-        return stat[stat.rindex(")") + 2:].split()[19]
-    except (OSError, ValueError, IndexError):
-        return None
+def _sessions_dirs_label():
+    """Every registry dir this dashboard reads, for alert text."""
+    import accounts
+    sl, _err = accounts.slots_or_home()
+    return ", ".join(d for _sid, d in accounts.sessions_dirs(sl))
 
 
-def _proc_children(pid):
-    try:
-        with open(f"/proc/{pid}/task/{pid}/children") as f:
-            return [int(x) for x in f.read().split()]
-    except (OSError, ValueError):
-        return []
+_proc_start = claude_registry.proc_start
+_proc_children = claude_registry.proc_children
 
 
 def read_session_registry(sessions_dir=None):
-    """The LIVE registry records (dead or reused pids dropped), each annotated
-    with `pane_id` ("%58") and `tmux_session` parsed from its tmux ref. Never
-    raises; an unreadable/missing directory is an empty fleet."""
-    d = sessions_dir or _sessions_dir()
-    live = []
-    try:
-        names = os.listdir(d)
-    except OSError:
-        return live
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(d, name)) as f:
-                rec = json.load(f)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(rec, dict) or not isinstance(rec.get("pid"), int):
-            continue
-        start = _proc_start(rec["pid"])
-        if start is None or str(rec.get("procStart", "")) != start:
-            continue
-        m = _TMUX_REF_RX.match(rec.get("tmux") or "")
-        rec["pane_id"] = f"%{m.group(3)}" if m else None
-        rec["tmux_session"] = m.group(1) if m else None
-        live.append(rec)
-    return live
+    """The LIVE registry records (dead or reused pids dropped) of EVERY account
+    slot (lib/claude_registry.py), each annotated with `pane_id`, `tmux_session`
+    and `slot`. With `sessions_dir`, that one dir only. Never raises."""
+    if sessions_dir:
+        return claude_registry.read_dir(sessions_dir)
+    return claude_registry.read_all()
 
 
 def registry_record(pane, registry):
     """The registry record for a tmux pane: by pane id first, then by process
     tree (the pane's shell or its direct child is the REPL) for a record whose
     tmux ref is missing. None when the pane has no live record."""
-    pane_id = pane.get("pane_id")
-    if pane_id:
-        for rec in registry:
-            if rec.get("pane_id") == pane_id:
-                return rec
-    ppid = pane.get("pane_pid")
-    if ppid:
-        candidates = {ppid, *_proc_children(ppid)}
-        for rec in registry:
-            if rec.get("pid") in candidates:
-                return rec
-    return None
+    return claude_registry.record_for_pane(pane, registry)
 
 
 _LABEL_RX = re.compile(r"[^\w .:@/#+-]+")
@@ -805,7 +766,7 @@ def _safe_label(text, limit=60):
     return _LABEL_RX.sub(" ", text or "").strip()[:limit]
 
 
-def paneless_sessions(registry, matched_pids):
+def paneless_sessions(registry, matched_pids, annotate=None):
     """The live sessions that own no tmux pane, shaped as /api/status entries.
 
     A `claude` background job (registry `kind: "bg"`) carries no tmux ref at
@@ -844,6 +805,7 @@ def paneless_sessions(registry, matched_pids):
             "b7d": None,
             "size": "",
             "bg": True,
+            **(annotate(rec) if annotate else {}),
         })
     return out
 
@@ -938,13 +900,13 @@ def _registry_watch(panes, registry, now, watch, alert=None):
         return covered, total
     watch["alerted_at"] = now
     msg = (f"Claude Code session registry has no live record for any of the {total} "
-           f"claude panes ({_sessions_dir()}) — ntfy session pings are BLIND. "
+           f"claude panes ({_sessions_dirs_label()}) — ntfy session pings are BLIND. "
            f"Did a Claude Code update move or rename the registry?")
     log.warning(msg)
     (alert or _raise_alert)(
         alert_id="session-state-source-lost", severity="critical",
         source="dashboard", message=msg,
-        details={"sessions_dir": _sessions_dir(), "claude_panes": total,
+        details={"sessions_dir": _sessions_dirs_label(), "claude_panes": total,
                  "lost_since": watch["lost_since"]})
     return covered, total
 
@@ -1272,6 +1234,48 @@ async def handle_index(request):
     return resp
 
 
+def account_fields(rec, sl, ls):
+    """The account slot, lease and clanker marker of one session, read from its
+    process (CLAUDE_CONFIG_DIR, CLANKER_SESSION) and the registry dir that holds
+    its record — never from a state file (docs/SESSION-ACCOUNTS.md 5.4)."""
+    if not rec:
+        return {"account": None, "lease": None, "managed": False}
+    s = accounts.slot_of_pid(rec["pid"], sl)
+    if s is None and rec.get("slot"):
+        s = accounts.get(rec["slot"], sl)
+    acct = None if s is None else {
+        "slot": s["id"], "plan": s.get("plan"), "five_hour": s.get("five_hour"),
+        "seven_day": s.get("seven_day"), "single": bool(s.get("single"))}
+    l = accounts.lease_of_pid(rec["pid"], ls)
+    lease = None if not l else {"id": l.get("id"), "kind": l.get("kind") or "job",
+                                "holder": l.get("holder"), "warnings": len(l.get("warnings") or [])}
+    managed = accounts.proc_env_value(rec["pid"], "CLANKER_SESSION") is not None
+    return {"account": acct, "lease": lease, "managed": managed}
+
+
+def account_usage(sl, sessions):
+    """Every account worth showing on the dashboard (not empty): 5h/7d figures,
+    resets, freshness and how many tmux sessions run Claude on it."""
+    names = {}
+    for s in sessions:
+        a = s.get("account") or {}
+        if a.get("slot"):
+            names.setdefault(a["slot"], set()).add(s.get("session"))
+    keep = ("id", "status", "plan", "usable", "why", "warnings", "five_hour", "seven_day", "resets_at",
+            "figure_at", "figure_source", "stale", "home")
+    return [dict({k: s.get(k) for k in keep}, sessions=len(names.get(s["id"], ())))
+            for s in sl if s["status"] not in ("empty", "?") and not s.get("single")]
+
+
+def _slots_and_leases():
+    sl, _err = accounts.slots_display()
+    try:
+        ls = accounts.leases()
+    except accounts.AccountsError:
+        ls = []
+    return sl, ls
+
+
 async def handle_status(request):
     """Return current tmux session status (cached 2s)."""
     cached = _status_cache.get()
@@ -1281,7 +1285,8 @@ async def handle_status(request):
         return resp
 
     panes = list_panes()
-    registry = read_session_registry()
+    sl, ls = _slots_and_leases()
+    registry = claude_registry.read_all(sl)
     sessions = []
     matched_pids = set()
     for p in panes:
@@ -1347,13 +1352,16 @@ async def handle_status(request):
             "b5h": b5h,
             "b7d": b7d,
             "size": f"{p['width']}x{p['height']}",
+            **account_fields(rec, sl, ls),
         })
 
     # The sessions no pane owns — `claude` background jobs. Without this the
     # list is only as complete as tmux is, and a bg job is nowhere in tmux.
-    sessions.extend(paneless_sessions(registry, matched_pids))
+    sessions.extend(paneless_sessions(registry, matched_pids,
+                                      annotate=lambda r: account_fields(r, sl, ls)))
 
-    result = {"sessions": sessions, "ntfy_configured": bool(NTFY_TOPIC)}
+    result = {"sessions": sessions, "ntfy_configured": bool(NTFY_TOPIC),
+              "accounts": accounts.enabled(), "account_usage": account_usage(sl, sessions)}
     _status_cache.set(result)
     resp = web.json_response(result)
     resp.enable_compression()
@@ -1567,59 +1575,180 @@ _SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 async def handle_session_new(request):
     """Create a fresh detached tmux session from the WebUI (claude or bare shell).
 
-    Default: launch `claude --dangerously-skip-permissions` with
-    CLAUDE_CODE_DISABLE_SANDBOX=1 so the new session is immediately usable and
-    shows up in Live Sessions. `{"shell": true}` makes it a bare login shell
-    instead. The session is anchored at $HOME. Behind the same 3-factor auth as
-    the terminal bridge (this is no more privileged than the existing terminal
-    access, which already reaches a skip-permissions claude)."""
+    Claude sessions launch through newsession.spawn — the one launch path: the
+    `account` the user picked (required whenever account slots exist; the dialog
+    never preselects one), a user lease, and a launch verified against Claude's
+    own registry. A Claude session runs in the `project` the user picked (every
+    Claude session belongs to a project, lib/session_flow.py); its name defaults
+    to the project's. `{"shell": true}` makes it a bare login shell at $HOME
+    instead. Kept across reboots until `clanker close`. Behind the same 3-factor auth as the terminal
+    bridge (this is no more privileged than the existing terminal access, which
+    already reaches a skip-permissions claude)."""
     try:
         data = await request.json()
     except Exception:
         data = {}
     name = (data.get("name") or "").strip()
     bare_shell = bool(data.get("shell"))
-    if not name:
-        name = ("sh-" if bare_shell else "cc-") + uuid.uuid4().hex[:6]
-    if name.startswith("web-") or not _SESSION_NAME_RE.match(name):
+    account = (data.get("account") or "").strip() or None
+    project = (data.get("project") or "").strip() or None
+    if bare_shell and not name:
+        name = "sh-" + uuid.uuid4().hex[:6]
+    if name and (name.startswith("web-") or not _SESSION_NAME_RE.match(name)):
         return web.json_response({"error": "invalid session name"}, status=400)
-
-    loop = asyncio.get_event_loop()
+    if account is not None and not _ACCOUNT_RE.match(account):
+        return web.json_response({"error": "invalid account"}, status=400)
+    if not bare_shell and not project:
+        return web.json_response({"error": "choose a project"}, status=400)
+    if not bare_shell and not account and accounts.enabled():
+        return web.json_response({"error": "choose an account"}, status=400)
 
     def _create():
-        chk = subprocess.run(["tmux", "has-session", "-t", name],
+        import session_flow
+        cwd = os.path.expanduser("~")
+        sname = name
+        if not bare_shell:
+            projs = session_flow.projects()
+            if project not in projs:
+                return {"error": f"unknown project '{project}'"}
+            cwd = projs[project]
+            sname = name or session_flow.session_name(project, [])
+        chk = subprocess.run(["tmux", "has-session", "-t", f"={sname}"],
                              capture_output=True, timeout=5)
         if chk.returncode == 0:
-            return {"error": "session already exists"}
-        home = os.path.expanduser("~")
-        # Via newsession so the pane gets the LOGIN shell even on a server born
-        # from a bare environment (2026-09-03: the cron keepalive restarted the
-        # server with SHELL=/bin/sh and every new window came up as dash).
-        from newsession import tmux_new_session, login_shell
-        r, healed = tmux_new_session(name, home, cols=120, rows=40, timeout=10)
-        if healed:
-            log.info("healed tmux default-shell %s -> %s", healed, login_shell())
-        if r.returncode != 0:
-            return {"error": (r.stderr or "tmux new-session failed").strip()[:200]}
-        if not bare_shell:
-            # Launch claude with the sandbox disabled + permissions skipped. tmux
-            # send-keys -l -- sends the line literally (no flag-injection); a
-            # separate Enter submits it.
-            launch = ("CLAUDE_CODE_DISABLE_SANDBOX=1 "
-                      "claude --dangerously-skip-permissions")
-            subprocess.run(["tmux", "send-keys", "-t", name, "-l", "--", launch],
-                           capture_output=True, timeout=5)
-            subprocess.run(["tmux", "send-keys", "-t", name, "Enter"],
-                           capture_output=True, timeout=5)
-        return {"ok": True, "session": name, "shell": bare_shell}
+            return {"error": f"session '{sname}' already exists"}
+        from newsession import spawn
+        try:
+            sess, msg = spawn(name=sname, cwd=cwd, shell=bare_shell, account=account)
+        except Exception as e:
+            log.exception("new session %s raised", sname)
+            return {"error": f"internal error: {type(e).__name__}: {e}"}
+        if not sess:
+            return {"error": msg}
+        session_flow.keep(sess, cwd)
+        return {"ok": True, "session": sess, "shell": bare_shell, "message": msg}
 
-    result = await loop.run_in_executor(None, _create)
+    result = await asyncio.to_thread(_create)
+    _status_cache.set(None)
     if result.get("error"):
         status = 409 if "exists" in result["error"] else 400
         return web.json_response(result, status=status)
-    log.info("New %s session %s created by %s",
-             "shell" if bare_shell else "claude", name, request.get("user", "?"))
+    log.info("New %s session %s (project %s, account %s) created by %s",
+             "shell" if bare_shell else "claude", result.get("session"), project or "-", account or "-",
+             request.get("user", "?"))
     return web.json_response(result)
+
+
+_ACCOUNT_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+_SWITCH_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
+async def handle_accounts(request):
+    """GET /api/accounts — the slots for the pickers, with live login state."""
+    def _get():
+        try:
+            sl = accounts.slots(online=True)
+        except accounts.AccountsError as e:
+            return {"enabled": accounts.enabled(), "error": str(e), "slots": []}
+        keep = ("id", "status", "plan", "usable", "why", "warnings", "five_hour",
+                "seven_day", "home", "single")
+        return {"enabled": accounts.enabled(),
+                "slots": [{k: s.get(k) for k in keep} for s in sl if s["status"] != "empty"]}
+    return web.json_response(await asyncio.to_thread(_get))
+
+
+async def handle_projects(request):
+    """GET /api/projects — the registered projects for the new-session picker."""
+    def _get():
+        import session_flow
+        try:
+            return {"projects": [{"name": n, "path": p} for n, p in sorted(session_flow.projects().items(),
+                                                                           key=lambda x: x[0].lower())]}
+        except Exception as e:
+            return {"projects": [], "error": f"{type(e).__name__}: {e}"}
+    return web.json_response(await asyncio.to_thread(_get))
+
+
+async def handle_session_switch(request):
+    """POST /api/session/switch {session, account} — move a running, idle Claude
+    session to another account slot (lib/session_switch.py)."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    name = (data.get("session") or "").strip()
+    account = (data.get("account") or "").strip()
+    if not _SWITCH_SESSION_RE.match(name) or name.startswith("web-"):
+        return web.json_response({"ok": False, "error": "invalid session name"}, status=400)
+    if not _ACCOUNT_RE.match(account):
+        return web.json_response({"ok": False, "error": "invalid account"}, status=400)
+    try:
+        from session_switch import switch
+        ok, msg = await asyncio.to_thread(switch, name, account, force=bool(data.get("force")))
+    except Exception as e:                       # never a bare 500: the session may be mid-switch
+        log.exception("account switch of %s to %s raised", name, account)
+        ok, msg = False, (f"internal error during the switch ({type(e).__name__}: {e}) — "
+                          f"look at the session before retrying: clanker open {name}")
+    _status_cache.set(None)
+    log.info("account switch of %s to %s by %s: %s", name, account,
+             request.get("user", "?"), "ok" if ok else "failed")
+    return web.json_response({"ok": ok, "message": msg}, status=200 if ok else 409)
+
+
+# ── user-lease reconciler (docs/SESSION-ACCOUNTS.md 5.3) ──
+LEASE_RECONCILE_SECS = 3600
+
+
+def reconcile_leases():
+    """Every live Claude process that clanker started (CLANKER_SESSION in its
+    environment) holds a user lease bound to its pid: renew the ones that hold
+    one, lease the ones that lost theirs (e.g. this service was down past the
+    ttl). Sessions other launchers started are theirs to lease. Returns
+    (renewed, leased, failed)."""
+    if not accounts.enabled():
+        return 0, 0, 0
+    sl = accounts.slots()
+    ls = accounts.leases(max_age=0)
+    renewed = leased = failed = 0
+    for rec in claude_registry.read_all(sl):
+        name = accounts.proc_env_value(rec["pid"], "CLANKER_SESSION")
+        if not name:
+            continue
+        l = accounts.lease_of_pid(rec["pid"], ls)
+        if l:
+            if accounts.renew(l.get("id")):
+                renewed += 1
+            else:
+                failed += 1
+            continue
+        s = accounts.slot_of_pid(rec["pid"], sl)
+        if not s or s["id"] == "?" or s.get("single"):
+            failed += 1
+            continue
+        try:
+            r = accounts.lease_user(s, name, rec["pid"])
+        except accounts.AccountsError as e:
+            log.warning("lease reconciler: %s on %s: %s", name, s["id"], e)
+            failed += 1
+            continue
+        if r.get("lease"):
+            leased += 1
+        else:
+            failed += 1
+            log.warning("lease reconciler: %s on %s refused: %s", name, s["id"], r.get("refused"))
+    return renewed, leased, failed
+
+
+async def lease_reconciler(app):
+    await asyncio.sleep(60)
+    while True:
+        try:
+            r = await asyncio.to_thread(reconcile_leases)
+            if any(r):
+                log.info("lease reconciler: renewed %d, leased %d, failed %d", *r)
+        except Exception as e:
+            log.warning("lease reconciler failed: %s", e)
+        await asyncio.sleep(LEASE_RECONCILE_SECS)
 
 
 # Native system monitor — the dashboard's floating compute-load view watches the
@@ -2158,8 +2287,10 @@ async def _post_ntfy(http, title, priority, tags, body, now, muted_until):
     """POST one ntfy message. Returns (delivered, muted_until) — 'delivered'
     only on a 200 (evidence, never assumption); a 429 arms the 30-min mute."""
     headers = {"Title": title, "Priority": priority, "Tags": tags}
-    if NTFY_TOKEN:
-        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
+    from alerts import ntfy_token
+    token = ntfy_token()                 # env, or CLANKER_NTFY_TOKEN_CMD (a secret store)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         async with http.post(
             f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body, headers=headers, timeout=10,
@@ -2228,7 +2359,7 @@ async def monitor_sessions(app):
                     announced = True
                     log.info("session-state source: %d/%d claude panes have a live "
                              "Claude Code registry record (%s)",
-                             covered, total, _sessions_dir())
+                             covered, total, _sessions_dirs_label())
 
                 # Drop bookkeeping for sessions that disappeared. A session that
                 # vanishes while last observed WORKING likely crashed / was
@@ -2262,6 +2393,11 @@ async def monitor_sessions(app):
                     state = detect_session_state(p, registry)
                     was = prev_state.get(sid)
                     prev_state[sid] = state
+                    if was is None and state == "working":
+                        # Already working when this monitor first saw it (a dashboard
+                        # restart): its fan-out was announced before. 2026-10-29: each
+                        # restart re-sent "maintainence: 1 agent(s) fanned out".
+                        agents_pinged.add(sid)
 
                     # A claude pane with NO registry record has no REPL behind
                     # it. If it shows the workspace-trust dialog it is parked —
@@ -2423,7 +2559,8 @@ async def handle_orch_spawn(request):
     loop = asyncio.get_event_loop()
     rec = await loop.run_in_executor(
         None, lambda: orch_spawn.spawn(task, project=data.get("project") or None,
-                                       headless=bool(data.get("headless"))))
+                                       headless=bool(data.get("headless")),
+                                       account=(data.get("account") or None)))
     log.info("orch spawn by %s: %s", request.get("user", "?"), task[:80])
     return web.json_response(rec)
 
@@ -2493,11 +2630,12 @@ async def start_background(app):
     app["orch_task"] = asyncio.create_task(orch_supervise(app))
     app["dashboard_task"] = asyncio.create_task(dashboard_refresher(app))
     app["sysmon_task"] = asyncio.create_task(sysmon_warmer(app))
+    app["lease_task"] = asyncio.create_task(lease_reconciler(app))
 
 
 async def stop_background(app):
     for key in ("monitor_task", "reaper_task", "orch_task", "dashboard_task",
-                "sysmon_task"):
+                "sysmon_task", "lease_task"):
         task = app.get(key)
         if task:
             task.cancel()
@@ -2552,6 +2690,8 @@ def _live_features_html():
   <div class="terminal-header">
     <h3 id="terminal-title"></h3>
     <div class="hdr-actions">
+      <span class="terminal-account" id="terminal-account" title="account slot of this session"></span>
+      <button class="terminal-hdr-btn" id="terminal-acct-btn" onclick="openAccountSwitch()" title="Move this session to another account" style="display:none">⇄</button>
       <span class="session-state" id="terminal-state"></span>
       <button class="terminal-hdr-btn" id="terminal-mode-btn" onclick="toggleMobileMode()" title="Reader ⇄ Terminal (mobile)">📖</button>
       <button class="terminal-hdr-btn" onclick="toggleComposeMode()" title="Compose bar (native autocorrect/glide typing; Enter sends the whole line)">⌨</button>
@@ -2585,13 +2725,35 @@ def _live_features_html():
 <div class="newsess-overlay" id="newsess-overlay">
   <div class="newsess-box">
     <h3>New Session</h3>
+    <div id="newsess-project-row">
+      <label class="row" for="newsess-project">Project</label>
+      <select id="newsess-project"><option value="">— choose a project —</option></select>
+    </div>
     <label class="row" for="newsess-name">Name (optional)</label>
-    <input type="text" id="newsess-name" placeholder="auto" autocomplete="off" autocapitalize="off" spellcheck="false">
-    <label class="chk"><input type="checkbox" id="newsess-shell"> Bare shell (no Claude)</label>
-    <div class="hint">Default launches <code>claude --dangerously-skip-permissions</code> with <code>CLAUDE_CODE_DISABLE_SANDBOX=1</code>, anchored at $HOME.</div>
+    <input type="text" id="newsess-name" placeholder="the project's name" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <label class="chk"><input type="checkbox" id="newsess-shell" onchange="syncNewSessionShell()"> Bare shell (no Claude)</label>
+    <div id="newsess-account-row">
+      <label class="row" for="newsess-account">Account</label>
+      <select id="newsess-account"><option value="">— choose an account —</option></select>
+      <div class="hint" id="newsess-account-note"></div>
+    </div>
+    <div class="hint">Launches <code>claude --dangerously-skip-permissions</code> with <code>CLAUDE_CODE_DISABLE_SANDBOX=1</code> on the account you choose, in the project's directory. Kept across reboots until <code>clanker close</code>.</div>
     <div class="newsess-actions">
       <button class="cancel" onclick="closeNewSession()">Cancel</button>
       <button class="go" id="newsess-go" onclick="createNewSession()">Create &amp; Open</button>
+    </div>
+  </div>
+</div>
+
+<!-- Account switch modal (lib/session_switch.py via /api/session/switch) -->
+<div class="newsess-overlay" id="acct-overlay">
+  <div class="newsess-box">
+    <h3>Switch account</h3>
+    <div class="hint" id="acct-current"></div>
+    <div class="acct-list" id="acct-list"></div>
+    <div class="acct-result" id="acct-result"></div>
+    <div class="newsess-actions">
+      <button class="cancel" onclick="closeAccountSwitch()">Close</button>
     </div>
   </div>
 </div>
@@ -2675,6 +2837,9 @@ def create_app():
     app.router.add_post("/api/orch/spawn", handle_orch_spawn)
     app.router.add_post("/api/orch/session/{id}/{action}", handle_orch_session_action)
     app.router.add_post("/api/session/new", handle_session_new)
+    app.router.add_post("/api/session/switch", handle_session_switch)
+    app.router.add_get("/api/accounts", handle_accounts)
+    app.router.add_get("/api/projects", handle_projects)
     app.router.add_get("/api/sysmon", handle_sysmon)
     app.router.add_get("/ws/sysmon", handle_ws_sysmon)
     app.router.add_get("/ws/view/{session}", handle_view)
