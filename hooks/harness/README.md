@@ -34,6 +34,8 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | PostToolUse | `Edit\|Write` | none | `governance-gates-autorun.sh` | 150 | Runs the gates of a research spec directory after an edit to one of its registry files. |
 | PostToolUse | `*` | none | `context-gauge.sh` | 10 | Gives the measured percentage of free context. In a nested run (`CLAUDE_CODE_ENTRYPOINT=sdk-cli`), it stops at once, unless `CLANKER_INJECT_NESTED=1`. |
 | Stop | none | none | `iron-law-check.sh` (`asyncRewake`) | 30 | Blocks a success claim that has no evidence token in the recent tool output. |
+| Stop | none | none | `idle-agent-gate.py` | 5 | Global rule 30: blocks the lead's stop once while a teammate is done or idle over 30 min (see the next section). |
+| TeammateIdle | none | none | `teammate-idle-record.py` | 10 | Records each idle teammate for `idle-agent-gate.py`. Always exits 0. |
 | SessionEnd | none | none | `clanker-dist/session-end.sh` | 20 | Records the session metrics for clanker. |
 
 ## Orchestrator wake economy (rule 25)
@@ -55,6 +57,13 @@ The incident: a lead session armed five Monitor watches for five jobs and one mo
 | A one-shot CronCreate (`recurring: false`) | Allow |
 
 Each allowed Monitor writes a stamp file to `$CLAUDE_SCRATCHPAD_DIR/watch-gate/<key>/`, or to `/var/tmp/claude-<uid>/watch-gate/<key>/` when that variable is not set. The key is the session ID, with `-<agent_id>` for a subagent. A stamp expires after the `timeout_ms` of its Monitor (at most 1,800,000). The hook cannot see a Monitor that stops early. Then clear the stamp: `python3 ~/.claude/hooks/watch-gate.py --reset <key>`, or remove the stamp files, or start the session with `WATCH_GATE_RESET=1`. `WATCH_GATE_OFF=1` turns off the gate.
+
+## Idle-agent gate (rule 30)
+
+An idle teammate wakes on every message sent to it and sends its whole context again. On 2026-11-18 a lead had 26 finished teammates still alive. A hook cannot stop a teammate (`{"continue": false}` from TeammateIdle leaves it listed); only the lead's `TaskStop` can. So two hooks make the lead do it.
+
+1. `teammate-idle-record.py` (TeammateIdle, fired in the lead's process) reads the teammate's last assistant text from `<lead transcript minus .jsonl>/subagents/agent-<agent_id>.jsonl` and writes `$CLANKER_DATA/raw/idle-gate/<team>/<name>.json` = `{idle_at, idle_ts, done, asked: false, ...}`. `done` is true when the final non-empty line starts with `AGENT-DONE` or `AGENT-HANDED-OFF`.
+2. `idle-agent-gate.py` (Stop) finds the lead's team in `<CLAUDE_CONFIG_DIR or ~/.claude>/teams/*/config.json` (by `leadSessionId`, else by `teamName` in the lead's teammate sidecars, which covers a resumed lead). For each member still listed with a record not yet asked about, it flags done records at once and others idle over `IDLE_GATE_MINUTES` (30). It sets `asked`, and blocks once: "Stop each with TaskStop <name> now (global rule 30), or say in one line why it stays." A new idle record resets `asked`. It skips a teammate whose transcript changed after it went idle (it is working again), never blocks when `stop_hook_active` is set, and fails open. `IDLE_GATE_OFF=1` turns it off.
 
 ## Bash dispatcher
 

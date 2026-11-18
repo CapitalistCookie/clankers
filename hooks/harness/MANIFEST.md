@@ -42,6 +42,8 @@ by hand. It stops and tells you to use `--force`.
 | `governance-gates-autorun.sh` | PostToolUse `Edit\|Write`, timeout 150 s | Runs the gates of a research spec directory after an edit to one of its registry files. |
 | `task-payload-gate.py` | PreToolUse `TaskCreate\|TaskUpdate`, timeout 30 s | Limits the size of the task registry. |
 | `watch-gate.py` | PreToolUse `Monitor\|CronCreate`, timeout 10 s | Global rule 25, the orchestrator wake economy. It has a `--selftest` (runs `tests/test_watch_gate.py`). |
+| `teammate-idle-record.py` | TeammateIdle, timeout 10 s | Global rule 30. Records each idle teammate (done when its final line starts with `AGENT-DONE` or `AGENT-HANDED-OFF`) in `$CLANKER_DATA/raw/idle-gate/<team>/<name>.json`. Always exits 0. Tests: `tests/test_idle_gate.py` in the repo root. |
+| `idle-agent-gate.py` | Stop, timeout 5 s (not async) | Global rule 30. Blocks the lead's stop once per idle period while a listed teammate is done or idle over `IDLE_GATE_MINUTES` (30), and names it for TaskStop. `IDLE_GATE_OFF=1` turns it off. |
 
 ## Other files that sync manages
 

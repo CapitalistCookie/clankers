@@ -29,6 +29,7 @@
   "hooks/harness/context-gauge.sh",
   "hooks/harness/governance-gates-autorun.sh",
   "hooks/harness/gpu-vm-guard.py",
+  "hooks/harness/idle-agent-gate.py",
   "hooks/harness/iron-law-check.sh",
   "hooks/harness/last-assistant-msg.py",
   "hooks/harness/post-build-review-reminder.sh",
@@ -36,6 +37,7 @@
   "hooks/harness/pretooluse-bash-dispatch.sh",
   "hooks/harness/ssh-tunnel-port-guard.py",
   "hooks/harness/task-payload-gate.py",
+  "hooks/harness/teammate-idle-record.py",
   "hooks/harness/tests/test_context_gauge.sh",
   "hooks/harness/tests/test_watch_gate.py",
   "hooks/harness/watch-gate.py",
@@ -163,6 +165,7 @@
   "tests/test_handoff.py",
   "tests/test_harness_lint.py",
   "tests/test_hook_errors.py",
+  "tests/test_idle_gate.py",
   "tests/test_live_js.py",
   "tests/test_livewatch_js.py",
   "tests/test_newsession.py",
@@ -194,5 +197,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "f799467"
+ "source_commit": "dc367ca"
 }
