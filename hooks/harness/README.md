@@ -25,7 +25,7 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | SessionStart | `startup`, `resume`, `clear`, `compact` | none | `clanker-dist/session-start.sh` | 10 | Gives the cold-start brief for the project. |
 | PreToolUse | `Bash` | none | `pretooluse-bash-dispatch.sh` | 60 | Runs the four generic Bash gates (see the next table). |
 | PreToolUse | `Agent` | none | `clanker-dist/subagent-tier-gate.py` | 5 | Blocks an Agent call that has no explicit `model`. |
-| PreToolUse | `Agent` | none | `subagent-delivery-gate.py` | 10 | Blocks an Agent call whose prompt has no contract to deliver the report to `main`. |
+| PreToolUse | `Agent` | none | `subagent-delivery-gate.py` | 10 | Blocks an Agent call whose prompt has no report contract. The contract depends on agent teams (see "Report contract"). |
 | PreToolUse | `TaskCreate\|TaskUpdate` | none | `task-payload-gate.py` | 30 | Limits the size of the task registry, because each reminder sends the full registry again. |
 | PreToolUse | `Monitor\|CronCreate` | none | `watch-gate.py` | 10 | Enforces global rule 25, the orchestrator wake economy (see the next section). |
 | PostToolUse | `Bash` | `Bash(git *)` | `post-build-review-reminder.sh` | 5 | After `git commit` or `git push`, asks for comments and concerns. |
@@ -64,6 +64,14 @@ An idle teammate wakes on every message sent to it and sends its whole context a
 
 1. `teammate-idle-record.py` (TeammateIdle, fired in the lead's process) reads the teammate's last assistant text from `<lead transcript minus .jsonl>/subagents/agent-<agent_id>.jsonl` and writes `$CLANKER_DATA/raw/idle-gate/<team>/<name>.json` = `{idle_at, idle_ts, done, asked: false, ...}`. `done` is true when the final non-empty line starts with `AGENT-DONE` or `AGENT-HANDED-OFF`.
 2. `idle-agent-gate.py` (Stop) finds the lead's team in `<CLAUDE_CONFIG_DIR or ~/.claude>/teams/*/config.json` (by `leadSessionId`, else by `teamName` in the lead's teammate sidecars, which covers a resumed lead). For each member still listed with a record not yet asked about, it flags done records at once and others idle over `IDLE_GATE_MINUTES` (30). It sets `asked`, and blocks once: "Stop each with TaskStop <name> now (global rule 30), or say in one line why it stays." A new idle record resets `asked`. It skips a teammate whose transcript changed after it went idle (it is working again), never blocks when `stop_hook_active` is set, and fails open. `IDLE_GATE_OFF=1` turns it off.
+
+## Report contract (rule 30)
+
+`subagent-delivery-gate.py` (PreToolUse `Agent`) reads `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` from its env, which is the session's merged settings env. Truthy is what Claude Code accepts: `1`, `true`, `yes`, `on` (trimmed, any case).
+
+- Teams on: the prompt must say to deliver the final report via SendMessage to `"main"` AND make it the final message (the 2026-07-28 and 2026-08-01 losses).
+- Teams off (operator 2026-11-18): an ordinary background agent's task notification carries its final message, so a SendMessage copy only wakes the lead twice. A line with the words "final message" is enough; the SendMessage contract still passes.
+- `NO-REPORT-NEEDED` opts out either way. A project turns teams off with `{"env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "0"}}` in its `.claude/settings.json`. Tests: `tests/test_delivery_gate.py` in the repo root.
 
 ## Bash dispatcher
 

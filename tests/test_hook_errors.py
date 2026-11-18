@@ -239,6 +239,9 @@ def test_normal_payloads_log_nothing(tmp_path):
                                                tool_input={"subject": "s", "description": "d"})),
         ("harness/watch-gate.py", dict(base, tool_name="CronCreate",
                                         tool_input={"cron": "17 3 26 9 *", "recurring": False})),
+        ("harness/subagent-delivery-gate.py", dict(base, tool_name="Agent", tool_input={
+            "prompt": 'Deliver your final report via SendMessage with to: "main", AND make '
+                      'that report your final message.'})),
     ]
     for rel, payload in cases:
         path = os.path.join(HOOKS, rel)

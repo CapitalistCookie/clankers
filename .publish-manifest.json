@@ -36,6 +36,7 @@
   "hooks/harness/pre-commit-verification.sh",
   "hooks/harness/pretooluse-bash-dispatch.sh",
   "hooks/harness/ssh-tunnel-port-guard.py",
+  "hooks/harness/subagent-delivery-gate.py",
   "hooks/harness/task-payload-gate.py",
   "hooks/harness/teammate-idle-record.py",
   "hooks/harness/tests/test_context_gauge.sh",
@@ -156,6 +157,7 @@
   "tests/test_cli.py",
   "tests/test_cli_ux.py",
   "tests/test_context_gauge_nested.py",
+  "tests/test_delivery_gate.py",
   "tests/test_ecc_budget.py",
   "tests/test_ecc_guard.py",
   "tests/test_ecc_overlap.py",
@@ -197,5 +199,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "dc367ca"
+ "source_commit": "9c92f29"
 }

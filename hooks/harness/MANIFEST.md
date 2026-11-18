@@ -44,6 +44,7 @@ by hand. It stops and tells you to use `--force`.
 | `watch-gate.py` | PreToolUse `Monitor\|CronCreate`, timeout 10 s | Global rule 25, the orchestrator wake economy. It has a `--selftest` (runs `tests/test_watch_gate.py`). |
 | `teammate-idle-record.py` | TeammateIdle, timeout 10 s | Global rule 30. Records each idle teammate (done when its final line starts with `AGENT-DONE` or `AGENT-HANDED-OFF`) in `$CLANKER_DATA/raw/idle-gate/<team>/<name>.json`. Always exits 0. Tests: `tests/test_idle_gate.py` in the repo root. |
 | `idle-agent-gate.py` | Stop, timeout 5 s (not async) | Global rule 30. Blocks the lead's stop once per idle period while a listed teammate is done or idle over `IDLE_GATE_MINUTES` (30), and names it for TaskStop. `IDLE_GATE_OFF=1` turns it off. |
+| `subagent-delivery-gate.py` | PreToolUse `Agent`, timeout 10 s | Global rule 30. Blocks a dispatch without a report contract: with agent teams on (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` truthy), SendMessage to `main` and the final message; with teams off, a "final message" line. `NO-REPORT-NEEDED` opts out. Vendored 2026-11-18. Tests: `tests/test_delivery_gate.py` in the repo root. |
 
 ## Other files that sync manages
 
@@ -89,7 +90,6 @@ These files are in `~/.claude/hooks/`, but not in this directory.
 | File | Wired in `~/.claude/settings.json` | Reason |
 |---|---|---|
 | `check-compute.sh` | Yes, as dispatcher gate 1 | It names an operator path and private hosts. A generic copy needs a new design. |
-| `subagent-delivery-gate.py` | Yes, PreToolUse `Agent` | It came on 2026-08-01, after the first vendoring. It is not in this directory. |
 | `tests/test_pretooluse_dispatch.sh` | not a hook | The parity test of the dispatcher. It contains operator paths and addresses. |
 | `tests/test_context_gauge.sh` | not a hook | The installed copy of `tests/test_context_gauge.sh` in this directory. See "Tests". |
 | `tests/test_watch_gate.py` | not a hook | The selftest of `watch-gate.py`. The source is `tests/test_watch_gate.py` in this directory. Sync does not copy it, so copy it by hand after a change (`cp -p`). `watch-gate.py --selftest` runs it. |
