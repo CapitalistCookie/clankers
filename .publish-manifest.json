@@ -25,6 +25,7 @@
   "hooks/context-gauge.py",
   "hooks/harness/MANIFEST.md",
   "hooks/harness/README.md",
+  "hooks/harness/agent-message-gate.py",
   "hooks/harness/closure-claim-verifier.sh",
   "hooks/harness/context-gauge.sh",
   "hooks/harness/governance-gates-autorun.sh",
@@ -149,6 +150,7 @@
   "tests/fakes/tmux",
   "tests/fixtures/registry.yaml",
   "tests/test_adopt.py",
+  "tests/test_agent_message_gate.py",
   "tests/test_alerts_escalation.py",
   "tests/test_all.py",
   "tests/test_analyze_rewrites.py",
@@ -199,5 +201,5 @@
   "tools/archive-transcripts.sh",
   "tools/hooktax.sh"
  ],
- "source_commit": "9c92f29"
+ "source_commit": "41462e8"
 }

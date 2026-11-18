@@ -242,6 +242,8 @@ def test_normal_payloads_log_nothing(tmp_path):
         ("harness/subagent-delivery-gate.py", dict(base, tool_name="Agent", tool_input={
             "prompt": 'Deliver your final report via SendMessage with to: "main", AND make '
                       'that report your final message.'})),
+        ("harness/agent-message-gate.py", dict(base, tool_name="SendMessage", agent_id="a1",
+                                                tool_input={"to": "main", "message": "m"})),
     ]
     for rel, payload in cases:
         path = os.path.join(HOOKS, rel)

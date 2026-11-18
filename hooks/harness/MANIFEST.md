@@ -45,6 +45,7 @@ by hand. It stops and tells you to use `--force`.
 | `teammate-idle-record.py` | TeammateIdle, timeout 10 s | Global rule 30. Records each idle teammate (done when its final line starts with `AGENT-DONE` or `AGENT-HANDED-OFF`) in `$CLANKER_DATA/raw/idle-gate/<team>/<name>.json`. Always exits 0. Tests: `tests/test_idle_gate.py` in the repo root. |
 | `idle-agent-gate.py` | Stop, timeout 5 s (not async) | Global rule 30. Blocks the lead's stop once per idle period while a listed teammate is done or idle over `IDLE_GATE_MINUTES` (30), and names it for TaskStop. `IDLE_GATE_OFF=1` turns it off. |
 | `subagent-delivery-gate.py` | PreToolUse `Agent`, timeout 10 s | Global rule 30. Blocks a dispatch without a report contract: with agent teams on (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` truthy), SendMessage to `main` and the final message; with teams off, a "final message" line. `NO-REPORT-NEEDED` opts out. Vendored 2026-11-18. Tests: `tests/test_delivery_gate.py` in the repo root. |
+| `agent-message-gate.py` | PreToolUse `SendMessage`, timeout 10 s | Global rule 30. Subagents and teammates only (payload `agent_id`): blocks a send to a teammate that is no longer a team member (a message revives its whole context); `CLANKER_AGENT_MESSAGES=lead-only` blocks every send but to main/team-lead/the lead. Fails open. Tests: `tests/test_agent_message_gate.py` in the repo root. |
 
 ## Other files that sync manages
 

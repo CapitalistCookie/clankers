@@ -28,6 +28,7 @@ The unit of `timeout` is seconds. A value of 5000 gives the hook 83 minutes, not
 | PreToolUse | `Agent` | none | `subagent-delivery-gate.py` | 10 | Blocks an Agent call whose prompt has no report contract. The contract depends on agent teams (see "Report contract"). |
 | PreToolUse | `TaskCreate\|TaskUpdate` | none | `task-payload-gate.py` | 30 | Limits the size of the task registry, because each reminder sends the full registry again. |
 | PreToolUse | `Monitor\|CronCreate` | none | `watch-gate.py` | 10 | Enforces global rule 25, the orchestrator wake economy (see the next section). |
+| PreToolUse | `SendMessage` | none | `agent-message-gate.py` | 10 | Global rule 30: blocks a subagent's or teammate's send to a stopped teammate; `CLANKER_AGENT_MESSAGES=lead-only` blocks every send but to the lead (see "Agent messages"). |
 | PostToolUse | `Bash` | `Bash(git *)` | `post-build-review-reminder.sh` | 5 | After `git commit` or `git push`, asks for comments and concerns. |
 | PostToolUse | `Bash` | `Bash(git commit *)` | `closure-claim-verifier.sh` | 10 | Warns when a commit claims a closure but shows no integration-test evidence. |
 | PostToolUse | `Skill` | none | `clanker-dist/skill-tracker.sh` | 5 | Records which skills run (telemetry only). |
@@ -72,6 +73,14 @@ An idle teammate wakes on every message sent to it and sends its whole context a
 - Teams on: the prompt must say to deliver the final report via SendMessage to `"main"` AND make it the final message (the 2026-07-28 and 2026-08-01 losses).
 - Teams off (operator 2026-11-18): an ordinary background agent's task notification carries its final message, so a SendMessage copy only wakes the lead twice. A line with the words "final message" is enough; the SendMessage contract still passes.
 - `NO-REPORT-NEEDED` opts out either way. A project turns teams off with `{"env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "0"}}` in its `.claude/settings.json`. Tests: `tests/test_delivery_gate.py` in the repo root.
+
+## Agent messages (rule 30)
+
+A message to a stopped or finished agent revives it and re-sends its whole context (2026-11-18 10:21Z: teammate look4 messaged perf, stopped 4 h earlier, and revived its 452k-token context). `agent-message-gate.py` (PreToolUse `SendMessage`) acts only when the payload has `agent_id` (a subagent or teammate); the lead is never gated. Sends to `main`, `team-lead` or the team's lead always pass.
+
+- Always: it blocks a send whose `to` (a name, `name [ref]`, or an agent id such as `aperf-3e90...`) names a teammate of the caller's team that is no longer in the members of `<CLAUDE_CONFIG_DIR or ~/.claude>/teams/<team>/config.json`. A teammate is a name with a sidecar `<lead transcript minus .jsonl>/subagents/agent-a<name>-*.meta.json` (also under the team's first lead session) or an idle-gate record. Other names (another session, a typo) pass. Reason: "<name> is stopped; a message revives it with its whole context. Put the request in your status log or report; the lead routes it (global rule 30)."
+- Per project: `{"env": {"CLANKER_AGENT_MESSAGES": "lead-only"}}` in `<repo>/.claude/settings.json` blocks every subagent send except to the lead.
+- Payload (captured 2026-11-18, Claude Code 2.1.322): `session_id` and `transcript_path` are the lead's, `agent_id`/`agent_type` the caller's, `tool_input` = `{to, message, summary, type, recipient, recipient_kind: "name"|"main", content}`. The team: `teamName` in the caller's sidecar, else `leadSessionId`, else `session-<sid8>`. Fails open; ~40 ms. Tests: `tests/test_agent_message_gate.py` in the repo root.
 
 ## Bash dispatcher
 
